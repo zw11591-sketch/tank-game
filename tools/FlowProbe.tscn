@@ -1,0 +1,9 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://tools/flow_probe.gd" id="1_probe"]
+[ext_resource type="PackedScene" path="res://scenes/Main.tscn" id="2_main"]
+
+[node name="Probe" type="Node"]
+script = ExtResource("1_probe")
+
+[node name="Main" parent="." instance=ExtResource("2_main")]

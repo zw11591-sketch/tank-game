@@ -1,0 +1,70 @@
+{
+  "version": "2.0.0",
+  "options": {
+    "env": { "GODOT": "D:\\DevSoftware\\godot\\godot.exe" }
+  },
+  "tasks": [
+    {
+      "label": "Godot: 语法与启动自检（无头跑 240 帧）",
+      "detail": "加载主场景并执行 240 帧，能暴露所有脚本的编译错误和 _ready 期间的运行时报错。退出码 0 即通过。",
+      "type": "shell",
+      "command": "& $env:GODOT --headless --path \"${workspaceFolder}\" --quit-after 240",
+      "options": { "shell": { "executable": "powershell.exe", "args": ["-NoProfile", "-Command"] } },
+      "problemMatcher": {
+        "owner": "gdscript",
+        "fileLocation": ["autoDetect", "${workspaceFolder}"],
+        "pattern": {
+          "regexp": "^.*(?:SCRIPT ERROR|ERROR):\\s*(.*)$",
+          "message": 1
+        }
+      },
+      "group": { "kind": "test", "isDefault": true },
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Godot: 重新导入资源",
+      "detail": "扫描并重建 .godot 导入缓存。新增或删除 glb / 图片后跑一次。",
+      "type": "shell",
+      "command": "& $env:GODOT --headless --path \"${workspaceFolder}\" --import",
+      "options": { "shell": { "executable": "powershell.exe", "args": ["-NoProfile", "-Command"] } },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Godot: 模型契约校验",
+      "detail": "跑 tools/check_models.gd，检查 26 个 glb 的节点层级、材质命名与负重轮数量。",
+      "type": "shell",
+      "command": "& $env:GODOT --headless --path \"${workspaceFolder}\" --script res://tools/check_models.gd",
+      "options": { "shell": { "executable": "powershell.exe", "args": ["-NoProfile", "-Command"] } },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Godot: 导出 Windows 发行版",
+      "detail": "导出到 build/TankBattle.exe。tools/ 和 PROMPT.md 已在导出预设里排除。",
+      "type": "shell",
+      "command": "& $env:GODOT --headless --path \"${workspaceFolder}\" --export-release \"Windows Desktop\" \"${workspaceFolder}/build/TankBattle.exe\"",
+      "options": { "shell": { "executable": "powershell.exe", "args": ["-NoProfile", "-Command"] } },
+      "problemMatcher": [],
+      "group": { "kind": "build", "isDefault": true },
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Blender: 重建全部 GLB 素材",
+      "detail": "调用 tools/build_assets.ps1，用无头 Blender 重新生成 assets/models 下的全部模型。",
+      "type": "shell",
+      "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${workspaceFolder}/tools/build_assets.ps1\"",
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Godot: 打开编辑器",
+      "detail": "用本机 Godot 打开本项目（需要图形界面）。",
+      "type": "shell",
+      "command": "Start-Process $env:GODOT -ArgumentList '--editor','--path','${workspaceFolder}'",
+      "options": { "shell": { "executable": "powershell.exe", "args": ["-NoProfile", "-Command"] } },
+      "problemMatcher": [],
+      "presentation": { "reveal": "silent", "panel": "shared" }
+    }
+  ]
+}

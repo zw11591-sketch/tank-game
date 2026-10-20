@@ -1,0 +1,9 @@
+[gd_scene format=3 uid="uid://b1pitchprobe"]
+
+[ext_resource type="Script" path="res://tools/pitch_probe.gd" id="1_pitch"]
+[ext_resource type="PackedScene" path="res://scenes/Main.tscn" id="2_main"]
+
+[node name="PitchProbe" type="Node"]
+script = ExtResource("1_pitch")
+
+[node name="Main" parent="." instance=ExtResource("2_main")]

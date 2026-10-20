@@ -1,0 +1,32 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "GDScript: 运行并调试项目",
+      "type": "godot",
+      "request": "launch",
+      "project": "${workspaceFolder}",
+      "debug_collisions": false,
+      "debug_paths": false,
+      "debug_navigation": false,
+      "additional_options": ""
+    },
+    {
+      "name": "GDScript: 调试（窗口模式，便于断点）",
+      "type": "godot",
+      "request": "launch",
+      "project": "${workspaceFolder}",
+      "additional_options": "--windowed --resolution 1600x900"
+    },
+    {
+      "name": "GDScript: 调试（显示碰撞体与寻路）",
+      "type": "godot",
+      "request": "launch",
+      "project": "${workspaceFolder}",
+      "debug_collisions": true,
+      "debug_paths": true,
+      "debug_navigation": true,
+      "additional_options": "--windowed --resolution 1600x900"
+    }
+  ]
+}

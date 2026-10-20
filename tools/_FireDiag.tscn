@@ -1,0 +1,9 @@
+[gd_scene format=3 uid="uid://bfirediag01"]
+
+[ext_resource type="Script" path="res://tools/_fire_diag.gd" id="1_diag"]
+[ext_resource type="PackedScene" path="res://scenes/Main.tscn" id="2_main"]
+
+[node name="FireDiag" type="Node"]
+script = ExtResource("1_diag")
+
+[node name="Main" parent="." instance=ExtResource("2_main")]

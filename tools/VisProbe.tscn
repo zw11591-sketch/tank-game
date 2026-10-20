@@ -1,0 +1,9 @@
+[gd_scene format=3 uid="uid://b1visprobe"]
+
+[ext_resource type="Script" path="res://tools/vis_probe.gd" id="1_vis"]
+[ext_resource type="PackedScene" path="res://scenes/Main.tscn" id="2_main"]
+
+[node name="VisProbe" type="Node"]
+script = ExtResource("1_vis")
+
+[node name="Main" parent="." instance=ExtResource("2_main")]

@@ -1,0 +1,9 @@
+[gd_scene format=3 uid="uid://b1hitprobe"]
+
+[ext_resource type="Script" path="res://tools/hit_probe.gd" id="1_hp"]
+[ext_resource type="PackedScene" path="res://scenes/Main.tscn" id="2_main"]
+
+[node name="HitProbe" type="Node"]
+script = ExtResource("1_hp")
+
+[node name="Main" parent="." instance=ExtResource("2_main")]

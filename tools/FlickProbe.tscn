@@ -1,0 +1,9 @@
+[gd_scene format=3 uid="uid://b1flickprobe"]
+
+[ext_resource type="Script" path="res://tools/flick_probe.gd" id="1_flick"]
+[ext_resource type="PackedScene" path="res://scenes/Main.tscn" id="2_main"]
+
+[node name="FlickProbe" type="Node"]
+script = ExtResource("1_flick")
+
+[node name="Main" parent="." instance=ExtResource("2_main")]

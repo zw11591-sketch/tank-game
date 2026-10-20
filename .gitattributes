@@ -1,0 +1,10 @@
+# 统一换行符，避免 Windows 工作区反复产生 CRLF 变更
+* text=auto eol=lf
+
+# 二进制资源不做文本差异比较
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.glb binary
+*.exe binary
+*.pck binary

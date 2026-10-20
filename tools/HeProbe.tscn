@@ -1,0 +1,9 @@
+[gd_scene format=3 uid="uid://b1heprobe"]
+
+[ext_resource type="Script" path="res://tools/he_probe.gd" id="1_he"]
+[ext_resource type="PackedScene" path="res://scenes/Main.tscn" id="2_main"]
+
+[node name="HeProbe" type="Node"]
+script = ExtResource("1_he")
+
+[node name="Main" parent="." instance=ExtResource("2_main")]

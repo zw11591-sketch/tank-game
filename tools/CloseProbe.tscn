@@ -1,0 +1,9 @@
+[gd_scene format=3 uid="uid://b1closeprobe"]
+
+[ext_resource type="Script" path="res://tools/close_probe.gd" id="1_close"]
+[ext_resource type="PackedScene" path="res://scenes/Main.tscn" id="2_main"]
+
+[node name="CloseProbe" type="Node"]
+script = ExtResource("1_close")
+
+[node name="Main" parent="." instance=ExtResource("2_main")]

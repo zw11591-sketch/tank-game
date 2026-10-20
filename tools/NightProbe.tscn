@@ -1,0 +1,9 @@
+[gd_scene format=3 uid="uid://b1nightprobe"]
+
+[ext_resource type="Script" path="res://tools/night_probe.gd" id="1_night"]
+[ext_resource type="PackedScene" path="res://scenes/Main.tscn" id="2_main"]
+
+[node name="NightProbe" type="Node"]
+script = ExtResource("1_night")
+
+[node name="Main" parent="." instance=ExtResource("2_main")]

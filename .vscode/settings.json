@@ -1,0 +1,44 @@
+{
+  // Godot 路径与无头语言服务器。同样的值也写进了用户设置，
+  // 因为这个工作区作用域此前没能传到扩展（见 Godot LSP.log）。
+  "godotTools.editorPath.godot4": "D:\\DevSoftware\\godot\\godot.exe",
+  "godotTools.lsp.headless": true,
+  "godotTools.lsp.autoReconnect.enabled": true,
+  "godotTools.lsp.autoReconnect.attempts": 60,
+  "godotTools.lsp.autoReconnect.cooldown": 3000,
+  "godotTools.editor.verbose": true,
+
+  "godotTools.inlayHints.gdscript": true,
+  "godotTools.scenePreview.previewRelatedScenes": true,
+
+  // 不要在这里写 files.associations：
+  // 扩展自己已经注册了 .gd=gdscript / .tscn=gdscene / .godot,.tres,.import=gdresource，
+  // 手写容易覆盖错（我第一版就把 .tscn 错配成了 gdresource）。
+
+  // GDScript 必须用 Tab 缩进，空格会被引擎当语法错误。
+  "[gdscript]": {
+    "editor.insertSpaces": false,
+    "editor.tabSize": 4,
+    "editor.detectIndentation": false,
+    "editor.defaultFormatter": "geequlim.godot-tools"
+  },
+
+  // .godot 是引擎导入缓存（几千个文件），不排除会拖慢搜索，
+  // 而且搜 Arena 这类符号时会被缓存文件的噪音淹没。
+  "files.watcherExclude": {
+    "**/.godot/**": true,
+    "**/build/**": true,
+    "**/__pycache__/**": true
+  },
+  "search.exclude": {
+    "**/.godot/**": true,
+    "**/build/**": true,
+    "**/__pycache__/**": true
+  },
+  "files.exclude": {
+    "**/__pycache__": true
+  },
+
+  "files.encoding": "utf8",
+  "files.eol": "\n"
+}
