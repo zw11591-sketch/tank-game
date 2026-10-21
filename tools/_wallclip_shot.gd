@@ -1,4 +1,4 @@
-﻿extends Node
+extends Node
 ## 临时诊断：单格走廊里，看得见的车体比碰撞轮廓宽多少。
 ## 打印标签全用 ASCII；截图存 tools/shots/clip/。
 

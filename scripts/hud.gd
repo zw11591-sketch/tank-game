@@ -220,8 +220,10 @@ func _process(_delta: float) -> void:
 	hull_ind.position = Vector2(vp.x - 204 - dial, vp.y - 64 - dial)
 	hull_ind.size = Vector2(dial, dial)
 	hull_ind.queue_redraw()
-	_speed_l.position = Vector2(vp.x - 328, vp.y - 60)
-	_speed_l.size = Vector2(152, 26)
+	# 车速标签比原来宽 40 px、左移 40 px："空挡 N  00 km/h" 在 17 px 字号下
+	# 约 190 px，原来的 152 px 会把两端顶出控件，靠近雷达时读起来像叠字。
+	_speed_l.position = Vector2(vp.x - 368, vp.y - 60)
+	_speed_l.size = Vector2(190, 26)
 
 	reticle.position = Vector2.ZERO
 	reticle.size = vp

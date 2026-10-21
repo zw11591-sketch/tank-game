@@ -27,10 +27,21 @@ const PITCH_SENS := 0.10
 ## 右摇杆满舵的角速度（弧度/秒）
 const STICK_RATE := 2.6
 
-## 镜头俯仰不再由鼠标控制：常态取 PITCH_BASE，并随炮管仰角按 PITCH_FOLLOW 抬降
-const PITCH_MIN := deg_to_rad(-8.0)
-const PITCH_MAX := deg_to_rad(42.0)
-const PITCH_BASE := deg_to_rad(26.0)
+## 镜头俯仰不再由鼠标控制：常态取 PITCH_BASE，并随炮管仰角按 PITCH_FOLLOW 抬降。
+##
+## 18° 而不是原来的 26°：俯角越大，画面里看到的越是墙顶与地面，车体反而缩在下方。
+## 收到 18° 之后视线更接近水平，3 m 砖墙会真正挡住画面，掩体才有"墙"的感觉，
+## 而不是一块可以俯视的矮台。
+const PITCH_MIN := deg_to_rad(-10.0)
+const PITCH_MAX := deg_to_rad(34.0)
+const PITCH_BASE := deg_to_rad(18.0)
+## 取景位的"视线高度"只到炮塔顶盖下方，而不是车顶之上。
+##
+## 3.0 的俯视点让相机实际站在 5.6 m 高：3 m 砖墙只到画面下三分之一，
+## 玩家一直在俯视墙顶；同时车尾离相机只有 5.8 m，履带正好压在画面下缘，
+## 被 HUD 切掉。降到 2.35 之后相机约 4.3 m 高：墙重新成为挡视线的掩体，
+## 车体在画面里从约 25% 提到 38%，而且履带完整可见。
+const PIVOT_EYE_Y := 2.35
 ## 镜头俯仰跟随炮管仰角的比例。
 ##
 ## 原来是 0.9：炮管一抬，镜头几乎整段跟着抬（俯角 33.2° → 9.8°），画面里准星
@@ -52,13 +63,18 @@ const FOLLOW_DEADZONE := deg_to_rad(42.0)
 
 const AIM_RANGE := 300.0
 
-const FOV_NORMAL := 74.0
+## 第三人称视场。74° 是"垂直视场"，在 16:9 下水平接近 110°，广角会把 4.4 m 的
+## 坦克压成画面里的一小块，并让边缘明显拉伸——这正是"桌面沙盘"读法的来源之一。
+## 60° 相当于 16:9 下水平约 91°，坦克在同样距离下占屏高度从 24% 提到 40% 以上。
+const FOV_NORMAL := 60.0
 const FOV_SNIPER := 26.0
 ## 第一人称视场比第三人称略宽，补偿"看不到车身两侧"带来的局促感
-const FOV_FIRST := 80.0
-const ARM_NORMAL := 12.0
-## 常态视角抬得比钢墙(4.4)更高，避免弹簧臂贴着掩体缩成特写
-const PIVOT_NORMAL := Vector3(0, 5.0, 0)
+const FOV_FIRST := 70.0
+## 常态臂长。12 m 时相机实际在离地 10 m 的空中，俯视整张图；
+## 7.6 m + 2.35 m 俯视点约等于 WoT 那种"贴着炮塔后方"的机位。
+const ARM_NORMAL := 7.6
+## 常态视角抬得比砖墙(3.0)更低：视线与炮塔齐平，掩体才会挡住视线。
+const PIVOT_NORMAL := Vector3(0, PIVOT_EYE_Y, 0)
 ## 狙击镜把镜头挪到炮口之前、与炮管同高，形成不被自车遮挡的炮手瞄具
 const PIVOT_SNIPER := Vector3(0, 2.1, -4.3)
 ## 第一人称：车长塔位置。炮塔顶盖约在 2.53，取 2.78 刚好探出舱盖，
@@ -101,7 +117,9 @@ var _hit_cache: Dictionary = {}
 func _ready() -> void:
 	arm = SpringArm3D.new()
 	arm.spring_length = ARM_NORMAL
-	arm.margin = 0.6
+	# 0.35 而不是 0.6：机位压低之后弹簧臂更容易顶到墙，margin 太大会把相机
+	# 推到车身里面；留一点余量避免贴图穿帮即可。
+	arm.margin = 0.35
 	arm.collision_mask = 1
 	arm.position = PIVOT_NORMAL
 	add_child(arm)

@@ -1,4 +1,4 @@
-﻿extends Node
+extends Node
 ## 临时验收：镜头相对驾驶（Settings.drive_relative）。
 ##
 ## 分两部分：

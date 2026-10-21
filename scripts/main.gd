@@ -626,7 +626,7 @@ func _spawn_enemy(t: int) -> bool:
 		e.setup(self, arena, pos)
 		add_child(e)
 		enemies.append(e)
-		Fx.smoke_puff(fx_root, pos + Vector3(0, 1.0, 0), 1.2)
+		Fx.smoke_puff(fx_root, pos + Vector3(0, 0.45, 0), 0.8)
 		Audio.play_3d("spawn", pos)
 		if t == 4:
 			_banner("⚠ 敌方指挥车出现！", 3.0)
@@ -649,7 +649,8 @@ func _spawn_player() -> void:
 	player.damage_mult = 1.0 + _stage_damage_bonus
 	player.shield_t = 3.0
 	rig.reset_to(player)
-	Fx.smoke_puff(fx_root, pos + Vector3(0, 1.0, 0), 1.2)
+	# 玩家出生不再放烟：出生点就在相机正前方 2 米，一团 1.2 米半径的烟
+	# 会直接糊住半个屏幕，开局三秒什么都看不清。护盾特效已经足够提示"车已就位"。
 	Audio.play("spawn")
 
 
@@ -995,9 +996,12 @@ func _build_garage() -> void:
 	_menu.add_child(_select_l)
 
 	_preview_vp = SubViewport.new()
-	_preview_vp.size = Vector2i(760, 440)
+	_preview_vp.size = Vector2i(1200, 700)
 	_preview_vp.transparent_bg = true
 	_preview_vp.own_world_3d = true
+	# 2K/4K 屏上 760x440 会被放大到发虚；1200x700 在同样的显示尺寸下
+	# 仍有足够像素承载迷彩与焊缝，MSAA 再把炮管这类细长边缘的锯齿压住。
+	_preview_vp.msaa_3d = Viewport.MSAA_4X
 	_preview_vp.render_target_update_mode = SubViewport.UPDATE_DISABLED
 	_menu.add_child(_preview_vp)
 
@@ -1007,36 +1011,80 @@ func _build_garage() -> void:
 	e.background_color = Color(0, 0, 0, 0)
 	e.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
 	e.ambient_light_color = Color(0.62, 0.68, 0.80)
-	e.ambient_light_energy = 0.85
+	e.ambient_light_energy = 0.72
+	# 转台原来只有纯透明背景：金属件没有任何可反射的东西，只能靠高光，
+	# 于是整台车看起来像塑料。给一个程序化天空当反射源，车顶与侧裙
+	# 才会出现天空的冷色反光，金属与涂装的分界也才读得出来。
+	var sky := Sky.new()
+	var sky_mat := ProceduralSkyMaterial.new()
+	sky_mat.sky_top_color = Color(0.20, 0.26, 0.38)
+	sky_mat.sky_horizon_color = Color(0.42, 0.40, 0.36)
+	sky_mat.ground_bottom_color = Color(0.05, 0.05, 0.055)
+	sky_mat.ground_horizon_color = Color(0.18, 0.17, 0.16)
+	sky_mat.sun_angle_max = 8.0
+	sky_mat.sun_curve = 0.12
+	sky.sky_material = sky_mat
+	e.sky = sky
+	e.reflected_light_source = Environment.REFLECTION_SOURCE_SKY
 	# 转台上的车是"展品"而不是"战场上的目标"，所以给它一点辉光让金属边缘亮起来
 	e.glow_enabled = true
 	e.glow_intensity = 0.5
-	e.tonemap_mode = Environment.TONE_MAPPER_FILMIC
+	# ACES 比 Filmic 更能压住高光，金属边缘不会一有反射就糊成白边
+	e.tonemap_mode = Environment.TONE_MAPPER_ACES
+	e.tonemap_exposure = 0.95
 	env.environment = e
 	_preview_vp.add_child(env)
 
 	_preview_holder = Node3D.new()
 	_preview_vp.add_child(_preview_holder)
 
-	# 三点布光：主光压出体积、辅光提亮暗面、轮廓光把车从深色背景里勾出来
+	# 接影地面：没有地面，主光开不开阴影都看不出来；有了它，车底才"落"在展台上。
+	var floor_mi := MeshInstance3D.new()
+	var disc := CylinderMesh.new()
+	disc.top_radius = 4.2
+	disc.bottom_radius = 4.4
+	disc.height = 0.12
+	disc.radial_segments = 48
+	floor_mi.mesh = disc
+	floor_mi.position = Vector3(0, -0.06, 0)
+	var floor_mat := StandardMaterial3D.new()
+	floor_mat.albedo_color = Color(0.145, 0.150, 0.160)
+	floor_mat.roughness = 0.42
+	floor_mat.metallic = 0.20
+	floor_mi.material_override = floor_mat
+	_preview_vp.add_child(floor_mi)
+
+	# 三点布光：主光压出体积、辅光提亮暗面、轮廓光把车从深色背景里勾出来。
+	# 主光 1.05 而不是 1.5：转台背景是一块亮天空，金属件会同时收到直射光与
+	# 天空反射，1.5 时车顶、舱盖、侧裙一起冲到 0.8 sRGB 以上，细节全被漂白。
 	var key := DirectionalLight3D.new()
 	key.rotation_degrees = Vector3(-38, 34, 0)
-	key.light_energy = 1.5
+	key.light_energy = 1.30
+	key.shadow_enabled = true
+	key.directional_shadow_max_distance = 14.0
 	_preview_vp.add_child(key)
 
 	var rim := DirectionalLight3D.new()
 	rim.rotation_degrees = Vector3(-22, -140, 0)
-	rim.light_energy = 1.0
+	rim.light_energy = 0.80
 	rim.light_color = Color(0.72, 0.82, 1.0)
 	_preview_vp.add_child(rim)
 
+	# 正面补光：主光在右后方，车头正面原来只剩环境光，炮盾与首上装甲
+	# 糊成一整块深绿。0.28 的暖色补光只抬暗面，不改变主光的方向感。
+	var front := DirectionalLight3D.new()
+	front.rotation_degrees = Vector3(-14, 196, 0)
+	front.light_energy = 0.28
+	front.light_color = Color(1.0, 0.92, 0.80)
+	_preview_vp.add_child(front)
+
 	var cam := Camera3D.new()
-	cam.position = Vector3(4.9, 3.1, 6.2)
-	cam.fov = 40.0
+	cam.position = Vector3(4.25, 2.65, 5.35)
+	cam.fov = 36.0
 	# look_at() 读的是全局变换，节点必须在树里才能算——所以先 add_child 再瞄。
 	# 顺序反了只会在启动时打一条 "Node not inside tree"，转台的机位也不会被设置。
 	_preview_vp.add_child(cam)
-	cam.look_at(Vector3(0, 1.0, 0), Vector3.UP)
+	cam.look_at(Vector3(0, 1.02, 0), Vector3.UP)
 
 	_preview_tex = TextureRect.new()
 	_preview_tex.texture = _preview_vp.get_texture()

@@ -12,7 +12,30 @@ build/
 
 # ---------------- 临时日志与调试输出 ----------------
 out_*.txt
+out_*.png
+out_*.png.import
+out_*.md
 _cur_*.txt
+# 根目录下以 _ 开头的一次性截图 / 转储 / 生成脚本（探针与正式工具不以下划线开头）
+_*.png
+_*.png.import
+_*.txt
+_*.md
+_*.py
+_*.gd
+_*.gd.uid
+_*.tscn
+# tools/ 下以 _ 开头的一次性探针（约定：长期保留的探针不以下划线开头）
+tools/_*.gd
+tools/_*.gd.uid
+tools/_*.tscn
+tools/_*.py
+tools/_*.txt
+tools/_*.ps1
+tools/_*.bin
+_recover/
+analysis_dump.txt
+report.txt
 tools/**/*.txt
 tools/shots/
 tools/blender/tex_cache/

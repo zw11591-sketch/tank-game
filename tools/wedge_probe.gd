@@ -1,4 +1,4 @@
-﻿extends Node
+extends Node
 ## 临时验收：单格宽门口（一行砖墙上只留一格）的通过性。
 ##
 ## squeeze_probe 的 gapRel 用例在这里重做一版，去掉两个会伪造结论的因素：

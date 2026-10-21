@@ -1,4 +1,4 @@
-﻿extends Node
+extends Node
 ## 临时诊断：**传统履带转向**（Settings.drive_relative = false）在单格宽通道里的手感。
 ##
 ## 为什么单独开一个：corridor / squeeze / wedge / pass 这几个探针全部先写死

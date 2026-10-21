@@ -36,9 +36,12 @@ def sandbags(out_dir):
         n = 5 - layer
         for i in range(n):
             x = (i - (n - 1) * 0.5) * 0.62
+            # 8x4 段：12 个袋子合计约 670 面，压在 prop_ 的 700 面预算内。
+            # 10x5 会到 960 面——沙袋是路障格里同屏最多的道具，超预算的代价
+            # 不是单件而是几十个实例一起翻倍。
             bag = L.sphere("bag%d_%d" % (layer, i), 0.33,
                            loc=(x, rng.uniform(-0.05, 0.05), 0.17 + layer * 0.3),
-                           segments=10, rings=5, material="M_Sandbag")
+                           segments=8, rings=4, material="M_Sandbag")
             bag.scale = (1.3, 0.85, 0.5)
             bag.rotation_euler = (0, 0, rng.uniform(-0.15, 0.15))
             parts.append(bag)
@@ -47,11 +50,13 @@ def sandbags(out_dir):
 
 def barrel(out_dir):
     L.reset_scene()
-    parts = [L.cyl("drum", 0.34, 1.05, loc=(0, 0, 0.52), verts=14, material="M_Rust")]
+    # 油桶同屏数量多，段数按"远看是圆的"取：12 边 + 12x4 箍 + 6 边桶盖
+    # 合计约 690 面，压在 700 面预算内；14/5 会到 760 面。
+    parts = [L.cyl("drum", 0.34, 1.05, loc=(0, 0, 0.52), verts=12, material="M_Rust")]
     for i in range(2):
         parts.append(L.torus("hoop%d" % i, 0.355, 0.035, loc=(0, 0, 0.32 + i * 0.42),
-                             major_seg=14, minor_seg=5, material="M_DarkMetal"))
-    parts.append(L.cyl("cap", 0.12, 0.07, loc=(0.16, 0, 1.06), verts=8,
+                             major_seg=12, minor_seg=4, material="M_DarkMetal"))
+    parts.append(L.cyl("cap", 0.12, 0.07, loc=(0.16, 0, 1.06), verts=6,
                        material="M_Accent"))
     return _finish(parts, "Barrel", out_dir)
 

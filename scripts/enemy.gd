@@ -152,6 +152,31 @@ func accent_glow() -> float:
 	return 1.5 if etype == 4 else 0.9
 
 
+## 可读性底光按地形取值：环境越暗，敌人车体需要的"与光照无关的最低亮度"越高。
+## 0.035 是白天的基准，暗图由 Arena 的 enemy_lift 覆盖（见 vis_probe 的 enemyLum）。
+func readability_floor() -> float:
+	if arena == null:
+		return 0.035
+	var v := arena.enemy_readability()
+	print("ENEMY_LIFT ", v, " terrain=", arena.terrain, " type=", etype)
+	return v
+
+
+## 敌车轮廓描边：冷色、只落在掠射边缘。
+##
+## 原来"敌车可读"全靠 readability 把整车自发光抬高——暗图上是必要的，
+## 但它也会在亮图上把车读成一块发光的模型。描边补的是另一件事：
+## 车体明度不变，轮廓外侧多出 2~3 像素的冷色，敌车与墙面、地面交界处
+## 永远有一条明度台阶。两件事叠在一起，才是"看得见"而不是"在发光"。
+##
+## 0.9 是实测取值：再高会在近距离变成一道荧光边，0.6 以下在 45 m 处
+## 只剩不到一个像素宽，等于没描。
+func edge_glow() -> float:
+	if etype == 4:
+		return 1.1
+	return 0.9
+
+
 ## 车型 → Blender 模型。索引与 configure() 的 etype 分支一一对应。
 func model_key() -> String:
 	match etype:

@@ -170,6 +170,44 @@ static func explosion(parent: Node, pos: Vector3, size := 1.0) -> void:
 
 	smoke_puff(parent, pos + Vector3(0, 1.0, 0), size * 1.2)
 
+	# 5. 贴地尘环：爆炸 1 秒后火球与火星都消失了，尘环还在往外推，
+	#    把"这里刚刚炸过"这句话延长到两三秒。
+	var dust := DustRing.new()
+	dust.position = pos
+	dust.size_mult = size
+	parent.add_child(dust)
+
+	# 6. 落地碎块：不再随粒子一起消失，而是真的躺在地上当战场垃圾。
+	_settle_debris(parent, pos, size)
+
+
+## 爆炸后留在原地的碎块。粒子系统里的碎块寿命一过就整批消失，
+## 所以这里单独摆几块静态网格：它们有体积、投影、受光，几秒后随父节点回收。
+static func _settle_debris(parent: Node, pos: Vector3, size: float) -> void:
+	var root := Node3D.new()
+	root.position = pos
+	parent.add_child(root)
+	var n := 4 + int(round(size * 2.0))
+	for i in n:
+		var a := randf_range(0.0, TAU)
+		var r := randf_range(0.7, 2.6) * size
+		var s := randf_range(0.14, 0.34) * maxf(0.8, size)
+		var mi := MeshInstance3D.new()
+		var box := BoxMesh.new()
+		box.size = Vector3(s, s * randf_range(0.55, 0.9), s * randf_range(0.8, 1.2))
+		mi.mesh = box
+		var col := Color(0.24, 0.225, 0.20).lerp(Color(0.36, 0.31, 0.24), randf())
+		var mat := StandardMaterial3D.new()
+		mat.albedo_color = col
+		mat.roughness = 0.95
+		mi.material_override = mat
+		mi.position = Vector3(cos(a) * r, s * 0.35, sin(a) * r)
+		mi.rotation = Vector3(randf_range(-0.2, 0.2), randf_range(0.0, TAU),
+				randf_range(-0.2, 0.2))
+		mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+		root.add_child(mi)
+	_autofree(root, 24.0)
+
 
 ## 炮口焰：锥形闪光 + 瞬时点光 + 一缕残烟
 static func muzzle_flash(parent: Node, pos: Vector3, dir: Vector3) -> void:
@@ -484,6 +522,47 @@ class Shockwave extends Node3D:
 		_mi.scale = Vector3(r, maxf(0.12, 0.6 - k * 0.5) * size_mult, r)
 		_mat.albedo_color.a = (1.0 - k) * 0.55
 		_mat.emission_energy_multiplier = 2.5 * (1.0 - k)
+
+
+## 贴地扩张的尘环：比 Shockwave 慢、比它大、比它久，颜色是土而不是光。
+## 冲击波负责"这一下很重"，尘环负责"这一下刚刚发生过"。
+class DustRing extends Node3D:
+	var t := 0.0
+	var duration := 2.6
+	var size_mult := 1.0
+	var _mi: MeshInstance3D
+	var _mat: StandardMaterial3D
+
+	func _ready() -> void:
+		_mat = StandardMaterial3D.new()
+		_mat.albedo_color = Color(0.43, 0.39, 0.32, 0.34)
+		_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+		_mat.disable_receive_shadows = true
+
+		var tm := TorusMesh.new()
+		tm.inner_radius = 0.62
+		tm.outer_radius = 1.0
+		tm.rings = 28
+		tm.ring_segments = 5
+		_mi = MeshInstance3D.new()
+		_mi.mesh = tm
+		_mi.material_override = _mat
+		_mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		add_child(_mi)
+		position.y += 0.12
+
+	func _process(delta: float) -> void:
+		t += delta
+		var k := clampf(t / duration, 0.0, 1.0)
+		if k >= 1.0:
+			queue_free()
+			return
+		# 前 15% 快速铺开，之后几乎停住慢慢淡掉：尘土是被推出去的，不是自己飞的
+		var r := (1.1 + 7.4 * pow(k, 0.55)) * size_mult
+		_mi.scale = Vector3(r, maxf(0.06, 0.5 - k * 0.42) * size_mult, r)
+		_mat.albedo_color.a = 0.34 * (1.0 - k) * (1.0 - k)
 
 
 ## 炮口焰：锥形闪光，瞬时亮一下就收

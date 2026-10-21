@@ -31,16 +31,23 @@ func setup(hull: Vector3, accent: Color) -> void:
 # ---------------- 车头灯 / 车尾灯 ----------------
 
 func _lamps(half_l: float, half_w: float, deck: float) -> void:
-	var white := _glow_mat(LAMP_WARM, 3.0)
-	var red := _glow_mat(LAMP_RED, 2.8)
+	# 发光强度收到 1.0~1.2：原来 2.8 / 3.0 的自发光在 ACES + 辉光下被推到
+	# 纯白再染上材质色，两块 0.34×0.26 m 的尾灯就变成车尾两块橙色光板
+	# （截图里比车体本身还抢眼，看起来像渲染 bug 而不是灯）。
+	# 灯具的作用是"读出车头车尾"，不是照明；1.1 在夜战图里仍然亮，
+	# 但高光不再溢出到灯体之外。
+	var white := _glow_mat(LAMP_WARM, 1.2)
+	var red := _glow_mat(LAMP_RED, 1.1)
 	var y := deck - 0.2
 	for sx in [-1.0, 1.0]:
 		# 车头灯：比首下斜板最前端再探出一点，避免被斜板挡住
-		_box(Vector3(0.36, 0.3, 0.14),
-				Vector3(sx * (half_w * 0.82), y, -half_l - 0.36), 0.0, white)
-		# 车尾灯：比尾板更靠后，红色是"尾巴"的通用语言
-		_box(Vector3(0.34, 0.26, 0.12),
-				Vector3(sx * (half_w * 0.72), y - 0.14, half_l + 0.22), 0.0, red)
+		_box(Vector3(0.26, 0.16, 0.10),
+				Vector3(sx * (half_w * 0.82), y, -half_l - 0.34), 0.0, white)
+		# 车尾灯：比尾板更靠后，红色是"尾巴"的通用语言。做成横向窄条
+		# 而不是方灯：0.26×0.10 m 的尺度在第三人称视距上刚好吃得下，
+		# 又不会在车尾糊成两块面板。
+		_box(Vector3(0.26, 0.10, 0.08),
+				Vector3(sx * (half_w * 0.72), y - 0.10, half_l + 0.18), 0.0, red)
 
 
 # ---------------- 地面导向箭头 ----------------

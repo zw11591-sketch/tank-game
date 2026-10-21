@@ -48,7 +48,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 TEX_DIR = os.path.join(_HERE, "tex_cache")
 
 # 生成器一改，缓存必须失效，否则会拿着旧图当新图用
-VERSION = "v3"
+VERSION = "v4"
 
 ## 一个 UV 单位对应多少米。全部件共用，贴图才可能跨部件对齐。
 TILE = 2.0
@@ -229,11 +229,14 @@ def _paint_maps():
     grain = _fbm(rng, n, cells=64, octaves=3)
 
     # --- 迷彩：两级阈值的斑块。只压暗、不染色，阵营色乘上来才是本阵营的迷彩 ---
+    # 对比度刻意收窄：0.56 的暗斑乘上阵营色后，一块车体上会出现接近两倍的明度差，
+    # 远看就是"贴了一张迷彩贴纸"。0.72 / 0.90 的落差在受光后仍读得出斑块，
+    # 但不会再和焊缝、流痕抢注意力。
     big = _fbm(rng, n, cells=2, octaves=4)
     mid = _fbm(rng, n, cells=4, octaves=4)
     alb = np.ones((n, n, 3), np.float64)
-    c_cool = np.array([0.74, 0.73, 0.70])       # 冷灰斑
-    c_warm = np.array([0.89, 0.85, 0.77])       # 暖褐斑
+    c_cool = np.array([0.72, 0.73, 0.74])       # 冷灰斑
+    c_warm = np.array([0.90, 0.87, 0.81])       # 暖褐斑
     alb = np.where((big > 0.55)[:, :, None], c_cool, alb)
     alb = np.where(((big <= 0.55) & (mid > 0.57))[:, :, None], c_warm, alb)
 
@@ -244,7 +247,7 @@ def _paint_maps():
 
     # --- 掉漆划痕：擦到接近底漆的亮度 ---
     scratch = _scratches(n, rng, 55, 1.0, 1.6)
-    alb = np.where(scratch[:, :, None] > 0.5, (0.96, 0.95, 0.93), alb)
+    alb = np.where(scratch[:, :, None] > 0.5, (0.80, 0.79, 0.77), alb)
 
     # --- 流痕与积灰：从横缝向下拖出的暗纹，再靠噪声打断成断续的条 ---
     grime = _streaks(n, hz, 1.0)
@@ -290,7 +293,7 @@ def _metal_maps():
     grain = _fbm(rng, n, cells=48, octaves=3)
 
     # 颜色烘进贴图：M_TankMetal 的 Base Color 因此留白，不会和因子二次相乘
-    base = _lin_to_srgb(L.PALETTE["M_Metal"][0][:3])
+    base = _lin_to_srgb(L.PALETTE["M_TankMetal"][0][:3])
     alb = np.ones((n, n, 3), np.float64) * base
 
     # 轧制纹：把竖向相邻几行平均掉，得到横向拉长的各向异性，像钢板的轧制方向
@@ -321,11 +324,14 @@ def _metal_maps():
     nrm = _height_to_normal(h, 1.4)
 
     orm = np.ones((n, n, 3), np.float64)
-    rough = 0.38 + 0.32 * (_fbm(rng, n, cells=9, octaves=3) - 0.5)
-    rough -= 0.14 * scratch
-    rough += 0.30 * smudge
+    # 金属度 0.90 会让整车金属件变成镜面：车库的亮天空、战场的地面颜色
+    # 全被反射到翼子板与舱盖上，于是"钢"读成"浅灰塑料"。0.35 保留金属高光，
+    # 但可见颜色重新由暗色的 albedo 主导。
+    rough = 0.52 + 0.26 * (_fbm(rng, n, cells=9, octaves=3) - 0.5)
+    rough -= 0.10 * scratch
+    rough += 0.22 * smudge
     orm[:, :, 1] = np.clip(rough, 0.12, 0.98)
-    orm[:, :, 2] = 0.90
+    orm[:, :, 2] = 0.35
     return alb, nrm, orm
 
 

@@ -48,6 +48,14 @@ const MIN_SCENE_LUM := 0.15
 const CROP := 48
 
 var _rows: Array = []
+## 只测一张图（--terrain=N），用于调参时快速迭代；不带参数时跑全部。
+var _only := -1
+## --terrains=0,1,3,6 时只跑这几张，用于按失败项复测。
+var _terrains: Array = []
+## 验收用的纯红材质。必须活到场景退出，否则敌车网格上会留下已释放的 override。
+var _dbg_mat: StandardMaterial3D
+## 调试开关：只量轮廓位置时换成纯红不发光材质，不参与 enemyLum 判据。
+var _debug_red := false
 
 
 func _main() -> Node:
@@ -63,12 +71,25 @@ func _ready() -> void:
 	for a in OS.get_cmdline_user_args():
 		if a.begins_with("--quality="):
 			Settings.quality = int(a.split("=")[1])
+		if a.begins_with("--terrain="):
+			_only = int(a.split("=")[1])
+		if a.begins_with("--terrains="):
+			_only = -2
+			_terrains = []
+			for s in a.split("=")[1].split(","):
+				_terrains.append(int(s))
+		if a == "--debug-red":
+			_debug_red = true
 	print("QUALITY ", Settings.quality)
 	Settings.apply_display()
 	Settings.apply_render()
 	DirAccess.make_dir_recursive_absolute(DIR)
 
 	for t in Arena.TERRAINS.size():
+		if _only >= 0 and t != _only:
+			continue
+		if _only == -2 and not _terrains.has(t):
+			continue
 		await _measure(t)
 
 	print("---- VISIBILITY TABLE ----")
@@ -76,6 +97,10 @@ func _ready() -> void:
 			% [MIN_SCENE_LUM, MIN_ENEMY_LUM, LANES])
 	print("   wMin/wAvg = weber contrast (observed only, not a gate)")
 	print("idx layout            sceneLum  eMin  eAvg   wMin  wAvg  dist verdict")
+	# 同一张表同时写盘。Godot 的 stdout 经 PowerShell 管道时会被块缓冲打散，
+	# 表格中间几行偶尔整段丢失；读数要能事后核对，就不能只依赖控制台。
+	var table: Array[String] = []
+	table.append("idx layout            sceneLum  eMin  eAvg   wMin  wAvg  dist verdict")
 	var fails := 0
 	for r in _rows:
 		var bad := []
@@ -92,11 +117,19 @@ func _ready() -> void:
 				failed = true
 		if failed:
 			fails += 1
-		print("%2d  %-16s %7.4f %6.4f %6.4f %6.3f %5.3f %5.1f %s" % [
+		var row := "%2d  %-16s %7.4f %6.4f %6.4f %6.3f %5.3f %5.1f %s" % [
 				r["idx"], r["layout"], r["scene"], r["emin"], r["eavg"],
 				r["wmin"], r["wavg"], r["dist"],
-				"ok" if bad.is_empty() else " ".join(bad)])
-	print("VERDICT fail=%d / %d" % [fails, _rows.size()])
+				"ok" if bad.is_empty() else " ".join(bad)]
+		print(row)
+		table.append(row)
+	var verdict := "VERDICT fail=%d / %d" % [fails, _rows.size()]
+	print(verdict)
+	table.append(verdict)
+	var f := FileAccess.open(DIR + "report.txt", FileAccess.WRITE)
+	if f != null:
+		f.store_string("\n".join(table) + "\n")
+		f.close()
 	get_tree().quit()
 
 
@@ -160,12 +193,26 @@ func _measure(idx: int) -> void:
 	main.add_child(e)
 	main.enemies.append(e)
 
+	# 默认沿用真实涂装 shader——验收量的是玩家实际看到的车，不是一块色卡。
+	# --debug-red 时才换成纯红 unshaded：用来把"车在不在画面里"和
+	# "涂装够不够亮"两个问题拆开查；红色经 ACES 后只有 0.17 左右，
+	# 用它量 enemyLum 必然误报 DARK。
+	if _debug_red:
+		_dbg_mat = StandardMaterial3D.new()
+		_dbg_mat.albedo_color = Color(1, 0, 0)
+		_dbg_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		for mi in e.find_children("*", "MeshInstance3D", true, false):
+			(mi as MeshInstance3D).material_override = _dbg_mat
+
 	var lum_min := 1.0
 	var lum_sum := 0.0
 	var web_min := 9.0
 	var web_sum := 0.0
 	var scene := 0.0
 	var ok := 0
+	# 采样被拒的原因。某张图如果一行都量不到（ok == 0），必须能看出
+	# 是"被墙挡住"还是"落在画面外"，否则只能看到一张空表。
+	var rej: Array[String] = []
 	var shown := false
 	for lane in lanes:
 		var yaw: float = float(lane["yaw"])
@@ -208,21 +255,49 @@ func _measure(idx: int) -> void:
 			vq.exclude = [p.get_rid()]
 			var vhit := space.intersect_ray(vq)
 			if vhit.is_empty() or vhit["collider"] != e:
+				var what := "empty" if vhit.is_empty() else String(vhit["collider"].name)
+				rej.append("occl:%s" % what)
 				continue
-			var sp: Vector2 = main.rig.cam.unproject_position(ctr)
+			# unproject_position 给的是相机可见区坐标，而截图是窗口像素坐标。
+			# 本项目 1280x720 窗口下相机可见区是 960x540（stretch canvas_items），
+			# 不换算就会把取样框打在车体左上方 100 多像素的空白地面上——
+			# 量到的"敌人亮度"其实是背景亮度，整张验收表因此失真。
+			var vsize: Vector2 = main.rig.cam.get_viewport().get_visible_rect().size
+			var k: Vector2 = Vector2(img.get_width(), img.get_height()) / vsize
+			var sp: Vector2 = main.rig.cam.unproject_position(ctr) * k
 			# 车在屏幕上有多大必须由投影算出来，不能写死像素：
 			# 取样块写死就会在近处只量到车体中心一小片、在远处把背景也圈进来，
 			# 而"背景环"一旦压在车身上，对比度会被自己抹平成 0。
 			var side: Vector3 = main.rig.cam.global_transform.basis.x * HULL_RADIUS
-			var rad: float = maxf(sp.distance_to(main.rig.cam.unproject_position(ctr + side)), 4.0)
+			var rad: float = maxf(sp.distance_to(
+					main.rig.cam.unproject_position(ctr + side) * k), 4.0)
 			var pr := int(rad * 0.55)
 			var r0 := int(rad * 1.35)
 			var r1 := int(rad * 2.4)
 			if sp.x < r1 or sp.x > img.get_width() - r1 \
 					or sp.y < r1 or sp.y > img.get_height() - r1:
+				rej.append("bounds%.0f,%.0f" % [sp.x, sp.y])
 				continue
 			if not shown:
 				shown = true
+				print("DIAG p=", p.global_position, " e=", e.global_position,
+						" cam=", main.rig.cam.global_position, " ctr=", ctr,
+						" behind=", main.rig.cam.is_position_behind(ctr),
+						" sp=", sp, " yaw=", yaw, " kids=", e.get_child_count(),
+						" vis=", e.visible, " alive=", e.alive)
+				print("DIAGSZ img=", img.get_size(),
+						" view=", main.rig.cam.get_viewport().get_visible_rect().size,
+						" win=", DisplayServer.window_get_size(),
+						" camsize=", main.rig.cam.get_viewport().size,
+						" fov=", main.rig.cam.fov)
+				var hull := e.find_child("HullMesh", true, false) as MeshInstance3D
+				if hull != null:
+					var m0 := hull.get_surface_override_material(0) as ShaderMaterial
+					if m0 != null:
+						print("DIAGMAT shader=", m0.shader != null,
+								" readable=", m0.get_shader_parameter("readability"),
+								" dirt=", m0.get_shader_parameter("dirt_amount"),
+								" paint=", m0.get_shader_parameter("paint_color"))
 				img.save_png(DIR + "%02d_%s.png" % [idx, layout])
 				scene = _frame_lum(img)
 				# 45 米外的敌车只有三十来个像素宽，整帧图上肉眼也分辨不出来，
@@ -254,9 +329,14 @@ func _measure(idx: int) -> void:
 			"wmin": web_min, "wavg": web_sum / float(ok),
 			"dist": float(lanes[0]["dist"]),
 		})
+	else:
+		print("NO_SAMPLE terrain=%d lanes=%d rej=%s" % [idx, lanes.size(), rej])
 
 	e.alive = false
 	main.enemies.erase(e)
+	# 先撤掉 override 再放车：释放顺序反过来会在退出时留下悬空材质引用
+	for mi in e.find_children("*", "MeshInstance3D", true, false):
+		(mi as MeshInstance3D).material_override = null
 	e.queue_free()
 
 
@@ -306,3 +386,14 @@ func _frame_lum(img: Image) -> float:
 			sum += img.get_pixel(x, y).get_luminance()
 			n += 1
 	return sum / maxf(float(n), 1.0)
+
+
+func _dump3d(n: Node, root: Node, depth: int) -> void:
+	if n is Node3D:
+		var n3 := n as Node3D
+		print("D3 ", "  ".repeat(depth), n.name, " cls=", n.get_class(),
+				" vis=", n3.visible, " gp=", n3.global_position,
+				" s=", n3.scale, " top=", n3.top_level)
+	for c in n.get_children():
+		if depth < 3:
+			_dump3d(c, root, depth + 1)

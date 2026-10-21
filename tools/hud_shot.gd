@@ -56,7 +56,10 @@ func _physics_process(_d: float) -> void:
 	if _f == 240:
 		_seed_powerups(main)
 
-	if _f == 300:
+	# 关卡横幅在进入战斗后还要停留 2.6 s。截图必须等它消失，
+	# 否则文档图正中永远是"第 3 关 · 废墟城区 · 普通"这行字。
+	# 300 帧时横幅早已结束（200 帧进入战斗 + 2.6 s ≈ 356 帧）。
+	if _f == 460:
 		_report(main)
 		await _shot("HUD_%d_%s" % [_idx, str(Arena.TERRAINS[TERRAINS[_idx]]["layout"])])
 		if _idx + 1 < TERRAINS.size():

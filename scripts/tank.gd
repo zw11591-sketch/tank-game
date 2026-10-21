@@ -186,6 +186,12 @@ var _wheel_radius := 0.45
 ## 炮管节点的静止局部坐标。后坐动画是在它之上叠加偏移，而不是直接写死坐标。
 var _barrel_base := Vector3.ZERO
 var _hull_base_y := 0.85
+var _track_mats: Array = []
+var _track_scroll := 0.0
+var _dust_l: GPUParticles3D
+var _dust_r: GPUParticles3D
+var _exhaust: GPUParticles3D
+var _damage_smoke: GPUParticles3D
 ## 自上一枚履带印以来行驶的距离（米）
 var _track_dist := 0.0
 ## 自上一声履带响以来行驶的距离（米）。与贴花分开计数：
@@ -261,6 +267,7 @@ func _ready() -> void:
 	# （那只是 Blender 的主箱体）。细节见 _init_hull_outline()。
 	_build_body()
 	_init_hull_outline()
+	_build_track_fx()
 
 	# 车体在+ 车鼻 + 车尾：物理引擎这一侧仍用圆柱近似车身（网格解交生
 	# _settle() 的精确矩形负责）。move_and_slide 与坦克之间的互撞因此看的
@@ -304,6 +311,19 @@ func accent_color() -> Color:
 ## 识别色块的自发光强度。玩家车不发光——自车位置永远不是信息缺口；
 ## 敌车发光，于是场上还有调在任何地形、任何光照下都读得出来（见Enemy）。
 func accent_glow() -> float:
+	return 0.0
+
+
+## 涂装的可读性底光（材质自发光的最低亮度）。玩家车保持默认；
+## 敌人按地形把它抬高，见 Enemy.readability_floor()。
+func readability_floor() -> float:
+	return 0.035
+
+
+## 轮廓描边强度（0 = 不描边）。只作用在剪影边缘，功率决定宽度。
+## 玩家车不描边——自车位置永远不是信息缺口；敌车靠这一圈冷色
+## 从背景里"挑"出来，而不必把整台车提亮成一块灯箱。
+func edge_glow() -> float:
 	return 0.0
 
 
@@ -488,7 +508,9 @@ func _build_model_body() -> bool:
 	if _model == null:
 		return false
 	add_child(_model)
-	Assets.paint(_model, hull_color(), accent_color(), accent_glow())
+	Assets.paint(_model, hull_color(), accent_color(), accent_glow(),
+			readability_floor(), edge_glow())
+	_track_mats = Assets.apply_track_shader(_model)
 
 	turret = Assets.find_node(_model, "Turret")
 	barrel = Assets.find_node(_model, "Barrel")
@@ -509,7 +531,46 @@ func _build_model_body() -> bool:
 	# （它又与 tools/blender/gen_tanks.py 的_running_gear 一一对应（
 	_wheel_radius = float(TankRoster.dims(model_key())["wheel"])
 	_hull_base_y = 0.0
+	_add_turret_markings()
 	return true
+
+
+## 炮塔侧面的车号。
+##
+## 涂装 shader 已经叠了泥污、AO、流痕三层，但整车仍然是一块"干净的色块"——
+## 缺少最后那层只有人手工刷上去才会有的信息：战术编号。编号不必精确到车，
+## 它解决的是"这台车被谁开过"的读法；同时也让同型号敌车在近距离不至于完全一样。
+##
+## 用 Label3D 而不是 Decal：编号只有两位数字，做成贴图要么带字体资源、
+## 要么自己画点阵；Label3D 直接用引擎字体，贴在炮塔两侧，转动炮塔时跟着走，
+## 与炮塔一起被击毁时也会随模型复制到残骸上。
+func _add_turret_markings() -> void:
+	if turret == null:
+		return
+	var tm := Assets.find_node(turret, "TurretMesh") as MeshInstance3D
+	if tm == null or tm.mesh == null:
+		return
+	var box: AABB = tm.mesh.get_aabb()
+	var center := box.get_center()
+	var half_x := box.size.x * 0.5
+	var number := randi_range(11, 98)
+	for side in [-1.0, 1.0]:
+		var l := Label3D.new()
+		l.text = "%02d" % number
+		# 96 px × 0.0032 m = 0.31 m 高：远看只是一个浅色小方块，
+		# 贴到 15 m 内才读得出数字——战术编号本来就该是这个尺度
+		l.font_size = 96
+		l.pixel_size = 0.0032
+		l.modulate = Color(0.84, 0.82, 0.74, 0.90)
+		# 受光而不是自发光：夜战图上编号不能变成一块发亮的白斑
+		l.shaded = true
+		l.billboard = BaseMaterial3D.BILLBOARD_DISABLED
+		l.double_sided = false
+		l.outline_size = 0
+		l.position = tm.position + Vector3(side * (half_x + 0.012), center.y, center.z)
+		# 两侧都朝外：+X 侧绕 +90°，-X 侧绕 -90°，文字在各自一侧都是正的
+		l.rotation.y = side * PI * 0.5
+		turret.add_child(l)
 
 
 func _build_shield() -> void:
@@ -1218,6 +1279,22 @@ func _bleed_on_impact(delta: float) -> void:
 func _animate_tracks(delta: float) -> void:
 	var sr := _speed / maxf(move_speed, 0.01)
 	_tread_phase += sr * delta * 6.0
+	# 履带带纹按真实线速度滚动。上支段与下支段符号相反，车往前走时
+	# 两条带子朝相反方向跑；材质上的 track_sign 就是这个方向的唯一来源。
+	_track_scroll += _speed * delta
+	for m in _track_mats:
+		var sm := m as ShaderMaterial
+		if sm != null:
+			sm.set_shader_parameter("scroll", _track_scroll * float(sm.get_meta("track_sign", 1.0)))
+	var moving := absf(_speed) > 1.2 and alive
+	if _dust_l != null:
+		_dust_l.emitting = moving
+	if _dust_r != null:
+		_dust_r.emitting = moving
+	if _exhaust != null:
+		_exhaust.emitting = alive and absf(_speed) > 0.4
+	if _damage_smoke != null:
+		_damage_smoke.emitting = alive and hp < max_hp * 0.45
 	# 车体随行进起伏：模型路径动整棵子树，图元路径只动车体网格
 	var bob := sin(_tread_phase * 3.0) * 0.035 * absf(sr)
 	if _model != null:
@@ -1233,6 +1310,217 @@ func _animate_tracks(delta: float) -> void:
 		_tread_l.position.y = 0.45 - bob * 0.5
 	if _tread_r != null:
 		_tread_r.position.y = 0.45 - bob * 0.5
+
+
+## 履带扬尘 / 排气 / 残血黑烟。
+##
+## 这四样是"这台车是活的"最直接的读法，而且全部走现有粒子系统，不需要任何新资源：
+## 移动时两条履带后方起尘、车尾排气随速度变浓、血量低于 45% 时发动机舱冒黑烟。
+## 粒子坐标设为世界空间（local_coords = false），车开走之后尘烟留在原地。
+func _build_track_fx() -> void:
+	var dust_col := Color(0.62, 0.56, 0.44, 0.26)
+	_dust_l = _make_trail(26, 1.35, Vector3(-body_radius * 0.66, 0.16, body_length * 0.34),
+		Vector3(0, 0.55, 0.85), 32.0, 0.5, 1.8, Vector3(0, 0.35, 0),
+		Vector3(0.45, 0.45, 0.45), Vector3(1.05, 1.05, 1.05), dust_col)
+	_dust_r = _make_trail(26, 1.35, Vector3(body_radius * 0.66, 0.16, body_length * 0.34),
+		Vector3(0, 0.55, 0.85), 32.0, 0.5, 1.8, Vector3(0, 0.35, 0),
+		Vector3(0.45, 0.45, 0.45), Vector3(1.05, 1.05, 1.05), dust_col)
+
+	_exhaust = _make_trail(18, 2.0, Vector3(0, 1.45, body_length * 0.30),
+		Vector3(0, 0.45, 0.55), 22.0, 0.5, 1.3, Vector3(0, 0.55, 0),
+		Vector3(0.35, 0.35, 0.35), Vector3(0.8, 0.8, 0.8),
+		Color(0.22, 0.21, 0.20, 0.30))
+
+	_damage_smoke = _make_trail(16, 3.0, Vector3(0, 1.55, body_length * 0.18),
+		Vector3(0, 0.8, 0.1), 14.0, 0.8, 1.8, Vector3(0.25, 0.9, 0),
+		Vector3(0.8, 0.8, 0.8), Vector3(1.8, 1.8, 1.8),
+		Color(0.09, 0.085, 0.08, 0.52))
+
+
+func _make_trail(amount: int, life: float, pos: Vector3, dir: Vector3, spread: float,
+		v0: float, v1: float, gravity: Vector3, s0: Vector3, s1: Vector3,
+		col: Color) -> GPUParticles3D:
+	var p := GPUParticles3D.new()
+	p.amount = amount
+	p.lifetime = life
+	p.local_coords = false
+	p.emitting = false
+	p.visibility_aabb = AABB(Vector3(-8, -2, -8), Vector3(16, 10, 16))
+	var pm := ParticleProcessMaterial.new()
+	pm.emission_shape = ParticleProcessMaterial.EMISSION_SHAPE_SPHERE
+	pm.emission_sphere_radius = 0.32
+	pm.direction = dir
+	pm.spread = spread
+	pm.initial_velocity_min = v0
+	pm.initial_velocity_max = v1
+	pm.gravity = gravity
+	pm.scale_min = s0.x
+	pm.scale_max = s1.x
+	pm.color = col
+	# 烟雾要随寿命长大，不能一出生就是最终大小
+	var curve := Curve.new()
+	curve.add_point(Vector2(0.0, 0.25))
+	curve.add_point(Vector2(0.35, 1.0))
+	curve.add_point(Vector2(1.0, 1.0))
+	var ct := CurveTexture.new()
+	ct.curve = curve
+	pm.scale_curve = ct
+	var ramp := Gradient.new()
+	ramp.set_color(0, Color(col.r, col.g, col.b, col.a))
+	ramp.set_color(1, Color(col.r, col.g, col.b, 0.0))
+	var rt := GradientTexture1D.new()
+	rt.gradient = ramp
+	pm.color_ramp = rt
+	p.process_material = pm
+	p.draw_pass_1 = Fx._quad(col, Fx.soft_dot(), false)
+	p.position = pos
+	p.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	add_child(p)
+	return p
+
+
+## 击毁后的残骸：车体保留、炮塔歪斜、炮管下垂、发动机舱冒黑烟。
+##
+## 原来的 `queue_free()` 让"击毁"只等于一次爆炸特效，1 秒后战场恢复原样；
+## 残骸既是视觉焦点，也是战术掩体。碰撞体放在 LAYER_BLOCKER：
+## 坦克的 mask 包含这一层，炮弹的射线 mask 不包含——于是它"挡车不挡弹"。
+func _spawn_wreck() -> void:
+	if arena == null:
+		return
+	var w := Node3D.new()
+	w.name = "Wreck"
+	# 必须先挂进场景树，global_position / rotation 才有意义：
+	# 在树外的节点上写 global_position 会刷 "!is_inside_tree()" 并返回单位变换，
+	# 残骸会被丢到世界原点，而不是击毁地点
+	arena.add_wreck(w)
+	w.global_position = global_position + Vector3(0, -0.05, 0)
+	w.rotation.y = rotation.y
+	w.rotation.z = randf_range(-0.075, 0.075)
+
+	var burn := StandardMaterial3D.new()
+	burn.albedo_color = Color(0.072, 0.064, 0.058)
+	burn.roughness = 0.97
+	burn.metallic = 0.12
+
+	if _model != null:
+		var copy := _model.duplicate() as Node3D
+		copy.position = Vector3.ZERO
+		copy.rotation = Vector3.ZERO
+		w.add_child(copy)
+		_burn_meshes(copy, burn)
+		var t := Assets.find_node(copy, "Turret")
+		if t != null:
+			t.rotation.y += randf_range(-0.30, 0.30)
+			t.rotation.z = randf_range(-0.22, 0.22)
+		var b := Assets.find_node(copy, "Barrel")
+		if b != null:
+			b.rotation.x += randf_range(0.12, 0.26)
+	else:
+		var hull := MeshInstance3D.new()
+		var hb := BoxMesh.new()
+		hb.size = Vector3(_hull_size.x, 0.9, _hull_size.y)
+		hull.mesh = hb
+		hull.position = Vector3(0, 0.7, 0)
+		hull.material_override = burn
+		w.add_child(hull)
+		var turret_mi := MeshInstance3D.new()
+		var tb := BoxMesh.new()
+		tb.size = Vector3(_hull_size.x * 0.6, 0.6, _hull_size.y * 0.5)
+		turret_mi.mesh = tb
+		turret_mi.position = Vector3(0.25, 1.4, 0.2)
+		turret_mi.rotation_degrees = Vector3(0, 18, 12)
+		turret_mi.material_override = burn
+		w.add_child(turret_mi)
+
+	# 残骸冒烟：比"残血黑烟"更浓、更久，30 秒后自动停，车体留着当掩体
+	var smoke := _make_wreck_smoke(w)
+	smoke.position = Vector3(0, 1.35, 0)
+	smoke.emitting = true
+
+	var ember := OmniLight3D.new()
+	ember.light_color = Color(1.0, 0.42, 0.12)
+	ember.light_energy = 0.7
+	ember.omni_range = 6.0
+	ember.position = Vector3(0, 1.0, 0)
+	ember.shadow_enabled = false
+	w.add_child(ember)
+
+	var body := StaticBody3D.new()
+	body.collision_layer = LAYER_BLOCKER
+	body.collision_mask = 0
+	body.name = "WreckBody"
+	var shape := CollisionShape3D.new()
+	var box := BoxShape3D.new()
+	box.size = Vector3(body_radius * 1.7, 1.35, body_length * 0.78)
+	shape.shape = box
+	shape.position = Vector3(0, 0.68, 0)
+	body.add_child(shape)
+	w.add_child(body)
+
+
+func _burn_meshes(n: Node, mat: StandardMaterial3D) -> void:
+	if n is MeshInstance3D:
+		var mi := n as MeshInstance3D
+		mi.material_override = mat
+		mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+		# 残骸是 `_model.duplicate()`：涂装只覆盖 M_Paint / M_Accent / 金属 /
+		# 尾灯 / 玻璃这五类表面，橡胶履带、帆布、深色金属等表面留下的是
+		# **null** surface override。原模型进场景树时这些 null 从未被查询，
+		# 复制出来的残骸却会在 NOTIFICATION_ENTER_WORLD 时逐表面对渲染器
+		# 查询 instance uniform，无头渲染器于是连刷
+		# `ERROR: Parameter "material" is null.`
+		# 残骸整体换烧黑材质，顺手把每一面的 override 都填成同一个非空材质，
+		# 既消掉日志，也保证没有任何一面还保留原来的涂装。
+		if mi.mesh != null:
+			for i in mi.mesh.get_surface_count():
+				mi.set_surface_override_material(i, mat)
+	for c in n.get_children():
+		_burn_meshes(c, mat)
+
+
+func _make_wreck_smoke(parent: Node) -> GPUParticles3D:
+	var p := GPUParticles3D.new()
+	p.amount = 26
+	p.lifetime = 4.5
+	p.local_coords = false
+	p.preprocess = 1.0
+	p.visibility_aabb = AABB(Vector3(-10, -3, -10), Vector3(20, 16, 20))
+	var pm := ParticleProcessMaterial.new()
+	pm.emission_shape = ParticleProcessMaterial.EMISSION_SHAPE_SPHERE
+	pm.emission_sphere_radius = 0.55
+	pm.direction = Vector3(0, 1, 0.15)
+	pm.spread = 18.0
+	pm.initial_velocity_min = 0.7
+	pm.initial_velocity_max = 1.9
+	pm.gravity = Vector3(0.2, 0.65, 0.05)
+	pm.scale_min = 1.0
+	pm.scale_max = 2.4
+	pm.color = Color(0.085, 0.08, 0.075, 0.55)
+	var curve := Curve.new()
+	curve.add_point(Vector2(0.0, 0.3))
+	curve.add_point(Vector2(0.3, 1.0))
+	curve.add_point(Vector2(1.0, 1.0))
+	var ct := CurveTexture.new()
+	ct.curve = curve
+	pm.scale_curve = ct
+	var ramp := Gradient.new()
+	ramp.set_color(0, Color(0.10, 0.095, 0.09, 0.55))
+	ramp.set_color(1, Color(0.16, 0.15, 0.14, 0.0))
+	var rt := GradientTexture1D.new()
+	rt.gradient = ramp
+	pm.color_ramp = rt
+	p.process_material = pm
+	p.draw_pass_1 = Fx._quad(Color(0.10, 0.095, 0.09, 0.55), Fx.soft_dot(), false)
+	p.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	parent.add_child(p)
+	# 30 秒后停烟，残骸继续留在场上
+	var t := Timer.new()
+	t.wait_time = 30.0
+	t.one_shot = true
+	t.autostart = true
+	t.timeout.connect(func(): p.emitting = false)
+	parent.add_child(t)
+	return p
 
 
 ## 当前车速（m/s，带符号）
@@ -1527,4 +1815,5 @@ func destroy(_by_shell: bool) -> void:
 		arena.add_scorch(global_position, 1.3)
 	Audio.play_3d("boom", global_position)
 	game.on_tank_destroyed(self)
+	_spawn_wreck()
 	queue_free()

@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     一键重建 assets/models 下的全部 GLB 素材。
 

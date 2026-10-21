@@ -161,11 +161,13 @@ def _hull(w, l, h, style):
         parts.append(L.cyl("hull_lampglass%d" % sx, 0.10, 0.06,
                            loc=(sx * hw * 0.74, l * 0.5 + 0.06, z + 0.10),
                            rot=(RAD(90), 0, 0), verts=12, material="M_Glass"))
-    # 尾灯：两颗小红灯，"哪头是车尾"在最远的视距上也读得出来
+    # 尾灯：两颗小红灯，"哪头是车尾"在最远的视距上也读得出来。
+    # 用带微弱自发光的专用材质，而不是 M_Glass——镜面反射会把暖色地面
+    # 映成两块高饱和橙色方块，看起来像霓虹灯而不是车灯。
     for sx in (-1, 1):
-        parts.append(L.box("hull_taillight%d" % sx, (0.13, 0.07, 0.11),
+        parts.append(L.box("hull_taillight%d" % sx, (0.10, 0.06, 0.09),
                            loc=(sx * hw * 0.66, -l * 0.5 - 0.02, z + h * 0.30),
-                           material="M_Glass"))
+                           material="M_TailLight"))
 
     # ---- 按风格追加的外挂件 ----
     if style in ("heavy", "boss"):
@@ -265,10 +267,13 @@ def _running_gear(hull_parent, w, l, h, count, style):
     top_z = roll_z + roll_r - run_t * 0.5
     run_len = l - 0.6 + 0.26
     for side, sx in (("L", -1), ("R", 1)):
+        # 上下两支段用不同材质名：Godot 侧按材质名分别挂一条"沿长度滚动"的
+        # 程序化履带带纹 shader，上支段和下支段的滚动方向相反。
+        # 颜色完全一致，材质名就是这一支该往哪边滚的唯一线索。
         static.append(L.box("track_low_%s" % side, (track_w, run_len, run_t),
-                            loc=(sx * x, 0, 0.055), material="M_Rubber"))
+                            loc=(sx * x, 0, 0.055), material="M_TrackLow"))
         static.append(L.box("track_top_%s" % side, (track_w, run_len, run_t),
-                            loc=(sx * x, 0, top_z), material="M_Rubber"))
+                            loc=(sx * x, 0, top_z), material="M_Track"))
         # 履带板纹路：从 10 片加密到 14 片，贴地那一段才不再是"一块黑条"
         for i in range(14):
             static.append(L.box("tracklink_%s%d" % (side, i),
@@ -276,11 +281,25 @@ def _running_gear(hull_parent, w, l, h, count, style):
                                 loc=(sx * x,
                                      run_len * 0.5 - 0.22 - i * (run_len - 0.44) / 13.0,
                                      0.055 + run_t * 0.5),
+                                material="M_Track"))
+        # 侧裙：分段而不是一整块。原来 86% 车长的一整条裙板把负重轮全挡住，
+        # 整车读起来就是"一个盒子架在两条黑板上"；改成三段、段间留 9 cm 缺口，
+        # 上缘再抬 8 cm，轮子就从缝里露出来，行走部分才重新有层次。
+        skirt_len = l * 0.74 / 3.0
+        for k in range(3):
+            static.append(L.box("skirt_%s%d" % (side, k),
+                                (0.10, skirt_len - 0.09, 0.34),
+                                loc=(sx * (x + track_w * 0.5 - 0.02),
+                                     (k - 1) * (skirt_len + 0.01),
+                                     top_z + 0.10)))
+        # 裙板上的加强筋：一条竖棱就够，它同时把三段裙板在视觉上连成一组
+        for k in range(4):
+            static.append(L.box("skirt_rib_%s%d" % (side, k),
+                                (0.12, 0.06, 0.30),
+                                loc=(sx * (x + track_w * 0.5 + 0.01),
+                                     (k - 1.5) * (skirt_len + 0.01),
+                                     top_z + 0.10),
                                 material="M_DarkMetal"))
-        # 侧裙：挂在履带外沿、只盖住上支段。位置特意抬高到负重轮上缘之上，
-        # 于是"轮子看得见、上支段看不见"——真车从侧面看就是这样。
-        static.append(L.box("skirt_%s" % side, (0.10, l * 0.86, 0.42),
-                            loc=(sx * (x + track_w * 0.5 - 0.02), -0.05, top_z + 0.02)))
         # 托带轮：托着上支段的两个小轮，缺了履带上部就像悬在空中
         for i in range(2):
             static.append(L.cyl("returnroller_%s%d" % (side, i), 0.13, 0.30,
@@ -349,9 +368,17 @@ def _turret(w, style):
     # 炮塔前脸倾斜板
     parts.append(L.box("turret_face", (tw * 0.85, 0.7, 0.62),
                        loc=(0, tw * 0.6, 0.42), rot=(RAD(-24), 0, 0)))
-    # 顶盖识别色块（Godot 侧按阵营刷色）
-    parts.append(L.box("turret_cap", (tw * 0.5, tw * 0.5, 0.1),
-                       loc=(0, -0.1, 0.84), material="M_Accent"))
+    # 顶部识别条：从一整块亮色板改成两条窄条 + 两侧小色块。
+    # 可读性（远处能认出敌我）靠的是颜色面积与位置，不是"车顶贴一张黄纸"；
+    # 窄条在俯视时仍然可见，近距离却不再像玩具。
+    parts.append(L.box("turret_cap", (tw * 0.30, tw * 0.075, 0.055),
+                       loc=(tw * 0.10, -tw * 0.34, 0.84), material="M_Accent"))
+    parts.append(L.box("turret_cap2", (tw * 0.07, tw * 0.20, 0.05),
+                       loc=(tw * 0.34, -tw * 0.12, 0.84), material="M_Accent"))
+    for sx in (-1, 1):
+        parts.append(L.box("turret_id_%d" % sx, (0.03, tw * 0.30, 0.14),
+                           loc=(sx * (tw * 0.455), -0.02, 0.46),
+                           material="M_Accent"))
     # 定角器 + 炮盾后方的螺栓
     parts.extend(_bolts("turret_bolt", 6,
                         (-tw * 0.44, tw * 0.62, 0.52), 0.17, axis=0,
@@ -385,7 +412,7 @@ def _turret(w, style):
     parts.append(mg)
     # 尾部储物篮 + 篷布卷
     parts.append(L.box("turret_basket", (tw * 0.8, 0.5, 0.3),
-                       loc=(0, -tw * 0.66, 0.5), material="M_Metal"))
+                       loc=(0, -tw * 0.66, 0.5), material="M_DarkMetal"))
     parts.append(L.box("turret_tarp", (tw * 0.7, 0.42, 0.22),
                        loc=(0, -tw * 0.66, 0.6), material="M_Canvas"))
     # 侧挂储物箱：炮塔两侧各一个，把侧影从"梯形"变成"梯形挂了两块"
@@ -444,8 +471,10 @@ def _casemate(w, tw):
     # 前脸大角度倾斜板：正面投影最小的那块
     parts.append(L.box("turret_face", (tw * 0.98, 1.05, 0.60),
                        loc=(0, tw * 0.66, 0.26), rot=(RAD(-36), 0, 0)))
-    parts.append(L.box("turret_cap", (tw * 0.52, tw * 0.52, 0.09),
-                       loc=(0, -0.12, 0.58), material="M_Accent"))
+    parts.append(L.box("turret_cap", (tw * 0.30, tw * 0.075, 0.055),
+                       loc=(tw * 0.10, -tw * 0.32, 0.58), material="M_Accent"))
+    parts.append(L.box("turret_cap2", (tw * 0.07, tw * 0.18, 0.05),
+                       loc=(tw * 0.32, -tw * 0.10, 0.58), material="M_Accent"))
     # 车长舱盖 + 三具潜望镜（无指挥塔，低矮是这台车唯一的设计目标）
     parts.append(L.cyl("turret_hatch", 0.30, 0.10, loc=(-tw * 0.24, -0.32, 0.62),
                        verts=16, material="M_Paint"))
@@ -507,9 +536,10 @@ def _gun(gun_len, caliber, style):
                        loc=(0, gun_len * 0.62, 0), rot=(RAD(90), 0, 0),
                        verts=16, material="M_DarkMetal"))
     # 炮口制退器 + 内膛
+    # 炮口制退器是钢件，不是识别色：黄圈会让整根炮管的剪影读成玩具。
     parts.append(L.cyl("gun_brake", caliber * 1.55, 0.5,
                        loc=(0, gun_len - 0.28, 0), rot=(RAD(90), 0, 0),
-                       verts=16, material="M_Accent"))
+                       verts=16, material="M_DarkMetal"))
     parts.append(L.cyl("gun_bore", caliber * 0.62, 0.22,
                        loc=(0, gun_len - 0.10, 0), rot=(RAD(90), 0, 0),
                        verts=14, material="M_DarkMetal"))
