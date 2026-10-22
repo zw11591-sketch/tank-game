@@ -1,9 +1,0 @@
-[gd_scene format=3 uid="uid://baimdiag01"]
-
-[ext_resource type="Script" path="res://tools/_aimdiag.gd" id="1_probe"]
-[ext_resource type="PackedScene" path="res://scenes/Main.tscn" id="2_main"]
-
-[node name="AimDiag" type="Node"]
-script = ExtResource("1_probe")
-
-[node name="Main" parent="." instance=ExtResource("2_main")]

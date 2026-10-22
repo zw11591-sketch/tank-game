@@ -1,9 +1,0 @@
-[gd_scene load_steps=3 format=3]
-
-[ext_resource type="PackedScene" path="res://scenes/Main.tscn" id="1"]
-[ext_resource type="Script" path="res://tools/_click_diag.gd" id="2"]
-
-[node name="ClickDiag" type="Node"]
-script = ExtResource("2")
-
-[node name="Main" parent="." instance=ExtResource("1")]
