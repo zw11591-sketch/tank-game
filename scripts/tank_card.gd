@@ -69,6 +69,14 @@ func _draw() -> void:
 				Color(0.78, 0.84, 0.90))
 		y += ROW_H
 
+	# ---- 战绩（底部） ----
+	# 画在尺寸的底边上而不是跟着对比条往下排：排行榜这类"有没有"信息
+	# 不该改变属性卡的排版，否则打过一局和没打过一局的面板高度会不一样。
+	var summary := Stats.tank_summary(tank_id)
+	if summary != "":
+		draw_string(f, Vector2(PAD, size.y - PAD), summary,
+				HORIZONTAL_ALIGNMENT_LEFT, w, 16, Color(0.72, 0.80, 0.72))
+
 
 # ---------------- 文本换行 ----------------
 

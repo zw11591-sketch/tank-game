@@ -12,10 +12,12 @@ extends SceneTree
 ##
 ## 运行： godot.exe --headless --path . --script res://tools/check_models.gd
 
-## 单侧负重轮数量真值表，与 tools/blender/dims.py 的 TANKS 表同源。
+## 单侧可滚动行走轮的数量：负重轮 + 诱导轮 + 主动轮 + 2 个托带轮。
+## 负重轮真值来自 tools/blender/dims.py 的 TANKS 表；后三者每侧各一个/两个。
+## 侦察车是轮式底盘，没有履带环，所以没有这三个附加轮。
 const WHEELS := {
-	"tank_player": 6, "tank_scout": 4, "tank_medium": 6, "tank_heavy": 7,
-	"tank_artillery": 6, "tank_destroyer": 6, "tank_boss": 8,
+	"tank_player": 10, "tank_scout": 4, "tank_medium": 10, "tank_heavy": 11,
+	"tank_artillery": 10, "tank_destroyer": 10, "tank_boss": 12,
 }
 
 const VERTS := ["Hull", "Turret", "Barrel", "Muzzle"]

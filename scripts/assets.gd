@@ -675,6 +675,23 @@ static func apply_track_shader(root: Node) -> Array:
 			sm.set_shader_parameter("track_color", src.albedo_color)
 			sm.set_shader_parameter("scroll", 0.0)
 			sm.set_meta("track_sign", sign)
+			# 这一块履带在车体的哪一侧（-1 左 / +1 右 / 0 跨中线）。
+			# 原地转向时左右履带反向滚动，没有这个标记就只能整车共用一个速度，
+			# 于是"车在转、履带不动"——转向看起来像镜头在转而不是车在转。
+			#
+			# 履带件在 GLB 里已经被合并进 HullMesh，按节点位置分不出左右，
+			# 所以按这一层表面的顶点质心取横向坐标。这个量只与几何有关，
+			# 在加载时算一次就够（每辆车一次，几百个顶点）。
+			var sx := mi.position.x
+			var arr := mesh.surface_get_arrays(i)
+			if arr.size() > Mesh.ARRAY_VERTEX:
+				var verts: PackedVector3Array = arr[Mesh.ARRAY_VERTEX]
+				if verts.size() > 0:
+					var acc := 0.0
+					for v in verts:
+						acc += v.x
+					sx += acc / float(verts.size())
+			sm.set_meta("track_side", -1.0 if sx < -0.05 else (1.0 if sx > 0.05 else 0.0))
 			out.append(sm)
 			mi.set_surface_override_material(i, sm)
 	return out

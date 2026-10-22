@@ -57,6 +57,9 @@ static func register() -> void:
 	_act("fire", [], [MOUSE_BUTTON_LEFT], [], [[JOY_AXIS_TRIGGER_RIGHT, 1.0]])
 	_act("aim_scope", [], [MOUSE_BUTTON_RIGHT], [], [[JOY_AXIS_TRIGGER_LEFT, 1.0]])
 	_act("switch_shell", [KEY_Q, KEY_1, KEY_2], [], [JOY_BUTTON_Y], [])
+	# 狙击镜换档。滚轮只在开镜时被消费（见 CameraRig.cycle_zoom）。
+	_act("zoom_in", [KEY_EQUAL], [MOUSE_BUTTON_WHEEL_UP], [], [])
+	_act("zoom_out", [KEY_MINUS], [MOUSE_BUTTON_WHEEL_DOWN], [], [])
 	_act("toggle_view", [KEY_V], [], [JOY_BUTTON_RIGHT_STICK], [])
 
 	# ---- 战术技能 ----
@@ -145,10 +148,12 @@ static func controls_text(drive_relative: bool, compact := false) -> String:
 	if compact:
 		return "%s    鼠标 / 右摇杆 转动炮塔    左键 / RT 开火\n" % drive_line \
 			+ "右键 / LT 狙击镜    V / 右摇杆键 切换视角    Q / Y 切换弹种(AP/HE)\n" \
-			+ "Shift / RB 冲刺    Space / LB 烟雾弹    Esc 暂停与设置    F11 显示模式    F3 输入诊断"
+			+ "滚轮 狙击镜两档    Shift / RB 冲刺    Space / LB 烟雾弹\n" \
+			+ "Esc 暂停与设置    F11 显示模式    F3 输入诊断"
 	return "%s\n" % drive_line \
 		+ "鼠标 / 右摇杆 转动炮塔    左键 / RT 开火\n" \
 		+ "右键 / LT 狙击镜    V / 右摇杆键 切换视角\n" \
-		+ "Q / Y 切换弹种(AP/HE)    Shift / RB 冲刺\n" \
-		+ "Space / LB 烟雾弹    Esc 暂停与设置\n" \
+		+ "Q / Y 切换弹种(AP/HE)    滚轮 狙击镜两档\n" \
+		+ "Shift / RB 冲刺    Space / LB 烟雾弹\n" \
+		+ "Esc 暂停与设置\n" \
 		+ "F11 显示模式    F3 输入诊断"

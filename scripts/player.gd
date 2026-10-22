@@ -32,6 +32,9 @@ const DRY_CLICK_CD := 0.18
 ## 按住只是"稳定的持续火力"。两条通道都不会让"点了没反应"重新出现——
 ## 点击走 `_pending_shot`，与这个间隔无关。
 const HOLD_FIRE_INTERVAL := 0.22
+## 快速装填增益对"按住连发"间隔的缩放。0.22 x 0.55 ≈ 0.12 s（约 8 发/秒）。
+## 增益的意义是"按住时火力密度真的上去了"，而不是改一个玩家点不出来也看不出的装填时间。
+const RAPID_HOLD_SCALE := 0.55
 
 ## 近距离交战判定。三个近战辅助共用这一档距离：
 ##   * 压炮：把瞄准角收回到敌车车体中心（`_apply_close_assist`）
@@ -295,6 +298,7 @@ func tick(delta: float) -> void:
 	overdrive_t = maxf(0.0, overdrive_t - delta)
 	dry_flash = maxf(0.0, dry_flash - delta)
 	hit_flash = maxf(0.0, hit_flash - delta)
+	expose_t = maxf(0.0, expose_t - delta)
 	_dry_cd = maxf(0.0, _dry_cd - delta)
 
 	# 冲刺与引擎过载可以叠加：两个都在的时候机动性相当夸张，但代价是冷却与持续时间
@@ -378,6 +382,10 @@ func tick(delta: float) -> void:
 	# "落在两个物理帧之间、轮询看不到的那一下"。后者是"点了没反应"的最后一个来源，
 	# 所以按下本身在事件层就锁存（见 _unhandled_input）。
 	rig.set_sniper(Input.is_action_pressed("aim_scope"))
+	if InputSetup.edge("zoom_in"):
+		rig.cycle_zoom(1)
+	elif InputSetup.edge("zoom_out"):
+		rig.cycle_zoom(-1)
 	# 事件锁存优先：同一次按下在下一个物理帧还会被 is_action_just_pressed() 再报一次
 	# （键鼠事件按渲染帧到达，120 Hz 物理会读两遍），所以消费锁存时要把 edge() 的
 	# 时间锁一起推掉——否则"点一下"会排出两发，第二发看起来像凭空多出来的。
@@ -394,7 +402,11 @@ func tick(delta: float) -> void:
 	# 否则 0.05~0.09 s 的装填会把按住读成 11~20 发/秒的机枪。
 	var held := Input.is_action_pressed("fire")
 	_hold_t = _hold_t + delta if held else 0.0
-	var want_shot := _pending_shot or (held and _hold_t >= HOLD_FIRE_INTERVAL)
+	# 快速装填增益必须作用在"按住连发"这一档上：射速的真实上限不是装填时间
+	# （0.06 s 已经被压到点击速度之下了），而是这个 0.22 s 的间隔。
+	# 只改 reload_rate 时增益几乎看不出来——玩家点了半天才发现"好像快了点"。
+	var hold_interval := HOLD_FIRE_INTERVAL * (RAPID_HOLD_SCALE if rapid_buff_t > 0.0 else 1.0)
+	var want_shot := _pending_shot or (held and _hold_t >= hold_interval)
 	if want_shot:
 		# 准星已经压在敌车身上时，把最后几度的炮塔残差吃掉：点下去就该有结果
 		_snap_turret_to_aim()
@@ -749,7 +761,18 @@ func _drop_smoke() -> void:
 
 
 func is_smoked() -> bool:
+	# 烟幕只在云团范围内生效。原来这里读的是"自己丢过烟"的计时，
+	# 于是玩家开出烟团之后仍然隐身——烟雾变成了一张会跟着车走的纸。
+	if game != null and game.has_method("smoke_at"):
+		return game.smoke_at(global_position)
 	return smoke_t > 0.0
+
+
+## 站在灌木 / 芦苇里，且没有刚刚开火。敌人中远距离看不见（见 Enemy._can_see）。
+func is_concealed() -> bool:
+	if expose_t > 0.0:
+		return false
+	return arena != null and arena.is_concealed(global_position)
 
 
 ## 空击：炮还没装好就按了开火键。给一声空膛"咔"与一次准星红闪，

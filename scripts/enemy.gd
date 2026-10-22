@@ -12,6 +12,9 @@ var points := 100
 var difficulty := 1
 
 var state := State.SEEK
+## 本帧是否看得见玩家。HUD 用它显示"被发现"指示灯；
+## 与 sees 判定同源，避免界面和 AI 各算一套。
+var sees_player := false
 var target: Tank = null
 
 var _path: Array = []
@@ -26,6 +29,28 @@ var _last_pos := Vector3.ZERO
 var _unstuck_t := 0.0
 var _engage_range := 46.0
 var _prefer_range := 18.0
+## 侧绕掷骰的冷却（见 _roll_flank）。0 表示"这一轮可以掷了"。
+var _flank_roll_t := 0.0
+## 掩体行为：装填期间退到"能挡住玩家视线"的格子后，装填完再开出来。
+## _cover_pos 是选中的掩体点（Vector3.INF 表示没有），_cover_t > 0 表示
+## 正在掩体行为中。_peek_pos / _peek_t 是装填结束后探头的位置与剩余时间。
+var _cover_pos := Vector3.INF
+var _cover_t := 0.0
+var _peek_pos := Vector3.INF
+var _peek_t := 0.0
+## 选掩体的搜索冷却。`_find_cover()` 是几十次网格步进，没有冷却的话
+## "附近没掩体"的敌人会在整段装填时间里每帧搜一次（120 Hz × 48 个候选格），
+## 帧率会被这几台找不到墙的车吃掉。
+var _cover_search_cd := 0.0
+## 掩体搜索范围：以自身为圆心 3 格（12 m）内，且不超过 14 m。
+## 再远就来不及在装填结束前退回去，行为会退化成"整场都在赶路"。
+const COVER_SEARCH_CELLS := 3
+const COVER_MAX_DIST := 14.0
+## 草丛隐蔽的有效距离：超过这个距离就看不见蹲草的玩家。
+## 20 m 大致是"一辆车从掩体后开到你面前"所需的时间，玩家有反应余地。
+const CONCEAL_SIGHT := 20.0
+## 敌车发动机循环。由 main 按距离开关，最多同时 3 台（见 set_engine_on）。
+var _engine: AudioStreamPlayer3D
 
 
 func configure(t: int, stage: int, diff: int) -> void:
@@ -157,9 +182,7 @@ func accent_glow() -> float:
 func readability_floor() -> float:
 	if arena == null:
 		return 0.035
-	var v := arena.enemy_readability()
-	print("ENEMY_LIFT ", v, " terrain=", arena.terrain, " type=", etype)
-	return v
+	return arena.enemy_readability()
 
 
 ## 敌车轮廓描边：冷色、只落在掠射边缘。
@@ -191,14 +214,54 @@ func _ready() -> void:
 	super._ready()
 	_last_pos = global_position
 	_flank_side = 1.0 if randf() < 0.5 else -1.0
+	_build_engine_audio()
+
+
+## ---- 敌车发动机声 ----
+##
+## 敌车原来是完全无声的：玩家只能靠看得见，绕到身后的敌人没有任何听觉预警。
+## 一个低音量的 3D 循环就够，但必须限量——七辆车各挂一路循环会一直占着语音位，
+## 而发动机声是最不紧急的那一层。所以由 main 按距离挑最近的 3 台打开，
+## 其余静音（节点常驻但不播放，开关只是 playing）。
+func _build_engine_audio() -> void:
+	var st := Audio.engine_stream()
+	if st == null:
+		return
+	_engine = AudioStreamPlayer3D.new()
+	_engine.stream = st
+	_engine.unit_size = 10.0
+	_engine.max_distance = 48.0
+	_engine.attenuation_model = AudioStreamPlayer3D.ATTENUATION_INVERSE_DISTANCE
+	_engine.bus = Audio.BUS_ENGINE
+	_engine.volume_db = -19.0
+	_engine.position = Vector3(0, 0.8, 1.4)
+	add_child(_engine)
+
+
+func set_engine_on(on: bool) -> void:
+	if _engine == null:
+		return
+	if on and not _engine.playing:
+		_engine.play()
+	elif not on and _engine.playing:
+		_engine.stop()
+
+
+func _update_engine_pitch() -> void:
+	if _engine == null or not _engine.playing:
+		return
+	var r := clampf(absf(speed()) / maxf(move_speed, 0.01), 0.0, 1.2)
+	_engine.pitch_scale = clampf(0.78 + r * 0.7, 0.5, 2.0)
 
 
 # ---------------- 主循环 ----------------
 
 func tick(delta: float) -> void:
 	if not alive:
+		sees_player = false
 		return
 	if game.state != "play":
+		sees_player = false
 		drive(0.0, 0.0, delta)
 		return
 
@@ -207,10 +270,14 @@ func tick(delta: float) -> void:
 	_aim_err_t -= delta
 	_react_t = maxf(0.0, _react_t - delta)
 	_unstuck_t = maxf(0.0, _unstuck_t - delta)
+	_cover_t = maxf(0.0, _cover_t - delta)
+	_peek_t = maxf(0.0, _peek_t - delta)
+	_cover_search_cd = maxf(0.0, _cover_search_cd - delta)
 
 	target = _pick_target()
 	var goal := _goal_position()
 	var sees := target != null and _can_see(target)
+	sees_player = sees
 
 	_update_state(sees, delta)
 
@@ -239,6 +306,8 @@ func tick(delta: float) -> void:
 			_do_seek(goal, delta)
 
 	_check_stuck(delta)
+	_update_engine_pitch()
+	_update_flank_roll(delta)
 
 
 func _pick_target() -> Tank:
@@ -262,10 +331,22 @@ func _can_see(t: Tank) -> bool:
 	# 烟雾弹在中远距离上遮蔽视野
 	if t.has_method("is_smoked") and t.is_smoked() and d > 11.0:
 		return false
+	# 草丛隐蔽：站在灌木 / 芦苇里，中远距离看不见；开火后 expose_t 会让它失效。
+	# 近距离（20 m 内）照常能发现——否则蹲草会变成"贴脸隐身"。
+	if d > CONCEAL_SIGHT and t.has_method("is_concealed") and t.is_concealed():
+		return false
 	return arena.has_line_of_sight(global_position + Vector3(0, 1.8, 0), t.global_position + Vector3(0, 1.8, 0))
 
 
 func _update_state(sees: bool, _delta: float) -> void:
+	# 在掩体后面看不见玩家是预期内的。这段几秒里如果照常按 sees 判定，
+	# 敌人会刚退进掩体就改去守家，再也不会探出来——掩体行为会退化成"逃跑"。
+	if _cover_t > 0.0 or _peek_t > 0.0:
+		if state != State.ENGAGE:
+			state = State.ENGAGE
+			_state_t = 0.0
+			_repath_t = 0.0
+		return
 	var hp_ratio := float(hp) / float(max_hp)
 	var new_state := state
 
@@ -275,7 +356,7 @@ func _update_state(sees: bool, _delta: float) -> void:
 			new_state = State.RETREAT
 		elif d > _prefer_range * 1.9 and etype != 3:
 			new_state = State.SEEK
-		elif state != State.FLANK and _state_t > 3.5 and etype != 3 and randf() < 0.35:
+		elif state != State.FLANK and _state_t > 3.5 and etype != 3 and _roll_flank():
 			# 阶段性地绕到侧后方，避免所有敌人正面排队送死
 			new_state = State.FLANK
 			_flank_side = 1.0 if randf() < 0.5 else -1.0
@@ -293,8 +374,28 @@ func _update_state(sees: bool, _delta: float) -> void:
 		state = new_state
 		_state_t = 0.0
 		_repath_t = 0.0
-		if state == State.ENGAGE:
-			_react_t = [0.75, 0.45, 0.2][difficulty]
+		# 反应延迟必须在**每一次**换状态时都给：原来只有 ENGAGE 给，
+		# 于是"先侧绕再开火"和"一看不见就后撤"这两条路径绕过了难度差异——
+		# 困难档的敌人在这两种状态下反应速度和简单档一模一样。
+		_react_t = [0.75, 0.45, 0.2][difficulty]
+		if state == State.FLANK or state == State.RETREAT:
+			# 侧绕与后撤本来就比正面交战慢半拍，多给一点时间，读起来才像"在判断"
+			_react_t *= 1.5
+
+
+## 侧绕掷骰。原来这个 35% 是每个 tick 掷一次的，而 tick 是 120 Hz——
+## 于是"3.5 秒后开始考虑侧绕"实际是"3.5 秒后必然在下一帧侧绕"，
+## 概率参数完全不起作用，全场的敌人会同时包抄。
+## 改成每 3.5 秒掷一次，35% 才真的是"大约三次里有一次"。
+func _roll_flank() -> bool:
+	if _flank_roll_t > 0.0:
+		return false
+	_flank_roll_t = 3.5
+	return randf() < 0.35
+
+
+func _update_flank_roll(delta: float) -> void:
+	_flank_roll_t = maxf(0.0, _flank_roll_t - delta)
 
 
 # ---------------- 行为 ----------------
@@ -305,6 +406,10 @@ func _do_seek(goal: Vector3, delta: float) -> void:
 	var ahead := global_position - global_transform.basis.z * 9.0
 	aim_at(ahead + Vector3(0, 1.5, 0), delta)
 	if target != null and _can_see(target):
+		# 看得见就该打：原来这里直接 return，于是"发现玩家但还没进入偏好距离"
+		# 的敌人只会一边瞄一边往前走，全程不开火——读起来像在发呆。
+		# 炮塔本来就已经指着它了，扣一下扳机没有任何额外成本。
+		_aim_and_shoot(delta)
 		return
 	if _wall_ahead() and can_fire() and randf() < 0.02:
 		fire()
@@ -314,6 +419,57 @@ func _do_engage(delta: float) -> void:
 	if target == null:
 		return
 	var d := global_position.distance_to(target.global_position)
+	var to_t := target.global_position - global_position
+	to_t.y = 0.0
+
+	# 探头：装填完成，从掩体后开出来打一发。
+	# 走 1.6 秒足够把炮口推出掩体，又不至于一路冲到玩家脸上。
+	if _peek_t > 0.0:
+		_follow_path(_peek_pos, 0.9, delta)
+		_aim_and_shoot(delta)
+		return
+
+	# 掩体后：装填期间退到墙后，炮塔仍然指着玩家。
+	# 车体先到掩体点站住，剩下的时间只是等装填——这段时间玩家能看到
+	# "它躲起来了"，而不是一辆在原地转圈的车。
+	if _cover_t > 0.0:
+		if reload_t > reload_time * 0.12:
+			var to_c := _cover_pos - global_position
+			to_c.y = 0.0
+			if to_c.length() > 1.3:
+				_follow_path(_cover_pos, 0.95, delta)
+			else:
+				drive(0.0, 0.0, delta)
+			aim_at(_predict(target), delta)
+			return
+		# 装填完成：选一个能重新看见玩家的点，开出去
+		_begin_peek(to_t)
+		_cover_t = 0.0
+		_follow_path(_peek_pos, 0.9, delta)
+		_aim_and_shoot(delta)
+		return
+
+	# 装填过程的前半段（剩余最多时）退到掩体后：刚开完炮就往回缩正是
+	# "一炮一缩"的时机，而等到只剩最后一点装填时间再退，地图上只会看到
+	# 一辆车在墙边来回蹭。侦察车与火炮车不参与——前者靠机动、后者靠射程，
+	# 退到墙后反而失去意义。搜索带冷却，见 _cover_search_cd。
+	if reload_t > reload_time * 0.45 and etype != 0 and etype != 3 \
+			and _cover_search_cd <= 0.0:
+		var cover := _find_cover()
+		_cover_search_cd = 0.75
+		if cover != Vector3.INF:
+			_cover_pos = cover
+			_cover_t = reload_time + 1.0
+			return
+
+	# 重型与 Boss 在装填期间斜摆车身：正面装甲以约 30° 迎敌，炮塔独立瞄准。
+	# 于是"等装填"这段时间也在做防御动作，而不是站着挨打。
+	if (etype == 2 or etype == 4) and reload_t > 0.0 and d < _prefer_range * 1.7:
+		var want := atan2(-to_t.x, -to_t.z) + deg_to_rad(30.0) * _flank_side
+		drive(0.0, _steer_yaw(want) * 0.8, delta)
+		_aim_and_shoot(delta)
+		return
+
 	# 保持在偏好交战距离上：太近后退，太远前压
 	var throttle := 0.0
 	if d > _prefer_range * 1.25:
@@ -325,6 +481,73 @@ func _do_engage(delta: float) -> void:
 	_aim_and_shoot(delta)
 
 
+## 在自身周围找一个"能挡住玩家视线"的格子。
+##
+## 判据有三条，缺一不可：
+##   * 候选点本身可通行（不然退不过去）；
+##   * 从候选点到玩家没有视线（这才是掩体，而不是"离墙近"）；
+##   * 挡视线的必须是砖墙——水面不挡视线，残骸也不该被当成战术掩体。
+##
+## 只在装填中途调用（每 2~4 秒一次），几十次网格步进的成本可以忽略。
+func _find_cover() -> Vector3:
+	if target == null:
+		return Vector3.INF
+	var c := Arena.to_cell(global_position)
+	var eye := Vector3(0, 1.8, 0)
+	var best := Vector3.INF
+	var best_d := 1e9
+	for dy in range(-COVER_SEARCH_CELLS, COVER_SEARCH_CELLS + 1):
+		for dx in range(-COVER_SEARCH_CELLS, COVER_SEARCH_CELLS + 1):
+			if dx == 0 and dy == 0:
+				continue
+			if absi(dx) + absi(dy) > COVER_SEARCH_CELLS + 1:
+				continue
+			var n := Vector2i(c.x + dx, c.y + dy)
+			if arena.blocks_tank(n.x, n.y):
+				continue
+			var p := Arena.cell_center(n.x, n.y)
+			var dist := p.distance_to(global_position)
+			if dist > COVER_MAX_DIST or dist < 2.0:
+				continue
+			if arena.has_line_of_sight(p + eye, target.global_position + eye):
+				continue
+			# 玩家方向上紧邻的格子必须是砖墙：水和残骸不算掩体
+			var dir := target.global_position - p
+			dir.y = 0.0
+			var probe := Arena.to_cell(p + dir.normalized() * Arena.CELL * 1.1)
+			if arena.cell(probe.x, probe.y) != Arena.BRICK:
+				continue
+			if dist < best_d:
+				best_d = dist
+				best = p
+	return best
+
+
+## 从掩体后开出来的落点：沿玩家方向依次试 4/6/8 m，取第一个能看见玩家的。
+## 都看不见（比如掩体是一整排墙）就退而求其次，沿同方向开出去再说——
+## 至少不会停在原地等玩家绕过来。
+func _begin_peek(to_target: Vector3) -> void:
+	var dir := to_target.normalized()
+	var eye := Vector3(0, 1.8, 0)
+	var best := Vector3.INF
+	for dist in [4.0, 6.0, 8.0]:
+		var p := arena.snap_open(_cover_pos + dir * dist)
+		if arena.has_line_of_sight(p + eye, target.global_position + eye):
+			best = p
+			break
+	if best == Vector3.INF:
+		best = arena.snap_open(global_position + dir * 5.0)
+	_peek_pos = best
+	_peek_t = 1.6
+	_cover_pos = Vector3.INF
+
+
+## 转向一个世界朝向。与 _steer_toward() 的区别是它不经过"目标点"，
+## 用于斜摆车身这类"只关心车头指哪"的动作。
+func _steer_yaw(want_yaw: float) -> float:
+	return clampf(wrapf(want_yaw - rotation.y, -PI, PI) * 1.6, -1.0, 1.0)
+
+
 func _do_flank(goal: Vector3, delta: float) -> void:
 	if target == null:
 		_do_seek(goal, delta)
@@ -334,7 +557,10 @@ func _do_flank(goal: Vector3, delta: float) -> void:
 	to_me.y = 0.0
 	var radius := _prefer_range
 	var tangent := Vector3(-to_me.z, 0, to_me.x).normalized() * _flank_side
-	var want := target.global_position + to_me.normalized() * radius + tangent * 10.0
+	# 目标点可能落在墙里或水里：侧绕的圆轨道不管地形。
+	# 先贴到最近的可通行格，至少"朝这个方向开"是可行的。
+	var want := arena.snap_open(
+			target.global_position + to_me.normalized() * radius + tangent * 10.0)
 	drive(0.85, _steer_toward(want) * 0.8, delta)
 	_aim_and_shoot(delta)
 
@@ -343,7 +569,8 @@ func _do_retreat(delta: float) -> void:
 	if target == null:
 		drive(0.0, 0.0, delta)
 		return
-	var away := global_position + (global_position - target.global_position).normalized() * 18.0
+	var away := arena.snap_open(
+			global_position + (global_position - target.global_position).normalized() * 18.0)
 	drive(0.9, _steer_toward(away) * 0.9, delta)
 	_aim_and_shoot(delta)
 

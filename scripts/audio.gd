@@ -23,6 +23,12 @@ extends Node
 
 const SR := 44100
 const MAX_VOICES := 28
+## 战斗反馈提示音。它们的职责是"告诉玩家这一发的结果"，
+## 丢一声就等于让玩家少一条信息；而炮声、履带声丢一声只是少一点氛围。
+## 所以这几路单独留 4 个通道：即便 28 路语音位已经被爆炸和引擎占满，
+## 命中"叮"、击穿、跳弹、击毁、格挡仍然播得出来。
+const PRIORITY_SFX := ["hitmark", "pen", "bounce", "kill", "block"]
+const PRIORITY_VOICES := 4
 
 ## 声速（m/s）与延迟上限。超过 MAX_DELAY 的距离听感上已经分不出远近，
 ## 再延长只会让"看到爆炸很久以后才听到"显得像卡顿。
@@ -47,6 +53,13 @@ const BUS_ENGINE := "Engine"
 ## 带音调含义的提示音给 0：命中"叮"、胜负音效一旦跑调就会听成走音的电子琴。
 const VARY := {
 	"shoot": 0.09,
+	"shoot_s": 0.07,
+	"shoot_m": 0.08,
+	"shoot_l": 0.09,
+	"shoot_he": 0.08,
+	"crash": 0.14,
+	"dirt": 0.12,
+	"water": 0.10,
 	"boom": 0.11,
 	"steel": 0.13,
 	"ricochet": 0.14,
@@ -57,6 +70,12 @@ const VARY := {
 	"spawn": 0.05,
 	"boost": 0.04,
 	"hitmark": 0.0,
+	# 四种战斗结果各有自己的音色。原来它们共用一声 "steel" 加一声 "叮"，
+	# 于是"打穿了"和"被弹开了"听起来完全一样——这是街机节奏下最不该省的信息。
+	"pen": 0.03,
+	"bounce": 0.02,
+	"kill": 0.05,
+	"block": 0.04,
 	"switch": 0.0,
 	"pickup": 0.0,
 	"power": 0.0,
@@ -91,6 +110,9 @@ const SPACE_DEFAULT := {"room": 0.5, "damp": 0.5, "wet": 0.22, "pre": 30.0}
 var _streams: Dictionary = {}
 var _rng := RandomNumberGenerator.new()
 var _voices := 0
+## 已经占用的优先通道数（见 PRIORITY_SFX）。与 _voices 分开计，
+## 因为优先音允许在总池满时超额播放。
+var _prio_voices := 0
 var _root3d: Node3D = null
 var _reverb: AudioEffectReverb = null
 ## 合成这一批波形花了多少毫秒。启动开销可见，才不会悄悄退化。
@@ -98,6 +120,9 @@ var _build_ms := 0
 
 
 func _ready() -> void:
+	# 暂停走 SceneTree.paused，而暂停菜单里的开关音必须还能响：
+	# autoload 默认随树暂停，这里显式常驻。
+	process_mode = Node.PROCESS_MODE_ALWAYS
 	_rng.randomize()
 	_build_buses()
 	var t0 := Time.get_ticks_msec()
@@ -205,7 +230,14 @@ func _listener_pos() -> Vector3:
 ## 非定位播放：界面操作与贴耳反馈（空击、命中确认、装填就绪）走这里。
 ## 走 UI 总线，没有混响也没有延迟——这类声音的职责是"立刻告诉玩家发生了什么"。
 func play(sfx: String, volume_db := 0.0) -> void:
-	if not _streams.has(sfx) or _voices >= MAX_VOICES:
+	if not _streams.has(sfx):
+		return
+	var prio := sfx in PRIORITY_SFX
+	if prio:
+		if _prio_voices >= PRIORITY_VOICES:
+			return
+		_prio_voices += 1
+	elif _voices >= MAX_VOICES:
 		return
 	var p := AudioStreamPlayer.new()
 	p.stream = _streams[sfx]
@@ -213,7 +245,7 @@ func play(sfx: String, volume_db := 0.0) -> void:
 	p.pitch_scale = _pitch(sfx)
 	p.bus = BUS_UI
 	add_child(p)
-	_track(p)
+	_track(p, prio)
 	p.play()
 
 
@@ -279,8 +311,11 @@ func _pitch(sfx: String) -> float:
 	return _rng.randf_range(1.0 - v, 1.0 + v)
 
 
-func _track(p: Node) -> void:
+func _track(p: Node, prio := false) -> void:
 	_voices += 1
+	if prio:
+		p.finished.connect(func() -> void:
+			_prio_voices = maxi(0, _prio_voices - 1))
 	p.finished.connect(func() -> void:
 		_voices -= 1
 		p.queue_free())
@@ -302,6 +337,31 @@ func stats() -> Dictionary:
 func _build_streams() -> void:
 	_streams = {
 		"shoot": _mix(_tone(180.0, 60.0, 0.22, 0.55, "square"), _noise(0.18, 0.5, 900.0)),
+		# ---- 分口径炮声 ----
+		# 每一档都是三层：爆裂（crack，高频瞬态）+ 低频轰鸣（boom）+ 远处回声尾音。
+		# 三层缺一不可：只有爆裂听起来像放鞭炮，只有轰鸣听起来像打鼓，
+		# 没有尾音则在户外场景里像在录音棚——而这三样正是"炮有多重"的全部信息。
+		# 口径只改三层的**比例与长度**，不改音高，于是它们仍然是同一种武器。
+		"shoot_s": _mix(
+				_mix(_noise(0.09, 0.44, 5200.0), _tone(220.0, 82.0, 0.15, 0.40, "square")),
+				_noise(0.34, 0.12, 240.0)),
+		"shoot_m": _mix(
+				_mix(_noise(0.13, 0.50, 4200.0), _tone(170.0, 58.0, 0.22, 0.50, "square")),
+				_noise(0.52, 0.15, 170.0)),
+		"shoot_l": _mix(
+				_mix(_noise(0.17, 0.55, 3400.0), _tone(128.0, 42.0, 0.30, 0.60, "square")),
+				_noise(0.74, 0.19, 120.0)),
+		# HE 更闷：爆裂层压低截止频率，轰鸣层更长更沉。
+		# 换弹种时玩家不必看 HUD 也能听出"这一发是榴弹"。
+		"shoot_he": _mix(
+				_mix(_noise(0.20, 0.50, 2100.0), _tone(95.0, 36.0, 0.40, 0.62, "sine")),
+				_noise(0.88, 0.21, 85.0)),
+		# 车体撞击：一声闷响 + 金属残余。履带车撞墙不是"砰"，是"咚"。
+		"crash": _mix(_noise(0.20, 0.48, 290.0), _tone(95.0, 44.0, 0.24, 0.46, "sine")),
+		# 弹着地面：泥土是"噗"不是"叮"。低频加宽带噪声，没有任何金属高频。
+		"dirt": _mix(_noise(0.16, 0.42, 620.0), _tone(140.0, 62.0, 0.12, 0.22, "sine")),
+		# 落水：水花是一段快速衰减的宽带噪声，末尾带一点上扬
+		"water": _mix(_noise(0.42, 0.34, 2600.0), _tone(320.0, 900.0, 0.20, 0.12, "sine")),
 		"steel": _tone(1500.0, 820.0, 0.07, 0.28, "square"),
 		"ricochet": _tone(2600.0, 420.0, 0.26, 0.3, "sine"),
 		"brick": _noise(0.16, 0.45, 420.0),
@@ -315,6 +375,19 @@ func _build_streams() -> void:
 		# 命中确认：一声短而亮的"叮"。开火到命中之间有飞行时间，
 		# 没有这声提示就只能靠盯着目标猜打中没打中。
 		"hitmark": _tone(1850.0, 2500.0, 0.055, 0.3, "sine"),
+		# 击穿：短促的金属破裂 + 一发低频重击。两个层叠在一起，
+		# 于是"打进去了"同时有"叮"的清晰和"咚"的份量。
+		"pen": _mix(_tone(2400.0, 900.0, 0.055, 0.28, "square"),
+				_tone(150.0, 62.0, 0.16, 0.34, "sine")),
+		# 跳弹：上扬的金属声加一段尾音。上扬是关键——它读起来是"被弹开了"，
+		# 而不是"打中了什么硬东西"。
+		"bounce": _mix(_tone(2100.0, 3400.0, 0.16, 0.30, "sine"),
+				_tone(3050.0, 1900.0, 0.24, 0.14, "sine")),
+		# 击毁：爆裂 + 一段短号角。号角把"这辆车没了"和"这一发打得不轻"分开。
+		"kill": _mix(_mix(_noise(0.42, 0.5, 160.0), _tone(120.0, 55.0, 0.36, 0.4, "square")),
+				_tone(523.0, 784.0, 0.30, 0.18, "square")),
+		# 装甲挡住：沉闷的钝响，没有金属高频。听到它就知道"这一发白打了"。
+		"block": _mix(_noise(0.16, 0.42, 240.0), _tone(210.0, 88.0, 0.13, 0.30, "sine")),
 		# 履带链节撞击。坦克在现实里是靠履带声被人听见的，不是靠发动机——
 		# 所以这一声比引擎更重要，也是"听声辨位"成立的前提。
 		"track": _mix(_tone(430.0, 190.0, 0.05, 0.16, "square"), _noise(0.07, 0.2, 3200.0)),

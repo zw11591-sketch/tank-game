@@ -39,7 +39,11 @@ var from_player := false
 
 var _life := 0.0
 var _dead := false
+## 发射这次击发的编号（见 Tank.claim_hit）。多弹装填的三发共用同一个编号。
+var _shot_id := -1
 var _trail: MeshInstance3D
+## 已经触发过视觉命中的道具（instance_id -> true）。见 _probe_blockers()。
+var _touched: Dictionary = {}
 
 
 func launch(g: Node, a: Arena, from: Tank, origin: Vector3, dir: Vector3, k: int) -> void:
@@ -48,6 +52,7 @@ func launch(g: Node, a: Arena, from: Tank, origin: Vector3, dir: Vector3, k: int
 	shooter = from
 	kind = k
 	from_player = from.is_player
+	_shot_id = from._shot_id
 	position = origin
 
 	var d := dir.normalized()
@@ -84,6 +89,26 @@ static func lob_dir(origin: Vector3, target: Vector3, fallback: Vector3) -> Vect
 		return fallback
 	var tan_theta := (v2 - sqrt(disc)) / (HE_GRAVITY * r)
 	return (flat / r + Vector3.UP * tan_theta).normalized()
+
+
+## 低抛弹道采样：从 origin 沿 dir 出发的 HE 飞行轨迹（世界坐标）。
+##
+## 供两处使用：狙击镜里的落点预览，以及 aim_reachable() 的抛物线路检。
+## 步长按 0.05 s 固定（20 Hz），因为这里要的是"形状对"，不是逐帧精确——
+## 真正的飞行仍由 _physics_process 按物理步长推进。
+static func trajectory(origin: Vector3, dir: Vector3, steps := 60) -> PackedVector3Array:
+	var pts := PackedVector3Array()
+	var p := origin
+	var v := dir.normalized() * HE_SPEED
+	var dt := 0.05
+	pts.append(p)
+	for i in steps:
+		v.y -= HE_GRAVITY * dt
+		p += v * dt
+		pts.append(p)
+		if p.y < 0.0:
+			break
+	return pts
 
 
 func _ready() -> void:
@@ -158,11 +183,17 @@ func _trace(from: Vector3, to: Vector3) -> bool:
 	q.collide_with_areas = false
 	var hit := space.intersect_ray(q)
 	if hit.is_empty():
+		# 主射线什么都没碰到，但这一段里可能有道具 / 残骸 / 水面：
+		# 它们在第 4 层，不挡炮弹，却应该留下痕迹。
+		_probe_blockers(from, to)
 		return false
 
 	var point: Vector3 = hit["position"]
 	var normal: Vector3 = hit["normal"]
 	var collider = hit["collider"]
+
+	# 视觉命中只查主命中点之前的这一段，免得炮弹穿过沙袋之后才在它身后冒烟
+	_probe_blockers(from, point)
 
 	if collider is Tank:
 		_hit_tank(collider, point)
@@ -172,24 +203,80 @@ func _trace(from: Vector3, to: Vector3) -> bool:
 	return false
 
 
+## 只做视觉的道具命中：沙袋 / 路障 / 残骸 / 水面在第 4 层。
+##
+## 规则不变——"挡车不挡弹"——炮弹照样穿过去。但完全没有反馈的穿透
+## 读起来像穿模：玩家看到炮弹从沙袋中间钻过去，会怀疑是不是碰撞错了。
+## 出一个沙尘/水花就够了，伤害与弹道一点不动。
+##
+## 每个物体只触发一次：炮弹会在一根窄射线里跨好几个子步，不去重的话
+## 同一堵沙袋会被连续打中四五次，冒出五团尘。
+func _probe_blockers(from: Vector3, to: Vector3) -> void:
+	var space := get_world_3d().direct_space_state
+	var q := PhysicsRayQueryParameters3D.create(from, to, Tank.LAYER_BLOCKER)
+	q.collide_with_areas = false
+	var hit := space.intersect_ray(q)
+	if hit.is_empty():
+		return
+	var c = hit["collider"]
+	if not is_instance_valid(c):
+		return
+	var id: int = c.get_instance_id()
+	if _touched.has(id):
+		return
+	_touched[id] = true
+	var point: Vector3 = hit["position"]
+
+	# 水面：格子类型能问 arena，比给每个水面块打 meta 更省
+	if c.has_meta("cell"):
+		var cell: Vector2i = c.get_meta("cell")
+		var t: int = arena.cell(cell.x, cell.y)
+		# 水面、沙袋与路障的碰撞体都刻意做得比可见网格高（防止坦克骑上去），
+		# 所以射线交点会浮在表面上方一米多。反馈必须贴回可见表面，
+		# 否则水柱会悬在半空、沙尘会在沙袋顶上飘。
+		if t == Arena.WATER:
+			point.y = Arena.WATER_H
+			Fx.water_splash(game.fx_root, point)
+			Audio.play_3d("water", point)
+			return
+		elif t == Arena.SAND:
+			point.y = minf(point.y, Arena.SAND_H)
+		elif t == Arena.BARRICADE:
+			point.y = minf(point.y, Arena.BARRICADE_H)
+	# 残骸 / 沙袋 / 路障 / 栅栏：都是"实心但不是钢"
+	Fx.dirt_impact(game.fx_root, point, Vector3.UP, Color(0.42, 0.38, 0.30))
+	Audio.play_3d("dirt", point)
+
+
 func _hit_tank(t: Tank, point: Vector3) -> void:
+	# 命中次数按击发记：同一发弹幕打到几辆车、HE 溅到几辆车，都只算一次。
+	# 放在 take_hit 之前，于是跳弹与护盾这些"碰到了但没穿"也计入命中。
+	if from_player and is_instance_valid(shooter) and shooter.is_player:
+		shooter.claim_hit(_shot_id)
 	var out := [0, ""]
-	var res := t.take_hit(damage, global_position, kind, out)
+	var res := t.take_hit(damage, global_position, kind, out, point)
 	if res == "ricochet":
 		# 跳弹：炮弹被弹开报废，不造成任何伤害
 		Fx.ricochet(game.fx_root, point)
 		if game.has_method("on_shell_feedback"):
-			game.on_shell_feedback("跳弹!", point, from_player)
+			game.on_shell_feedback("跳弹!", point, from_player, "bounce")
 		_die()
 		return
 	if res == "shield":
 		Fx.ricochet(game.fx_root, point)
+		if game.has_method("on_shell_feedback"):
+			game.on_shell_feedback("护盾吸收", point, from_player, "block")
 		_die()
 		return
 	if res != "none" and game.has_method("on_shell_feedback"):
-		game.on_shell_feedback("%s %d" % [out[1], out[0]], point, from_player)
+		var result := "kill" if res == "kill" else "pen"
+		game.on_shell_feedback("%s %d" % [out[1], out[0]], point, from_player,
+				result, int(out[0]), _etype_of(t))
 	if kind == Kind.HE:
-		_explode()
+		# 把直击目标传给 _explode：它会照旧吃溅射伤害，但不再为同一发再飘一个数字。
+		# 原来一颗 HE 直击会同时出"正面 57"和"溅射 41"、响两声命中提示，
+		# 玩家数不清自己打了几发。
+		_explode(t)
 	else:
 		_die()
 
@@ -213,13 +300,20 @@ func _hit_world(collider: Object, point: Vector3, normal: Vector3) -> bool:
 				Fx.explosion(game.fx_root, point, 0.9)
 				Audio.play_3d("boom", point)
 	else:
-		Fx.debris(game.fx_root, point, normal, Color(0.45, 0.42, 0.35))
-		Audio.play_3d("steel", point)
+		# 地面：土溅 + 弹坑 + 泥土声。原来这里放的是钢板的"叮"，
+		# 于是每一发打空的炮弹都在提醒玩家"地面是钢做的"。
+		Fx.dirt_impact(game.fx_root, point, normal, Color(0.42, 0.36, 0.27))
+		Audio.play_3d("dirt", point)
+		# AP 打进土里会留一个小坑；HE 已经在 _explode 里留下更大的弹坑
+		if kind == Kind.AP:
+			arena.add_crater(point, 0.72)
 	_die()
 	return true
 
 
-func _explode() -> void:
+## direct 是直击命中的那辆车（HE 才有）。它的溅射伤害照常结算，
+## 但不再额外飘一次字、响一声"叮"——那一段反馈已经由 _hit_tank() 给过了。
+func _explode(direct: Tank = null) -> void:
 	if _dead:
 		return
 	var center := global_position
@@ -235,6 +329,7 @@ func _explode() -> void:
 		arena.add_crater(center, 1.0)
 
 	# 溅射伤害按距离衰减
+	var splash_landed := false
 	for t in game.all_tanks():
 		if not is_instance_valid(t) or not t.alive:
 			continue
@@ -249,9 +344,28 @@ func _explode() -> void:
 			continue
 		var out := [0, ""]
 		var res: String = t.take_hit(dmg, center, kind, out)
-		if res != "none" and res != "shield" and game.has_method("on_shell_feedback"):
-			game.on_shell_feedback("溅射 %d" % out[0], t.global_position, from_player)
+		if res != "none" and res != "shield" and res != "ricochet":
+			splash_landed = true
+		# 直击目标不再重复提示：同一发炮弹只该有一个数字、一声提示
+		if t == direct:
+			continue
+		if res == "none" or res == "shield" or res == "ricochet":
+			continue
+		if game.has_method("on_shell_feedback"):
+			game.on_shell_feedback("溅射 %d" % out[0], t.global_position, from_player,
+					"kill" if res == "kill" else "pen", int(out[0]), _etype_of(t))
+	# 落地溅射也算命中：HE 打进人堆时没有直击，但伤害确实造成了。
+	# claim_hit 按击发去重，所以直击 + 溅射不会记成两次。
+	if splash_landed and from_player and is_instance_valid(shooter) and shooter.is_player:
+		shooter.claim_hit(_shot_id)
 	_die()
+
+
+## 敌车类型；玩家没有这个字段。
+## 直接写 `t.etype` 会在玩家被击穿时抛 "Invalid access to property"——
+## 而玩家恰恰是最常被打中的那个，于是每次中弹都刷一条脚本错误。
+static func _etype_of(t: Tank) -> int:
+	return (t as Enemy).etype if t is Enemy else -1
 
 
 func _die() -> void:

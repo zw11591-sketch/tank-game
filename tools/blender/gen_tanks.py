@@ -281,7 +281,7 @@ def _running_gear(hull_parent, w, l, h, count, style):
                                 loc=(sx * x,
                                      run_len * 0.5 - 0.22 - i * (run_len - 0.44) / 13.0,
                                      0.055 + run_t * 0.5),
-                                material="M_Track"))
+                                material="M_TrackPlate"))
         # 侧裙：分段而不是一整块。原来 86% 车长的一整条裙板把负重轮全挡住，
         # 整车读起来就是"一个盒子架在两条黑板上"；改成三段、段间留 9 cm 缺口，
         # 上缘再抬 8 cm，轮子就从缝里露出来，行走部分才重新有层次。
@@ -300,11 +300,16 @@ def _running_gear(hull_parent, w, l, h, count, style):
                                      (k - 1.5) * (skirt_len + 0.01),
                                      top_z + 0.10),
                                 material="M_DarkMetal"))
-        # 托带轮：托着上支段的两个小轮，缺了履带上部就像悬在空中
+        # 托带轮：托着上支段的两个小轮，缺了履带上部就像悬在空中。
+        # 与负重轮一样独立成 Wheel_ 节点：整条行走部分都该跟着地面转，
+        # 只有负重轮转、诱导轮与托带轮静止，读起来是"轮子在空转"。
         for i in range(2):
-            static.append(L.cyl("returnroller_%s%d" % (side, i), 0.13, 0.30,
-                                loc=(sx * x, 0.45 - i * 1.5, top_z - run_t * 0.5 - 0.13),
-                                rot=(0, RAD(90), 0), verts=12, material="M_Metal"))
+            rr = L.cyl("Wheel_%s_return%d" % (side, i), 0.13, 0.30,
+                       loc=(sx * x, 0.45 - i * 1.5, top_z - run_t * 0.5 - 0.13),
+                       rot=(0, RAD(90), 0), verts=12, material="M_Metal")
+            L.bake(rr)
+            rr.parent = hull_parent
+            wheels.append(rr)
 
     span = (l - 1.6) / max(count - 1, 1)
     for i in range(count):
@@ -329,22 +334,33 @@ def _running_gear(hull_parent, w, l, h, count, style):
             one.parent = hull_parent
             wheels.append(one)
 
-    # 诱导轮（前）与主动轮（后）：比负重轮大一圈，履带环由它们撑起来
+    # 诱导轮（前）与主动轮（后）：比负重轮大一圈，履带环由它们撑起来。
+    # 两者都必须能转：履带是由主动轮驱动的，诱导轮只是被带着走；
+    # 一辆车往前开、诱导轮却纹丝不动，是行走部分最容易被一眼看穿的假。
+    # 主动轮的齿与轮盘并成同一个节点——齿必须跟着轮子走，否则轮转齿不转。
     for side, sx in (("L", -1), ("R", 1)):
-        static.append(L.cyl("idler_%s" % side, roll_r, 0.60,
-                            loc=(sx * x, l * 0.5 - 0.30, roll_z),
-                            rot=(0, RAD(90), 0), verts=18, material="M_DarkMetal"))
-        static.append(L.cyl("sprocket_%s" % side, roll_r, 0.64,
-                            loc=(sx * x, -l * 0.5 + 0.30, roll_z),
-                            rot=(0, RAD(90), 0), verts=18, material="M_Metal"))
+        idler = L.cyl("Wheel_%s_idler" % side, roll_r, 0.60,
+                      loc=(sx * x, l * 0.5 - 0.30, roll_z),
+                      rot=(0, RAD(90), 0), verts=18, material="M_DarkMetal")
+        L.bake(idler)
+        idler.parent = hull_parent
+        wheels.append(idler)
+
+        sprocket_parts = [L.cyl("sprocket_core", roll_r, 0.64,
+                                loc=(sx * x, -l * 0.5 + 0.30, roll_z),
+                                rot=(0, RAD(90), 0), verts=18, material="M_Metal")]
         for k in range(8):
             a = math.pi * 2.0 * k / 8.0
-            static.append(L.box("sprocket_tooth_%s%d" % (side, k),
-                                (0.50, 0.13, 0.13),
-                                loc=(sx * x,
-                                     -l * 0.5 + 0.30 + math.cos(a) * (roll_r + 0.06),
-                                     roll_z + math.sin(a) * (roll_r + 0.06)),
-                                rot=(0, RAD(90), -a), material="M_Metal"))
+            sprocket_parts.append(L.box("sprocket_tooth%d" % k,
+                                        (0.50, 0.13, 0.13),
+                                        loc=(sx * x,
+                                             -l * 0.5 + 0.30 + math.cos(a) * (roll_r + 0.06),
+                                             roll_z + math.sin(a) * (roll_r + 0.06)),
+                                        rot=(0, RAD(90), -a), material="M_Metal"))
+        sprocket = L.join(sprocket_parts, "Wheel_%s_sprocket" % side)
+        L.bake(sprocket)
+        sprocket.parent = hull_parent
+        wheels.append(sprocket)
     return wheels, static
 
 

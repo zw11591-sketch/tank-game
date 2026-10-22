@@ -48,6 +48,12 @@ var player: Player = null
 var enemies: Array = []
 var powerups: Array = []
 var damage_marks: Array = []
+## 场上的烟幕云团：{ "pos": Vector3, "r": float, "t": float }。
+## 隐蔽效果按"车在不在云里"判定，而不是给坦克挂一个计时状态——
+## 后者会让烟幕跟着车走，开出去照样隐身。
+var smoke_clouds: Array = []
+const SMOKE_RADIUS := 5.6
+const SMOKE_CLOUDS_MAX := 4
 ## 坦克两两接触的持续时长："pair key" -> 秒。侧向滑移的强度由它决定。
 var _contact: Dictionary = {}
 ## 上一物理帧各坦克的位置：instance_id -> Vector3。
@@ -69,6 +75,16 @@ var state := "title"
 var state_timer := 0.0
 var banner_text := ""
 
+## 受击暗角强度（0~1），由 on_player_hit 点亮、逐帧衰减。
+var hit_vignette := 0.0
+
+## 暂停前所处的状态。继续时必须回到这里，而不是无条件写回 "play"：
+## 在 "ready" 下暂停会跳过整段倒计时，在 "clear" 下暂停会让 _update_play
+## 把"敌人已清空"再判一次、把过关奖励重复加一遍。
+var _state_before_pause := "play"
+## 本关的过关奖励是否已经结算过。与状态恢复互补：同一关反复进出 clear 也只发一次。
+var _stage_cleared := false
+
 var combo_mult := 1.0
 var _combo_t := 0.0
 var _kills := 0
@@ -81,6 +97,12 @@ var _banner_t := 0.0
 var _fortify_t := 0.0
 var _stage_damage_bonus := 0.0
 var _field_t := 10.0
+## 敌车发动机声的调度计时（见 _update_enemy_engines）
+var _engine_t := 0.0
+## 同时可闻的敌车发动机数量上限。发动机是最不紧急的一层声，
+## 七台一起响会把语音位吃光，炮声与命中提示反而被丢掉。
+const ENGINE_VOICES := 3
+const ENGINE_RANGE := 46.0
 
 var _menu: CanvasLayer
 var _bg: TextureRect
@@ -112,13 +134,20 @@ func _ready() -> void:
 	randomize()
 	_load_high_score()
 
+	# 暂停走 SceneTree.paused。主节点必须始终处理输入，否则按 Esc 之后
+	# 连"继续"都收不到；战场里的东西则必须真的停住（炮弹还在飞、
+	# 连击窗口还在流逝的暂停等于没暂停）。
+	process_mode = Node.PROCESS_MODE_ALWAYS
+
 	arena = Arena.new()
 	arena.game = self
 	add_child(arena)
+	arena.process_mode = Node.PROCESS_MODE_PAUSABLE
 	arena.generate(1)
 
 	fx_root = Node3D.new()
 	add_child(fx_root)
+	fx_root.process_mode = Node.PROCESS_MODE_PAUSABLE
 	Audio.set_listener_root(fx_root)
 	# 开火、命中、爆炸的粒子着色器都在"第一次用到"时才编译上传，
 	# 不预热的话第一发炮必然掉几帧——而那正是玩家判断"反馈跟不跟手"的那一下。
@@ -127,6 +156,8 @@ func _ready() -> void:
 
 	rig = CameraRig.new()
 	add_child(rig)
+	# 相机也属于"战场"：暂停时不能继续跟随、不能继续吃鼠标
+	rig.process_mode = Node.PROCESS_MODE_PAUSABLE
 
 	hud = HUD.new()
 	hud.game = self
@@ -209,12 +240,17 @@ func _refresh_mouse_mode() -> void:
 
 func _set_pause(on: bool) -> void:
 	if on:
+		_state_before_pause = state
 		state = "pause"
+		# 暂停必须真的把战场停住：炮弹还在飞、冷却还在走、连击窗口还在流逝的
+		# 暂停只是"看不见"，不是"没发生"。
+		get_tree().paused = true
 		_refresh_mouse_mode()
 		_show_menu("", _pause_text())
 		_bg.modulate = Color(0.35, 0.35, 0.4, 0.92)
 	else:
-		state = "play"
+		state = _state_before_pause
+		get_tree().paused = false
 		_refresh_mouse_mode()
 		_hide_menu()
 
@@ -260,10 +296,26 @@ static func _garage_controls_text() -> String:
 # ---------------- 每帧 ----------------
 
 func _process(delta: float) -> void:
+	# 暂停期间整棵树都停了，这里也停掉横幅、连击窗口与加固计时：
+	# 否则玩家在暂停菜单里待 20 秒，回来时连击已经断了、加固也过期了。
+	if state == "pause":
+		return
+
 	if _banner_t > 0.0:
 		_banner_t -= delta
 		if _banner_t <= 0.0:
 			banner_text = ""
+
+	hit_vignette = maxf(0.0, hit_vignette - delta * 1.6)
+
+	# 烟幕寿命。暂停时这里不跑，所以暂停不会白白烧掉烟幕时间。
+	if smoke_clouds.size() > 0:
+		var clouds: Array = []
+		for c in smoke_clouds:
+			c["t"] = float(c["t"]) - delta
+			if float(c["t"]) > 0.0:
+				clouds.append(c)
+		smoke_clouds = clouds
 
 	_update_damage_marks(delta)
 
@@ -326,7 +378,13 @@ func _update_play(delta: float) -> void:
 		else:
 			_spawn_t = 0.5
 
-	if enemies_remaining() == 0:
+	_engine_t -= delta
+	if _engine_t <= 0.0:
+		_engine_t = 0.4
+		_update_enemy_engines()
+
+	if enemies_remaining() == 0 and not _stage_cleared:
+		_stage_cleared = true
 		state = "clear"
 		state_timer = 3.4
 		_refresh_mouse_mode()
@@ -444,6 +502,29 @@ func _is_jammed(a: Tank, b: Tank, now: Dictionary) -> bool:
 	return ma < JAM_STEP and mb < JAM_STEP
 
 
+## 敌车发动机声的调度：只打开离玩家最近的 3 台。
+##
+## 全开会让语音位被持续占据，而发动机声是最不紧急的一层——听不到身后那辆车
+## 只是少一点预警，听不到炮声与命中提示却会让战斗读不出来。
+func _update_enemy_engines() -> void:
+	var p = player
+	if p == null or not is_instance_valid(p) or not p.alive:
+		for e in enemies:
+			if is_instance_valid(e):
+				e.set_engine_on(false)
+		return
+	var near: Array = []
+	for e in enemies:
+		if is_instance_valid(e) and e.alive:
+			near.append([p.global_position.distance_to(e.global_position), e])
+	near.sort_custom(func(a, b): return float(a[0]) < float(b[0]))
+	for i in near.size():
+		var e = near[i][1]
+		if not is_instance_valid(e):
+			continue
+		e.set_engine_on(i < ENGINE_VOICES and float(near[i][0]) < ENGINE_RANGE)
+
+
 func _update_damage_marks(delta: float) -> void:
 	var i := damage_marks.size() - 1
 	while i >= 0:
@@ -470,6 +551,7 @@ func _cleanup() -> void:
 
 func _enter_title() -> void:
 	state = "title"
+	get_tree().paused = false
 	_refresh_mouse_mode()
 	hud.visible = false
 	_clear_battle()
@@ -558,6 +640,10 @@ func _confirm_start() -> void:
 	lives = MAX_LIVES
 	combo_mult = 1.0
 	_kills = 0
+	_stage_cleared = false
+	get_tree().paused = false
+	# 单局统计从零开始：结算页要报的是"这一局"，不是"到今天为止"
+	Stats.begin_run()
 	# 选车结果写进设置：下次开局直接停在上一次那台车上，不必每次重选
 	Settings.selected_tank = TankRoster.ORDER[_sel_tank]
 	Settings.save_cfg()
@@ -580,6 +666,7 @@ func _start_stage() -> void:
 	Audio.set_space(String(Arena.TERRAINS[terrain]["layout"]))
 	_clear_battle()
 	_build_spawn_queue()
+	_stage_cleared = false
 	max_active = mini(2 + int(stage / 2.0), 6)
 	_stage_damage_bonus = 0.0
 	_fortify_t = 0.0
@@ -625,6 +712,9 @@ func _spawn_enemy(t: int) -> bool:
 		e.configure(t, stage, difficulty)
 		e.setup(self, arena, pos)
 		add_child(e)
+		# 主节点是 ALWAYS（为了在暂停里还能读 Esc），所以动态生成的战场单位
+		# 必须显式标成 PAUSABLE，否则它们会跟着主节点一起继续跑。
+		e.process_mode = Node.PROCESS_MODE_PAUSABLE
 		enemies.append(e)
 		Fx.smoke_puff(fx_root, pos + Vector3(0, 0.45, 0), 0.8)
 		Audio.play_3d("spawn", pos)
@@ -644,6 +734,7 @@ func _spawn_player() -> void:
 	player.rig = rig
 	player.setup(self, arena, pos)
 	add_child(player)
+	player.process_mode = Node.PROCESS_MODE_PAUSABLE
 	# 必须在 _ready() 之后，否则基础属性会覆盖难度调整
 	player.apply_difficulty(difficulty)
 	player.damage_mult = 1.0 + _stage_damage_bonus
@@ -677,6 +768,7 @@ func _clear_battle() -> void:
 		player.queue_free()
 	player = null
 	damage_marks.clear()
+	smoke_clouds.clear()
 
 
 func _count_active() -> int:
@@ -707,6 +799,7 @@ func spawn_shell(from: Tank, origin: Vector3, dir: Vector3, kind: int) -> void:
 	var s := Shell.new()
 	s.launch(self, arena, from, origin, dir, kind)
 	add_child(s)
+	s.process_mode = Node.PROCESS_MODE_PAUSABLE
 
 
 func on_tank_destroyed(t: Tank) -> void:
@@ -715,8 +808,10 @@ func on_tank_destroyed(t: Tank) -> void:
 		return
 
 	_kills += 1
+	Stats.add_kill()
 	_combo_t = COMBO_WINDOW
 	combo_mult = minf(COMBO_MAX, combo_mult + 0.5)
+	Stats.note_combo(combo_mult)
 	var gain := int(t.points * combo_mult)
 	score += gain
 	rig.add_trauma(0.25)
@@ -736,32 +831,100 @@ func on_base_destroyed() -> void:
 func on_player_hit(from_pos: Vector3, dmg: int) -> void:
 	damage_marks.append({"pos": from_pos, "t": 1.4})
 	rig.add_trauma(clampf(dmg / 160.0, 0.15, 0.6))
+	hit_vignette = minf(1.0, hit_vignette + clampf(dmg / 200.0, 0.25, 0.8))
 	combo_mult = 1.0
 	_combo_t = 0.0
 
 
+## 玩家自己的车身挡下了一发（跳弹 / 护盾）。与"挨打"相反，这是好消息，
+## 但也必须给反馈：斜摆车身之所以值得练，唯一的原因就是玩家能看见它起作用。
+## 原来 take_hit() 在这两种情况下直接 return，没有方向环、没有震屏、没有提示——
+## 玩家只会以为"对方打偏了"。
+func on_player_blocked(what: String, blocked := 0) -> void:
+	var p = player
+	if p == null or not is_instance_valid(p):
+		return
+	# 只有轻微震屏：这是"被打了一下但没穿"，不是受伤
+	rig.add_trauma(0.12)
+	Stats.add_blocked(blocked)
+	if hud != null and hud.visible:
+		hud.show_result("%s · 装甲挡住了" % what, Color(0.70, 0.85, 1.0))
+	Audio.play("block", -2.0)
+
+
 ## 玩家炮弹产生结果时的统一反馈入口。
-## 除了飘字，还要在准星上打一个命中标记并给一声"叮"——
-## 开火与命中之间隔着飞行时间，没有这个确认就只能盯着目标猜打中没打中。
-func on_shell_feedback(text: String, pos: Vector3, from_player: bool) -> void:
+##
+## result 是四种战斗结果之一：
+##   "pen"    击穿   —— 清脆金属声 + 低频重击
+##   "bounce" 跳弹   —— 上扬的"叮"
+##   "kill"   击毁   —— 爆裂 + 短号角
+##   "block"  被挡下 —— 沉闷钝响
+## 原来四种情况共用一声 "steel" 加一声 "叮"，"打穿了"和"被弹开了"听起来
+## 完全一样——这是街机节奏下最不该省的信息。
+func on_shell_feedback(text: String, pos: Vector3, from_player: bool,
+		result := "pen", amount := 0, etype := -1) -> void:
 	if not from_player:
 		return
 	var col := Color(1.0, 0.9, 0.4)
-	var ric := text.begins_with("跳弹")
-	if ric:
-		col = Color(0.7, 0.8, 1.0)
-	elif text.begins_with("背面"):
-		col = Color(1.0, 0.35, 0.3)
+	var ribbon := text
+	match result:
+		"bounce":
+			col = Color(0.70, 0.80, 1.0)
+			ribbon = "跳弹"
+			Stats.add_bounce()
+		"kill":
+			col = Color(1.0, 0.55, 0.15)
+			ribbon = "击毁！"
+			Stats.add_damage(amount)
+		"block":
+			col = Color(0.70, 0.82, 1.0)
+			ribbon = "装甲挡住"
+		_:
+			col = Color(1.0, 0.86, 0.30)
+			ribbon = "击穿 " + text
+			Stats.add_damage(amount)
+
 	Fx.damage_number(fx_root, pos, text, col)
+	if hud != null and hud.visible:
+		hud.show_result(ribbon, col)
+		if result == "kill":
+			# 击杀栏记录"谁被打掉"，击毁那一瞬间的画面很乱，
+			# 没有这一行玩家事后根本想不起来刚才那一发打的是哪辆车。
+			hud.feed("击毁  %s" % _enemy_type_name(etype))
+	Audio.play(result, -3.0)
 	if player != null and is_instance_valid(player) and player.alive:
 		# 跳弹也算"打到了"，但标记用冷色，与实打实的伤害区分开
 		player.hit_flash = 0.3
-		player.hit_ricochet = ric
-		Audio.play("hitmark", -7.0 if ric else -3.0)
+		player.hit_ricochet = result == "bounce"
+
+
+static func _enemy_type_name(t: int) -> String:
+	match t:
+		0: return "侦察车"
+		2: return "重型坦克"
+		3: return "自行火炮"
+		4: return "指挥车"
+		_: return "中型坦克"
 
 
 func deploy_smoke(pos: Vector3, dur: float) -> void:
 	Fx.smoke_screen(fx_root, pos, dur)
+	smoke_clouds.append({"pos": pos, "r": SMOKE_RADIUS, "t": dur})
+	if smoke_clouds.size() > SMOKE_CLOUDS_MAX:
+		smoke_clouds.pop_front()
+
+
+## 这个点是否落在任意一团有效烟幕里（只看水平距离）。
+## 敌人用它对玩家做视线判定，HUD 也可以用它显示"已隐蔽"。
+func smoke_at(pos: Vector3) -> bool:
+	for c in smoke_clouds:
+		var p: Vector3 = c["pos"]
+		var dx := p.x - pos.x
+		var dz := p.z - pos.z
+		var r: float = c["r"]
+		if dx * dx + dz * dz <= r * r:
+			return true
+	return false
 
 
 func apply_powerup(ptype: int) -> void:
@@ -843,6 +1006,7 @@ func _spawn_powerup(pos: Vector3, ptype: int, from_field: bool) -> PowerUp:
 	p.from_field = from_field
 	p.position = pos
 	add_child(p)
+	p.process_mode = Node.PROCESS_MODE_PAUSABLE
 	powerups.append(p)
 	return p
 
@@ -896,29 +1060,89 @@ func _on_player_death() -> void:
 
 func _game_over() -> void:
 	state = "over"
+	get_tree().paused = false
 	_refresh_mouse_mode()
 	hud.visible = false
+	var won := false
 	if score > high_score:
 		high_score = score
 		_save_high_score()
-	_show_menu("战 败", "抵达第 %d 关   击毁 %d 辆\n得分 %07d\n最高 %07d\n\nR 重新出击   Esc 返回标题" % [
-		stage, _kills, score, high_score,
-	])
+	Stats.end_run(_player_tank_id(), difficulty, score, won)
+	_show_menu("战 败", _result_text(won))
 	Audio.play("gameover")
 
 
 func _win() -> void:
 	state = "win"
+	get_tree().paused = false
 	_refresh_mouse_mode()
 	hud.visible = false
 	score += lives * 3000
 	if score > high_score:
 		high_score = score
 		_save_high_score()
-	_show_menu("全 线 胜 利", "通关 %s 难度   击毁 %d 辆\n剩余战车奖励 +%d\n总得分 %07d\n\nEnter 返回标题" % [
-		DIFF_NAMES[difficulty], _kills, lives * 3000, score,
-	])
+	Stats.end_run(_player_tank_id(), difficulty, score, true)
+	_show_menu("全 线 胜 利", _result_text(true))
 	Audio.play("victory")
+
+
+## 当前使用的车型 id。玩家可能在关卡之间死掉（player == null），
+## 所以不能从 player 上读，只能从设置里读——那才是这一局真正出击的车。
+func _player_tank_id() -> String:
+	return Settings.selected_tank if TankRoster.has(Settings.selected_tank) \
+			else TankRoster.DEFAULT_ID
+
+
+## 详细结算页。
+##
+## 原来只有"关卡 / 击毁 / 得分 / 最高分"四个数，玩家打完一局不知道自己
+## 是怎么赢的、也不知道下一局该改什么。这里补上四个能指导决策的量：
+## 伤害输出（火力是否用满）、挡下伤害（装甲和斜摆是否生效）、命中率
+## （瞄得准不准）、跳弹次数（有没有在浪费炮弹），最后按阈值发勋章。
+func _result_text(won: bool) -> String:
+	var tank: Dictionary = TankRoster.spec(_player_tank_id())
+	var acc := Stats.accuracy()
+	var acc_txt := "—" if acc < 0.0 else "%d%%  (%d/%d)" % [
+		int(round(acc * 100.0)), Stats.run_hits, Stats.run_shots]
+	var lines: Array = []
+	lines.append("%s难度   战车【%s】" % [DIFF_NAMES[difficulty], String(tank["full"])])
+	lines.append("抵达第 %d 关       得分 %07d       最高 %07d" % [stage, score, high_score])
+	lines.append("")
+	lines.append("击毁        %d 辆" % Stats.run_kills)
+	lines.append("伤害输出    %d" % Stats.run_damage)
+	lines.append("挡下伤害    %d" % Stats.run_blocked)
+	lines.append("命中率      %s" % acc_txt)
+	lines.append("跳弹        %d 次" % Stats.run_bounces)
+	lines.append("最高连击    x%.1f" % Stats.run_combo)
+	lines.append("")
+	var medals := _medals(won)
+	lines.append("勋  章")
+	lines.append("  " + ("   ".join(medals) if medals.size() > 0 else "—"))
+	lines.append("")
+	lines.append("生涯累计   击毁 %d   最高分 %07d   通关 %d 次" % [
+		Stats.kills, Stats.best_score, Stats.wins])
+	lines.append("")
+	lines.append("R 重新出击   Esc 返回标题" if not won else "Enter 返回标题")
+	return "\n".join(lines)
+
+
+## 勋章阈值按"一局打满八关"的规模取：
+## 击毁 20 辆≈ 整整两关的敌人，命中率 70% 要求瞄得准而不是靠扫射，
+## 挡下 1200 伤害≈ 铁砧正面吃掉四发重型炮，连击 x3.0 需要连续 5 次击杀不挨打。
+func _medals(won: bool) -> Array:
+	var out: Array = []
+	if won:
+		out.append("★ 全线胜利")
+	if Stats.run_kills >= 20:
+		out.append("★ 钢铁洪流")
+	var acc := Stats.accuracy()
+	if acc >= 0.70 and Stats.run_hits >= 10:
+		out.append("★ 神射手")
+	if Stats.run_blocked >= 1200:
+		out.append("★ 铁壁")
+	if Stats.run_combo >= 3.0:
+		out.append("★ 连击大师")
+	return out
 
 
 func _banner(text: String, dur := 2.0) -> void:

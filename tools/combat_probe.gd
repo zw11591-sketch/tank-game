@@ -19,8 +19,9 @@ extends Node
 
 ## 判定为真实穿透的重叠深度（米）。留一点余量给单帧的数值抖动
 const TOL_PEN := 0.15
-## 车体圆到实心格的间隙小于这个值就算"贴上墙了"（米）。
-## move_and_slide 有 6cm 的 safe_margin，所以紧贴着墙时间隙是正的而不是 0，
+## 车体矩形到实心格的间隙小于这个值就算"贴上墙了"（米）。
+## 车体是按朝向旋转的矩形（tank.gd 的 _depen_offset_at），不是圆；
+## 求解器把车推到刚好接触为止，所以稳态间隙接近 0，留 0.14 m 给单帧抖动。
 ## 判据活性必须用间隙来数，不能用重叠量——那样永远数不到。
 const TOL_TOUCH := 0.14
 ## 一对坦克处于接触状态的时长。只做观测，不作判据——
@@ -213,23 +214,45 @@ func _check_penetration(main) -> void:
 	for t in main.all_tanks():
 		if not is_instance_valid(t):
 			continue
-		var pos: Vector3 = t.global_position
-		var radius: float = t.body_radius - 0.02
-		var c0 := Arena.to_cell(pos)
+		# 与 tank.gd 的 _depen_offset_at() 用同一套几何：车体是**有朝向的矩形**。
+		# 原探针按 body_radius 的圆来量，而矩形的半宽比半径大约 0.2 m，
+		# 于是算出来的"间隙"永远不会小于 0.14——wallFrames 长期为 0、
+		# testValid 永远 false，测的其实是另一个形状。
+		var base: Vector3 = t._hull_center(t.global_position, t.rotation.y)
+		var yaw: float = t.rotation.y
+		var rx := cos(yaw)
+		var rz := -sin(yaw)
+		var fx := -sin(yaw)
+		var fz := -cos(yaw)
+		var hw: float = t._hull_half_w
+		var hl: float = t._hull_half_l
+		var c0 := Arena.to_cell(base)
+		var reach: float = maxf(hw, hl) + half
+		var span := int(ceil(reach / Arena.CELL))
 		var worst := 0.0
 		var gap := INF
-		for dy in range(-1, 2):
-			for dx in range(-1, 2):
+		for dy in range(-span, span + 1):
+			for dx in range(-span, span + 1):
 				var cx: int = c0.x + dx
 				var cy: int = c0.y + dy
 				if not a.blocks_tank(cx, cy):
 					continue
 				var center := Arena.cell_center(cx, cy)
-				var nx := clampf(pos.x, center.x - half, center.x + half)
-				var nz := clampf(pos.z, center.z - half, center.z + half)
-				var dist := Vector2(pos.x - nx, pos.z - nz).length()
-				worst = maxf(worst, radius - dist)
-				gap = minf(gap, dist - radius)
+				var delta := Vector2(base.x - center.x, base.z - center.z)
+				if absf(delta.x) > reach or absf(delta.y) > reach:
+					continue
+				# 四条分离轴上的间距：负数代表重叠，取最大值即"最小分离量"。
+				# 与 Tank._obb_mtv() 的四条轴一一对应，所以这里量到的
+				# 就是求解器留下的残差，而不是另一套近似。
+				var sx := absf(delta.x) - (hw * absf(rx) + hl * absf(fx) + half)
+				var sz := absf(delta.y) - (hw * absf(rz) + hl * absf(fz) + half)
+				var sr := absf(delta.dot(Vector2(rx, rz))) \
+						- (hw + half * (absf(rx) + absf(rz)))
+				var sf := absf(delta.dot(Vector2(fx, fz))) \
+						- (hl + half * (absf(fx) + absf(fz)))
+				var g: float = maxf(maxf(sx, sz), maxf(sr, sf))
+				gap = minf(gap, g)
+				worst = maxf(worst, -g)
 		if gap < TOL_TOUCH:
 			_t_wall_frames += 1
 		_t_pen_raw = maxf(_t_pen_raw, worst)
@@ -263,6 +286,11 @@ func _check_overlap(main, delta: float) -> void:
 			if not is_instance_valid(a) or not is_instance_valid(b):
 				continue
 			var d: Vector3 = b.global_position - a.global_position
+			# 与 main.gd 的互推判据同源：重叠量量的是**车身轴线段之间的最近距离**，
+			# 而不是两个中心的距离。坦克长 4~6 米，首尾相接时中心离得很远、
+			# 车体却已经压在一起；按中心距离数，丁字相撞根本不会被记为接触。
+			var near: PackedVector3Array = main._closest_between(a, b)
+			d = near[1] - near[0]
 			d.y = 0.0
 			var want: float = (a.body_radius + b.body_radius) * CONTACT_K
 			if d.length() >= want:

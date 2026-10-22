@@ -68,6 +68,11 @@ static func _quad(col: Color, tex: Texture2D, unshaded: bool, stretch := 0.0) ->
 	m.billboard_mode = BaseMaterial3D.BILLBOARD_PARTICLES
 	m.vertex_color_use_as_albedo = true
 	m.disable_receive_shadows = true
+	# 软粒子：烟、尘、火星都是贴着地面或墙面生成的。不开邻近淡出时，
+	# 公告板与地面相交的那一条会被深度裁成硬边，看起来像一张方形贴纸插进土里。
+	# 0.6 m 足够盖住 1~3 m 的烟团，又不会让远处的粒子提前消失。
+	m.proximity_fade_enabled = true
+	m.proximity_fade_distance = 0.6
 	m.shading_mode = (
 		BaseMaterial3D.SHADING_MODE_UNSHADED if unshaded
 		else BaseMaterial3D.SHADING_MODE_PER_PIXEL
@@ -285,6 +290,62 @@ static func debris(parent: Node, pos: Vector3, normal: Vector3, col: Color) -> v
 	dust.damping_max = 5.0
 	dust.scale_curve = _grow_curve()
 	_burst(parent, pos, 8, 1.1, _quad(Color(1, 1, 1, 1), soft_dot(), false), dust, 10.0)
+
+
+## 土溅：AP 弹打进地面。
+##
+## 原来打地面用的是钢板的"叮"，而且不留任何痕迹——玩家看到的是炮弹落在地上
+## 又弹了一声金属，读起来像打在看不见的钢板上。土溅 + 弹坑才让"打空了"
+## 也变成一次有效的反馈。
+static func dirt_impact(parent: Node, pos: Vector3, normal: Vector3, col: Color) -> void:
+	debris(parent, pos, normal, col)
+	var n := normal if normal.length() > 0.01 else Vector3.UP
+	# 竖直向上的土柱：比碎块慢、比烟快，它是"这一发扎进地里"最直接的形状
+	var pm := _pm(n, 30.0, 2.5, 7.0, Vector3(0, -16.0, 0), 0.5, 1.5,
+		Color(col.r, col.g, col.b, 0.55))
+	pm.damping_min = 1.5
+	pm.damping_max = 3.0
+	pm.scale_curve = _grow_curve()
+	_burst(parent, pos, 12, 0.85, _quad(Color(1, 1, 1, 1), soft_dot(), false), pm, 10.0)
+
+
+## 炮弹落水：一根向上的水柱 + 一圈扩散的水花。
+##
+## 水是唯一"打上去没有任何事发生"的材质：没有火花、没有碎块、没有声音，
+## 炮弹就那样消失了。水面占了好几张图的可玩面积，不补这一下，
+## 那几张图会显得比别的图"少做了一层"。
+static func water_splash(parent: Node, pos: Vector3) -> void:
+	if parent == null:
+		return
+	var up := Vector3.UP
+	var pm := _pm(up, 14.0, 6.0, 13.0, Vector3(0, -22.0, 0), 0.35, 0.9,
+		Color(0.80, 0.90, 1.0, 0.75))
+	pm.damping_min = 1.0
+	pm.damping_max = 2.5
+	pm.scale_over_velocity_min = 0.3
+	_burst(parent, pos + up * 0.12, 22, 1.1,
+		_quad(Color(0.85, 0.93, 1.0, 0.9), soft_dot(), false), pm, 10.0)
+
+	# 水面上的白色泡沫环。平贴水面，几秒钟内向外推开再消失
+	var ring := MeshInstance3D.new()
+	var disc := TorusMesh.new()
+	disc.inner_radius = 0.30
+	disc.outer_radius = 0.52
+	ring.mesh = disc
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(0.88, 0.94, 1.0, 0.75)
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	ring.material_override = mat
+	ring.position = pos + up * 0.10
+	parent.add_child(ring)
+	var tw := ring.create_tween()
+	tw.set_parallel(true)
+	tw.tween_property(ring, "scale", Vector3(4.0, 1.0, 4.0), 0.55) \
+			.set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_OUT)
+	tw.tween_property(mat, "albedo_color:a", 0.0, 0.55)
+	_autofree(ring, 0.8)
 
 
 ## 一团散开的烟：爆炸余烟、排气、尘土共用
@@ -540,6 +601,9 @@ class DustRing extends Node3D:
 		_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 		_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
 		_mat.disable_receive_shadows = true
+		# 尘环贴地铺开，也要软边：否则它从地面切过去的那一圈是一条直线
+		_mat.proximity_fade_enabled = true
+		_mat.proximity_fade_distance = 0.7
 
 		var tm := TorusMesh.new()
 		tm.inner_radius = 0.62

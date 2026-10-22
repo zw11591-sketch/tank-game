@@ -135,6 +135,11 @@ var reload_t := 0.0
 ## "这一下点出去几发"时，一帧的推移就足以越过判据（见tools/click_probe.gd），
 ## 计数没有这个问题。
 var shot_count := 0
+## 玩家击发的编号与"本发已记过命中"标记。
+## 多弹装填一次击发会生成三发炮弹，共用同一个编号；本次击发只要有一发碰到
+## 敌车就记一次命中，于是命中率不会因为弹幕而超过 100%。
+var _shot_id := 0
+var _hit_claimed := false
 ## 累计被命中次数（**含跳弹与护盾这类零伤害的结果**）。同样只给验收探针用：
 ## close_aim_probe 必须区分"弹道确实落在车上，只是被跳弹挡掉"与从车边飞过去"，
 ## 后者才是玩家说的瞄准了却打到天上"。只真hp 会把 30% 的跳弹算成打空。
@@ -156,12 +161,15 @@ var armor_rear := 1.75
 
 # --- 增益状态（秒） ---
 var shield_t := 0.0
-var emp_t := 0.0
 var armor_buff_t := 0.0
 var rapid_buff_t := 0.0
 ## 多弹装填：一次击发同时打出三发带散布的炮弹
 var multi_t := 0.0
 var damage_mult := 1.0
+## 开火后的"暴露"计时：草丛隐蔽在这段时间内失效（见 player.is_concealed）。
+## 放在基类是因为它由 fire() 统一写入，玩家与敌人共用同一套开火流程。
+var expose_t := 0.0
+const EXPOSE_TIME := 1.6
 
 var turret: Node3D
 var barrel: Node3D
@@ -172,6 +180,37 @@ var _tread_l: MeshInstance3D
 var _tread_r: MeshInstance3D
 var _tread_phase := 0.0
 var _recoil := 0.0
+## ---- 悬挂（只作用于视觉节点 `_model`，物理层完全不动） ----
+##
+## 车体姿态是"这台车有多重"最直接的读法：起步抬头、刹车点头、转弯向外侧倾、
+## 开炮后坐。原来整车只有 3.5 cm 的正弦起伏，所有位移都发生在同一瞬间，
+## 于是玩家读到的是一块会平移的贴图，而不是一台几吨重的车。
+##
+## 实现是一个三自由度的弹簧-阻尼器（俯仰 / 侧倾 / 垂向），全部只写进
+## `_model` 的局部变换。**判定、碰撞、寻路一个都不参与**——所以它可以让
+## 车头点 5°，却不会让炮弹打偏半米。
+var _susp_pitch := 0.0
+var _susp_roll := 0.0
+var _susp_heave := 0.0
+var _susp_pitch_v := 0.0
+var _susp_roll_v := 0.0
+var _susp_heave_v := 0.0
+## 上一帧的车头轴速度与朝向，用来算加速度与角速度
+var _susp_prev_speed := 0.0
+var _susp_prev_yaw := 0.0
+## 本次转向的实际角速度（rad/s），由 drive() 每帧写入
+var _yaw_rate := 0.0
+## 撞击音效/震屏的冷却。连续顶墙时不该每帧响一声。
+var _impact_cd := 0.0
+## 悬挂刚度与阻尼。k 越大越"硬"，d 越接近 2*sqrt(k) 越不振铃。
+const SUSP_K := 120.0
+const SUSP_D := 15.0
+## 转向侧倾的强度。离心加速度 = ω × v，所以低速原地转向几乎没有侧倾，
+## 而高速大转弯会明显压向外侧——这一条正是"重"的来源。
+const SUSP_ROLL_K := 0.030
+## 加速度到俯仰的换算（rad per m/s²）。0.012 下满油门约 4.5°，
+## 已经能读出来但不至于让炮口离开准星的感觉。
+const SUSP_PITCH_K := 0.0042
 var _hull_size := Vector3(3.4, 1.0, 4.4)
 ## 当前沿车头轴的速度，带符号（正 = 前进）。惯性模型的唯一状态量。
 var _speed := 0.0
@@ -180,14 +219,22 @@ var _speed := 0.0
 var _moved := 0.0
 ## Blender 模型的根节点（走图元回退时为 null）
 var _model: Node3D
-## 可滚动的负重轮。模型里的Wheel_L*/Wheel_R* 节点，已烘掉摆放旋转。
+## 可滚动的行走部分。模型里的Wheel_L*/Wheel_R* 节点，已烘掉摆放旋转。
+## 包括负重轮、诱导轮、主动轮与托带轮——它们半径不同，
+## 用同一个轮径换算会让大轮转得太快、小轮几乎不动。
 var _wheels: Array[Node3D] = []
 var _wheel_radius := 0.45
+## 每个轮子自己的半径（instance_id -> 米）。从网格 AABB 现取，
+## 不依赖 Blender 侧再导出一份尺寸表：模型的轮径改了，转速自动跟上。
+var _wheel_radii: Dictionary = {}
 ## 炮管节点的静止局部坐标。后坐动画是在它之上叠加偏移，而不是直接写死坐标。
 var _barrel_base := Vector3.ZERO
 var _hull_base_y := 0.85
 var _track_mats: Array = []
 var _track_scroll := 0.0
+## 左右两条履带各自的滚动量。原地转向时两者反向，纵向行驶时相同。
+var _track_scroll_l := 0.0
+var _track_scroll_r := 0.0
 var _dust_l: GPUParticles3D
 var _dust_r: GPUParticles3D
 var _exhaust: GPUParticles3D
@@ -527,8 +574,17 @@ func _build_model_body() -> bool:
 
 	_barrel_base = barrel.position
 	_wheels = Assets.find_all(_model, "Wheel_")
-	# 轮径只影响滚动速度的观感，与任何判定无关；数值取自名册的尺寸真值表
-	# （它又与 tools/blender/gen_tanks.py 的_running_gear 一一对应（
+	# 每个行走轮的半径从它自己的网格包围盒来：圆柱轴线沿 X，
+	# 所以在 Y/Z 两个方向上的半高就是半径。
+	# 轮径只影响滚动速度的观感，与任何判定无关。
+	_wheel_radii.clear()
+	for w in _wheels:
+		var r := float(TankRoster.dims(model_key())["wheel"])
+		var mi := w as MeshInstance3D
+		if mi != null and mi.mesh != null:
+			var bb: AABB = mi.get_aabb()
+			r = clampf(maxf(bb.size.y, bb.size.z) * 0.5, 0.08, 1.4)
+		_wheel_radii[w.get_instance_id()] = r
 	_wheel_radius = float(TankRoster.dims(model_key())["wheel"])
 	_hull_base_y = 0.0
 	_add_turret_markings()
@@ -712,11 +768,11 @@ func _physics_process(delta: float) -> void:
 	turret_blocked = false
 	reload_t = maxf(0.0, reload_t - delta * reload_rate())
 	shield_t = maxf(0.0, shield_t - delta)
-	emp_t = maxf(0.0, emp_t - delta)
 	armor_buff_t = maxf(0.0, armor_buff_t - delta)
 	rapid_buff_t = maxf(0.0, rapid_buff_t - delta)
 	multi_t = maxf(0.0, multi_t - delta)
 	_recoil = maxf(0.0, _recoil - delta * 5.0)
+	_impact_cd = maxf(0.0, _impact_cd - delta)
 	# 后坐沿炮管轴向（局部+Z 即炮尾方向）叠加在静止坐标之上
 	barrel.position = _barrel_base + Vector3(0, 0, _recoil * 0.9)
 
@@ -740,10 +796,6 @@ func reload_ratio() -> float:
 	return 1.0 - clampf(reload_t / maxf(reload_time, 0.01), 0.0, 1.0)
 
 
-func is_emp() -> bool:
-	return emp_t > 0.0
-
-
 # ---------------- 机动 ----------------
 
 ## throttle: -1..1 前进/后退；steer: -1..1 车体左右转。
@@ -755,16 +807,6 @@ func drive(throttle: float, steer: float, delta: float) -> void:
 	throttle = clampf(throttle, -1.0, 1.0)
 	steer = clampf(steer, -1.0, 1.0)
 	var pos_before := global_position
-
-	if is_emp():
-		_speed = move_toward(_speed, 0.0, brake_decel * delta)
-		var depth_now := _hull_depth(rotation.y)
-		velocity = -global_transform.basis.z * _speed
-		move_and_slide()
-		_settle()
-		_undo_unresolved_move(pos_before, depth_now)
-		_track_motion(pos_before, delta)
-		return
 
 	var target := move_speed * throttle
 	if throttle < 0.0:
@@ -805,7 +847,12 @@ func drive(throttle: float, steer: float, delta: float) -> void:
 	_undo_unresolved_turn(yaw_before, depth_before)
 
 	_bleed_on_impact(delta)
+	# 实际角速度取**最终**朝向与转向前的差：_undo_unresolved_turn() 把顶墙的
+	# 那一部分转角收回去了，侧倾必须按真正转过的角度算，否则贴着墙拧舵时
+	# 车身会一直歪着，而车其实没在转。
+	_yaw_rate = wrapf(rotation.y - yaw_before, -PI, PI) / maxf(delta, 0.0001)
 	_animate_tracks(delta)
+	_animate_suspension(delta)
 	_lay_tracks()
 	_track_noise(delta)
 	_track_motion(pos_before, delta)
@@ -818,6 +865,10 @@ func drive(throttle: float, steer: float, delta: float) -> void:
 func _track_motion(from: Vector3, delta: float) -> void:
 	_moved = Vector2(global_position.x - from.x, global_position.z - from.z).length() \
 			/ maxf(delta, 0.0001)
+	# 开过铁丝网 / 栅栏时把它们放倒。只按实际位移触发：顶住墙原地轰油门的
+	# 那几秒不算“碾过去”，否则玩家还没碰到就会看见远处的栅栏自己倒下。
+	if _moved > 1.0 and arena != null:
+		arena.crush_at(global_position)
 
 
 ## 每次移动后的收尾：压回地面高度，再用网格硬约束把整条车身推出任何实心格。
@@ -1273,6 +1324,17 @@ func _bleed_on_impact(delta: float) -> void:
 	var t := clampf((bite - 0.35) / 0.65, 0.0, 1.0)
 	if t <= 0.0:
 		return
+	# 撞击的那一下必须有声音和车身反应：原来只有"速度悄悄掉下去"，
+	# 玩家读到的是一脚油门没反应，而不是"我撞上东西了"。
+	if t > 0.45 and absf(_speed) > 6.0 and _impact_cd <= 0.0:
+		_impact_cd = 0.35
+		Audio.play_3d("crash", global_position + Vector3(0, 0.8, 0),
+				lerpf(-16.0, -7.0, t), 45.0)
+		# 撞墙点头：车头压下去，紧接着被弹簧弹回来
+		_susp_pitch_v -= absf(_speed) * 0.035 * t
+		_susp_heave_v -= absf(_speed) * 0.02 * t
+		if is_player and game.rig != null:
+			game.rig.add_trauma(0.10 * t)
 	_speed = move_toward(_speed, 0.0, absf(_speed) * IMPACT_BLEED_MAX * t * t * t * delta)
 
 
@@ -1281,35 +1343,92 @@ func _animate_tracks(delta: float) -> void:
 	_tread_phase += sr * delta * 6.0
 	# 履带带纹按真实线速度滚动。上支段与下支段符号相反，车往前走时
 	# 两条带子朝相反方向跑；材质上的 track_sign 就是这个方向的唯一来源。
-	_track_scroll += _speed * delta
+	#
+	# 左右两条履带的线速度并不相同：原地转向时一侧前进、一侧后退。
+	# 所以滚动量必须按"转向中心到履带的距离"分别积分，而不是整车共用一份。
+	# 这也是原地转向唯一能被看见的地方——原来原地拧舵时履带完全静止，
+	# 车却在转，读起来像镜头在转而不是车在转。
+	var half_track := maxf(body_radius * 0.55, 0.4)
+	var v_l := _speed + _yaw_rate * half_track
+	var v_r := _speed - _yaw_rate * half_track
+	_track_scroll_l += v_l * delta
+	_track_scroll_r += v_r * delta
 	for m in _track_mats:
 		var sm := m as ShaderMaterial
 		if sm != null:
-			sm.set_shader_parameter("scroll", _track_scroll * float(sm.get_meta("track_sign", 1.0)))
-	var moving := absf(_speed) > 1.2 and alive
+			var side := float(sm.get_meta("track_side", 0.0))
+			var scroll := _track_scroll_l if side < 0.0 else (
+					_track_scroll_r if side > 0.0 else (_track_scroll_l + _track_scroll_r) * 0.5)
+			sm.set_shader_parameter("scroll", scroll * float(sm.get_meta("track_sign", 1.0)))
+	var spinning := absf(_speed) > 1.2 or absf(_yaw_rate) > 0.25
 	if _dust_l != null:
-		_dust_l.emitting = moving
+		_dust_l.emitting = spinning and alive
 	if _dust_r != null:
-		_dust_r.emitting = moving
+		_dust_r.emitting = spinning and alive
 	if _exhaust != null:
 		_exhaust.emitting = alive and absf(_speed) > 0.4
 	if _damage_smoke != null:
 		_damage_smoke.emitting = alive and hp < max_hp * 0.45
-	# 车体随行进起伏：模型路径动整棵子树，图元路径只动车体网格
+	# 行走部分按各自的线速度与各自的轮径滚动（原地转向时左右反向）。
+	# 轮子已在 Blender 侧烘掉摆放旋转，直接写 rotation.x。
+	for w in _wheels:
+		# 节点名约定 Wheel_L0 / Wheel_R0（见 tools/blender/gen_tanks.py）
+		var left := String(w.name).contains("_L")
+		var v := v_l if left else v_r
+		var r: float = float(_wheel_radii.get(w.get_instance_id(), _wheel_radius))
+		w.rotation.x += v * delta / maxf(r, 0.05)
+	if _model == null:
+		# 图元回退模式：上下支段原本按 bob 反向压一点，让"履带在脚下起伏"
+		# 而不是整块车体上下平移。这条在改成悬挂后丢了，补回来。
+		var bob := sin(_tread_phase * 3.0) * 0.035 * absf(sr)
+		if _tread_l != null:
+			_tread_l.position.y = 0.45 - bob * 0.5
+		if _tread_r != null:
+			_tread_r.position.y = 0.45 - bob * 0.5
+
+
+## 车体悬挂姿态：俯仰 / 侧倾 / 垂向，三者各自一个弹簧-阻尼器。
+##
+## 目标值来自"这一帧车在受什么力"：
+##   * 纵向加速度 → 俯仰（加速抬头、刹车点头、撞墙猛点头）
+##   * 角速度 × 车速 → 侧倾（高速转弯压向外侧）
+##   * 开炮 → 一次冲量（炮口上跳，幅度按单发伤害缩放）
+##
+## 全部写进 `_model` 的局部变换，物理层一点不动。图元回退模式只动 `_hull_mesh`。
+func _animate_suspension(delta: float) -> void:
+	if delta <= 0.0:
+		return
+	var accel := (_speed - _susp_prev_speed) / delta
+	_susp_prev_speed = _speed
+
+	# 俯仰：目标 = +k * 加速度（加速抬头、刹车点头）。
+	# 正 rotation.x 让车头（-Z）抬起——与"加速时重量后移"的方向一致。
+	var target_pitch := clampf(accel * SUSP_PITCH_K, -0.085, 0.085)
+	# 侧倾：离心加速度 = ω × v，符号让车身压向转弯的外侧
+	var target_roll := clampf(-_yaw_rate * _speed * SUSP_ROLL_K, -0.075, 0.075)
+	# 垂向：几乎没有目标，只有路面起伏与撞击时的一次性冲量
+	var target_heave := 0.0
+
+	_susp_pitch_v += ((target_pitch - _susp_pitch) * SUSP_K - _susp_pitch_v * SUSP_D) * delta
+	_susp_pitch += _susp_pitch_v * delta
+	_susp_roll_v += ((target_roll - _susp_roll) * SUSP_K - _susp_roll_v * SUSP_D) * delta
+	_susp_roll += _susp_roll_v * delta
+	_susp_heave_v += ((target_heave - _susp_heave) * SUSP_K - _susp_heave_v * SUSP_D) * delta
+	_susp_heave += _susp_heave_v * delta
+
+	# 履带起伏（原来那 3.5 cm 的正弦）保留，叠在悬挂之上
+	var sr := _speed / maxf(move_speed, 0.01)
 	var bob := sin(_tread_phase * 3.0) * 0.035 * absf(sr)
+	var y := _hull_base_y + bob + _susp_heave
 	if _model != null:
-		_model.position.y = _hull_base_y + bob
-		# 负重轮按真实线速度滚动，轮子已在Blender 侧烘掉摆放旋转，直接写rotation.x
-		var spin := _speed * delta / maxf(_wheel_radius, 0.05)
-		for w in _wheels:
-			w.rotation.x += spin
+		_model.position.y = y
+		_model.rotation.x = _susp_pitch
+		_model.rotation.z = _susp_roll
 		return
 	if _hull_mesh != null:
-		_hull_mesh.position.y = _hull_base_y + bob
-	if _tread_l != null:
-		_tread_l.position.y = 0.45 - bob * 0.5
-	if _tread_r != null:
-		_tread_r.position.y = 0.45 - bob * 0.5
+		_hull_mesh.position.y = y
+		_hull_mesh.rotation.x = _susp_pitch
+		_hull_mesh.rotation.z = _susp_roll
 
 
 ## 履带扬尘 / 排气 / 残血黑烟。
@@ -1318,7 +1437,11 @@ func _animate_tracks(delta: float) -> void:
 ## 移动时两条履带后方起尘、车尾排气随速度变浓、血量低于 45% 时发动机舱冒黑烟。
 ## 粒子坐标设为世界空间（local_coords = false），车开走之后尘烟留在原地。
 func _build_track_fx() -> void:
+	# 扬尘颜色跟着地形走：雪原扬雪、沙漠扬沙、熔岩扬灰。
+	# 固定土黄色会让车开过雪地时拖出一条泥尾巴，一眼就假。
 	var dust_col := Color(0.62, 0.56, 0.44, 0.26)
+	if arena != null:
+		dust_col = arena.track_dust_color()
 	_dust_l = _make_trail(26, 1.35, Vector3(-body_radius * 0.66, 0.16, body_length * 0.34),
 		Vector3(0, 0.55, 0.85), 32.0, 0.5, 1.8, Vector3(0, 0.35, 0),
 		Vector3(0.45, 0.45, 0.45), Vector3(1.05, 1.05, 1.05), dust_col)
@@ -1396,9 +1519,15 @@ func _spawn_wreck() -> void:
 	w.global_position = global_position + Vector3(0, -0.05, 0)
 	w.rotation.y = rotation.y
 	w.rotation.z = randf_range(-0.075, 0.075)
+	# 残骸会挡车，所以要让 A* 知道这一格不能走（见 Arena.note_wreck）。
+	# 必须在位置写完之后调用：封的是"残骸实际落在的那一格"。
+	arena.note_wreck(w.global_position)
 
+	# 焦黑色作为**颜色**传入，而不是一个纯黑材质覆盖：
+	# `_burn_meshes` 会按面派生材质，原贴图与迷彩轮廓都保留（见该函数注释）。
+	var burn_col := Color(0.072, 0.064, 0.058)
 	var burn := StandardMaterial3D.new()
-	burn.albedo_color = Color(0.072, 0.064, 0.058)
+	burn.albedo_color = burn_col
 	burn.roughness = 0.97
 	burn.metallic = 0.12
 
@@ -1407,7 +1536,7 @@ func _spawn_wreck() -> void:
 		copy.position = Vector3.ZERO
 		copy.rotation = Vector3.ZERO
 		w.add_child(copy)
-		_burn_meshes(copy, burn)
+		_burn_meshes(copy, burn_col)
 		var t := Assets.find_node(copy, "Turret")
 		if t != null:
 			t.rotation.y += randf_range(-0.30, 0.30)
@@ -1437,6 +1566,25 @@ func _spawn_wreck() -> void:
 	smoke.position = Vector3(0, 1.35, 0)
 	smoke.emitting = true
 
+	# 刚被击毁的十秒内有明火与偶尔迸出的火星。只冒烟的话，残骸读起来像
+	# "很久以前就烧完了"；有火焰才看得出这是刚刚发生的事，也给暗图一个光源。
+	var fire := _make_wreck_fire(w)
+	fire.position = Vector3(0, 1.05, 0)
+	fire.emitting = true
+	var sparks := _make_wreck_sparks(w)
+	sparks.position = Vector3(0, 1.35, 0)
+	sparks.emitting = true
+	var stop := Timer.new()
+	stop.wait_time = 10.0
+	stop.one_shot = true
+	stop.autostart = true
+	stop.timeout.connect(func() -> void:
+		if is_instance_valid(fire):
+			fire.emitting = false
+		if is_instance_valid(sparks):
+			sparks.emitting = false)
+	w.add_child(stop)
+
 	var ember := OmniLight3D.new()
 	ember.light_color = Color(1.0, 0.42, 0.12)
 	ember.light_energy = 0.7
@@ -1458,24 +1606,53 @@ func _spawn_wreck() -> void:
 	w.add_child(body)
 
 
-func _burn_meshes(n: Node, mat: StandardMaterial3D) -> void:
+## 把残骸"烧黑"，但**保留原贴图**。
+##
+## 原来的做法是给每一面套一个纯黑 material_override：贴图、法线、锈斑、焊缝
+## 全部消失，残骸读起来是一个黑盒子——和它旁边那台车没有任何视觉联系。
+## 现在改成逐面派生材质：贴图原样留着，只把反照率压向焦黑。
+## 于是烧毁的车仍然看得出是哪一款车，装甲板的接缝与迷彩的轮廓都还在，
+## 只是整台车像被熏过一遍。
+func _burn_meshes(n: Node, tint: Color) -> void:
 	if n is MeshInstance3D:
 		var mi := n as MeshInstance3D
-		mi.material_override = mat
-		mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
-		# 残骸是 `_model.duplicate()`：涂装只覆盖 M_Paint / M_Accent / 金属 /
-		# 尾灯 / 玻璃这五类表面，橡胶履带、帆布、深色金属等表面留下的是
-		# **null** surface override。原模型进场景树时这些 null 从未被查询，
-		# 复制出来的残骸却会在 NOTIFICATION_ENTER_WORLD 时逐表面对渲染器
-		# 查询 instance uniform，无头渲染器于是连刷
-		# `ERROR: Parameter "material" is null.`
-		# 残骸整体换烧黑材质，顺手把每一面的 override 都填成同一个非空材质，
-		# 既消掉日志，也保证没有任何一面还保留原来的涂装。
 		if mi.mesh != null:
 			for i in mi.mesh.get_surface_count():
-				mi.set_surface_override_material(i, mat)
+				var src := mi.get_surface_override_material(i)
+				if src == null:
+					src = mi.mesh.surface_get_material(i)
+				if src is ShaderMaterial:
+					# 涂装面：贴图在 shader 里，改 paint_color 即可保留迷彩与焊缝，
+					# 同时把可读性底光与描边关掉——烧掉的车不该还在发光。
+					var sm := (src as ShaderMaterial).duplicate() as ShaderMaterial
+					sm.set_shader_parameter("paint_color", tint)
+					sm.set_shader_parameter("readability", 0.0)
+					sm.set_shader_parameter("edge_glow", 0.0)
+					sm.set_shader_parameter("rim_strength", 0.08)
+					sm.set_shader_parameter("dirt_amount", 1.0)
+					mi.set_surface_override_material(i, sm)
+				elif src is BaseMaterial3D:
+					var bm := (src as BaseMaterial3D).duplicate() as BaseMaterial3D
+					# albedo_texture 不动，只把基色乘暗：橡胶履带、帆布、玻璃
+					# 这些没有涂装 shader 的表面靠这一条变焦黑。
+					bm.albedo_color = bm.albedo_color.lerp(tint, 0.86)
+					bm.roughness = 0.96
+					bm.metallic = 0.05
+					bm.emission_enabled = false
+					bm.emission_energy_multiplier = 0.0
+					mi.set_surface_override_material(i, bm)
+				else:
+					# 查不到任何材质（null override）：填一个非空材质，
+					# 否则残骸进场景树时渲染器会逐面刷 "material is null"。
+					# 注意这里必须填 Material，不能直接塞 Color。
+					var flat := StandardMaterial3D.new()
+					flat.albedo_color = tint
+					flat.roughness = 0.97
+					flat.metallic = 0.05
+					mi.set_surface_override_material(i, flat)
+		mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
 	for c in n.get_children():
-		_burn_meshes(c, mat)
+		_burn_meshes(c, tint)
 
 
 func _make_wreck_smoke(parent: Node) -> GPUParticles3D:
@@ -1523,7 +1700,70 @@ func _make_wreck_smoke(parent: Node) -> GPUParticles3D:
 	return p
 
 
-## 当前车速（m/s，带符号）
+## 残骸明火。与黑烟分开两层：烟往上走、火贴着车体烧，
+## 叠在一起才是"刚烧起来"，只有烟则像"早烧完了"。
+func _make_wreck_fire(parent: Node) -> GPUParticles3D:
+	var p := GPUParticles3D.new()
+	p.amount = 26
+	p.lifetime = 0.95
+	p.local_coords = false
+	p.preprocess = 0.3
+	p.visibility_aabb = AABB(Vector3(-8, -2, -8), Vector3(16, 12, 16))
+	var pm := ParticleProcessMaterial.new()
+	pm.emission_shape = ParticleProcessMaterial.EMISSION_SHAPE_SPHERE
+	pm.emission_sphere_radius = 0.70
+	pm.direction = Vector3(0, 1, 0)
+	pm.spread = 22.0
+	pm.initial_velocity_min = 0.5
+	pm.initial_velocity_max = 1.5
+	pm.gravity = Vector3(0.1, 0.9, 0.05)
+	pm.scale_min = 0.45
+	pm.scale_max = 1.25
+	var curve := Curve.new()
+	curve.add_point(Vector2(0.0, 0.35))
+	curve.add_point(Vector2(0.4, 1.0))
+	curve.add_point(Vector2(1.0, 0.55))
+	var ct := CurveTexture.new()
+	ct.curve = curve
+	pm.scale_curve = ct
+	var ramp := Gradient.new()
+	ramp.set_color(0, Color(1.0, 0.80, 0.32, 0.95))
+	ramp.set_color(1, Color(0.90, 0.18, 0.05, 0.0))
+	ramp.add_point(0.45, Color(1.0, 0.46, 0.10, 0.85))
+	var rt := GradientTexture1D.new()
+	rt.gradient = ramp
+	pm.color_ramp = rt
+	pm.color = Color(1.0, 0.52, 0.12, 0.9)
+	p.process_material = pm
+	p.draw_pass_1 = Fx._quad(Color(1.0, 0.55, 0.14, 0.9), Fx.soft_dot(), true)
+	p.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	parent.add_child(p)
+	return p
+
+
+## 偶尔迸出的火星。数量很少、速度很快、带重力，负责"火还在烧"的随机感。
+func _make_wreck_sparks(parent: Node) -> GPUParticles3D:
+	var p := GPUParticles3D.new()
+	p.amount = 16
+	p.lifetime = 1.3
+	p.local_coords = false
+	p.visibility_aabb = AABB(Vector3(-10, -4, -10), Vector3(20, 16, 20))
+	var pm := ParticleProcessMaterial.new()
+	pm.emission_shape = ParticleProcessMaterial.EMISSION_SHAPE_SPHERE
+	pm.emission_sphere_radius = 0.55
+	pm.direction = Vector3(0, 1, 0)
+	pm.spread = 55.0
+	pm.initial_velocity_min = 2.2
+	pm.initial_velocity_max = 5.2
+	pm.gravity = Vector3(0.3, -7.0, 0.15)
+	pm.scale_min = 0.035
+	pm.scale_max = 0.080
+	pm.color = Color(1.0, 0.72, 0.24, 0.95)
+	p.process_material = pm
+	p.draw_pass_1 = Fx._quad(Color(1.0, 0.72, 0.24, 0.95), Fx.soft_dot(), true)
+	p.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	parent.add_child(p)
+	return p
 func speed() -> float:
 	return _speed
 
@@ -1569,7 +1809,7 @@ func aim_at_angles(world_yaw: float, want_pitch: float, delta: float) -> bool:
 	if turret_limit > 0.0 and absf(want) > turret_limit:
 		want = signf(want) * turret_limit
 		turret_blocked = true
-	var rate := 0.0 if is_emp() else turret_speed
+	var rate := turret_speed
 	var dy := angle_difference(turret.rotation.y, want)
 	# 误差越大回转越快：大角度甩炮迅速，临门微调仍然稳
 	if rate > 0.0 and turret_snap > 0.0:
@@ -1694,7 +1934,7 @@ func he_dir(origin: Vector3, dir: Vector3) -> Vector3:
 
 
 func can_fire() -> bool:
-	return alive and reload_t <= 0.0 and not is_emp()
+	return alive and reload_t <= 0.0
 
 
 ## 直瞄弹该往哪飞：炮管姿态只是*视觉**，真正该去的地方是准星打中的那个点。
@@ -1729,7 +1969,23 @@ func fire() -> bool:
 		return false
 	reload_t = reload_time
 	shot_count += 1
+	if is_player:
+		# 命中率的分母。放在这里而不是 spawn_shell：多弹装填一次击发会生成三发炮弹，
+		# 按炮弹数统计会让命中率莫名其妙地除以三。
+		Stats.add_shot()
+		# 本发的编号，随炮弹一起下发。三发弹幕共用同一个编号，
+		# 于是无论哪一发先打中，这次击发都只记一次命中。
+		_shot_id += 1
+		_hit_claimed = false
+		# 开火会暴露位置：草丛隐蔽在这段时间里失效，于是"蹲草"不是无敌，
+		# 而是"打一发、换一个位置"的节奏。
+		expose_t = EXPOSE_TIME
 	_recoil = 0.55
+	# 开炮后坐：整车向后一顿，车头随之上抬。幅度按单发伤害缩放，
+	# 于是山猫是"抖一下"、猎手是"被推了一把"，两种车的手感不靠数字区分。
+	var kick := clampf(damage / 420.0, 0.05, 0.5)
+	_susp_pitch_v += kick
+	_susp_heave_v += kick * 0.35
 	var kind := shell_kind if can_use_he else Shell.Kind.AP
 	var dir := aim_solution(aim_dir())
 	var origin := shot_origin(dir)
@@ -1743,8 +1999,30 @@ func fire() -> bool:
 		for s in [-1.0, 1.0]:
 			game.spawn_shell(self, origin, dir.rotated(Vector3.UP, deg_to_rad(2.4) * s), kind)
 	Fx.muzzle_flash(game.fx_root, muzzle_pos(), dir)
-	Audio.play_3d("shoot", muzzle_pos())
+	# 分口径炮声：小 / 中 / 大三档，HE 另有一档更闷的。
+	# 侦察车和歼击车原来共用同一段波形，听感上打不出区别——
+	# 而"这一发有多重"恰恰应该先从耳朵里知道。
+	var sfx := "shoot_m"
+	if kind == Shell.Kind.HE:
+		sfx = "shoot_he"
+	elif damage >= 150:
+		sfx = "shoot_l"
+	elif damage < 80:
+		sfx = "shoot_s"
+	Audio.play_3d(sfx, muzzle_pos())
 	return true
+
+
+## 由炮弹在"确实碰到敌车"时调用（跳弹、护盾也算碰到）。
+##
+## 命中率按**击发**统计，而不是按炮弹或按被波及的目标：一发 HE 溅到四辆车
+## 仍然只是一次命中，否则命中率会超过 100%。编号不符说明是上一发的炮弹
+## 迟到了，不能记在当前这一发头上。
+func claim_hit(id: int) -> void:
+	if id != _shot_id or _hit_claimed:
+		return
+	_hit_claimed = true
+	Stats.add_hit()
 
 
 func toggle_shell() -> void:
@@ -1756,33 +2034,70 @@ func toggle_shell() -> void:
 
 # ---------------- 受击 ----------------
 
-## 返回 "shield" / "ricochet" / "hit" / "kill"，并输出实际伤害到out_dmg[0]
-func take_hit(amount: int, from_pos: Vector3, kind: int, out_dmg: Array = []) -> String:
+## 入射方向与车体正面的水平夹角（度）。0° = 从车头正前方打来。
+func impact_angle(from_pos: Vector3) -> float:
+	var to_hit := from_pos - global_position
+	to_hit.y = 0.0
+	if to_hit.length() < 0.01:
+		to_hit = Vector3.FORWARD
+	return rad_to_deg((-global_transform.basis.z).angle_to(to_hit.normalized()))
+
+
+## 该方向上打来的一发炮弹算哪个装甲区：0 正面 / 1 侧面 / 2 背面。
+##
+## HUD 的准星提示与 take_hit() 的分区判定共用这一个函数。
+## 两边各写一套阈值的话，准星说"正面"、实际却按侧面结算，
+## 玩家会认为提示在撒谎——那比没有提示更糟。
+func zone_index(from_pos: Vector3) -> int:
+	var ang := impact_angle(from_pos)
+	if ang < 55.0:
+		return 0
+	if ang > 125.0:
+		return 2
+	return 1
+
+
+## 该方向、该弹种下是否处在"可能跳弹"的角度上（正面 AP，夹角 > 32°）。
+## 只用于准星提示：真正的 30% 判定仍在 take_hit() 里。
+func is_ricochet_angle(from_pos: Vector3, kind: int) -> bool:
+	if kind != Shell.Kind.AP:
+		return false
+	var ang := impact_angle(from_pos)
+	return ang > 32.0 and ang < 55.0
+
+
+## 返回 "shield" / "ricochet" / "hit" / "kill"，并输出实际伤害到out_dmg[0]。
+## at 是可选的真实命中点（炮弹射线给的那个点）；不给时退回"车中心朝来袭方向
+## 偏移 1.6 m"的估算位置。
+func take_hit(amount: int, from_pos: Vector3, kind: int, out_dmg: Array = [],
+		at := Vector3.INF) -> String:
 	if not alive:
 		return "none"
 	hit_count += 1
 	if shield_t > 0.0:
 		Audio.play_3d("steel", global_position)
+		if is_player and game.has_method("on_player_blocked"):
+			game.on_player_blocked("护盾", amount)
 		return "shield"
 
-	var to_hit := from_pos - global_position
-	to_hit.y = 0.0
-	if to_hit.length() < 0.01:
-		to_hit = Vector3.FORWARD
-	# 入射方向与车体正面的夹角：° 正面，80° 背面
-	var fwd := -global_transform.basis.z
-	var ang := rad_to_deg(fwd.angle_to(to_hit.normalized()))
+	var ang := impact_angle(from_pos)
+	var zone_i := zone_index(from_pos)
 
 	var mult := armor_side
 	var zone := "侧面"
-	if ang < 55.0:
+	if zone_i == 0:
 		mult = armor_front
 		zone = "正面"
 		# 正面被AP 弹以大角度擦到有几率跳弹
 		if kind == Shell.Kind.AP and ang > 32.0 and randf() < 0.30:
 			Audio.play_3d("ricochet", global_position)
+			# 玩家自己跳掉了一发，必须有反馈：这是"斜摆车身有用"唯一的学习途径。
+			# 原来这里是直接 return，玩家既看不到方向指示也听不到提示，
+			# 只会以为对方打偏了。
+			if is_player and game.has_method("on_player_blocked"):
+				game.on_player_blocked("跳弹", int(round(amount * armor_front)))
 			return "ricochet"
-	elif ang > 125.0:
+	elif zone_i == 2:
 		mult = armor_rear
 		zone = "背面"
 
@@ -1798,7 +2113,12 @@ func take_hit(amount: int, from_pos: Vector3, kind: int, out_dmg: Array = []) ->
 	if is_player and game.has_method("on_player_hit"):
 		game.on_player_hit(from_pos, dmg)
 
-	Fx.hit_spark(game.fx_root, global_position + Vector3(0, 1.6, 0) + to_hit.normalized() * 1.6)
+	var spark_at := at
+	if spark_at == Vector3.INF:
+		var dir := from_pos - global_position
+		dir.y = 0.0
+		spark_at = global_position + Vector3(0, 1.6, 0) + dir.normalized() * 1.6
+	Fx.hit_spark(game.fx_root, spark_at)
 	if hp <= 0:
 		destroy(true)
 		return "kill"

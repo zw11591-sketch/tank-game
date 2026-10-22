@@ -263,6 +263,25 @@ var _mats: Dictionary = {}
 var _water_mat: ShaderMaterial
 var _props_root: Node3D
 var _dust: GPUParticles3D
+## 环境粒子（雪 / 沙 / 灰烬 / 雾气 / 飞虫）。换关时统一清掉，
+## 否则每开一关都会多叠一层粒子系统，十几关之后帧率会被吃光。
+var _ambient_fx: Array[Node] = []
+## 残骸占用的格子。写进 A* 网格后敌人会绕开残骸，
+## 而不是一头撞上去、顶到 `_check_stuck` 才倒车。
+## 上限与连通性都在 note_wreck() 里兜底：宁可少封几格，也不能把路封死。
+var _wreck_cells: Dictionary = {}
+const MAX_WRECK_CELLS := 28
+## 灌木与芦苇所在的格子：站在这里会被植被遮住，敌人中远距离看不见。
+## 只收这两种“高到能藏车”的植被；贴地草皮不算——否则半张图都是草丛，
+## 隐蔽就变成了默认状态。开火后由玩家侧的 expose_t 临时解除。
+var _conceal_cells: Dictionary = {}
+## 可压倒的装饰物（铁丝网 / 栅栏）。它们本来就没有碰撞体，撞过去只是
+## 视觉上“立着”变成“躺着”。key -> { "mmi": MultiMeshInstance3D,
+## "xfs": Array[Transform3D], "down": Dictionary }
+var _crush_meta: Dictionary = {}
+## 格 -> Array[[key, index]]，让碰撞检测只查本格与相邻四格
+var _crush_cells: Dictionary = {}
+var _crush_cd := 0.0
 var _decal_root: Node3D
 var _wrecks_root: Node3D
 var _scorches: Array = []
@@ -294,6 +313,13 @@ var _shore_root: Node3D
 var _runs_root: Node3D
 var _runs_dirty := false
 var _runs_pending := false
+## 打碎的墙留下的碎砖。这是一次性增量的 MultiMesh：每破一格塞 3 块进去，
+## 最多 DEBRIS_CAP 块，超过就从头覆盖（战场上最先打碎的墙最先被忘掉）。
+## 不进寻路网格、不加碰撞——它们只是地面上的"这里曾经有堵墙"。
+var _debris_mm: MultiMesh
+var _debris_mi: MultiMeshInstance3D
+var _debris_n := 0
+const DEBRIS_CAP := 720
 ## 上一次构建墙段时每格的状态，用来判断"这次受击有没有真的改变外观"
 var _built_state: Dictionary = {}
 ## 连续墙的接缝壁柱。现在只在**材质交界**处立一根，
@@ -357,10 +383,26 @@ func cell(x: int, y: int) -> int:
 	return grid[y][x]
 
 
-## 阻挡坦克通行
+## 静态地形阻挡坦克通行。
+##
+## 这里刻意**不含**残骸。残骸有自己的碰撞体（LAYER_BLOCKER），物理层已经挡住车；
+## 若再按整格算进这里，一辆只是擦到残骸边缘的车会被 depenetrate() 按 3 m 见方
+## 的格子推开最多一米，残骸周围就出现了一圈看不见的墙。按格决策的地方
+## （寻路、贴边、空投选点）用 blocks_nav()。
 func blocks_tank(x: int, y: int) -> bool:
 	var c := cell(x, y)
 	return c == BRICK or c == STEEL or c == WATER or c == BARRICADE or c == SAND or c == BASE
+
+
+## 这一格是否躺着残骸。
+func is_wreck_cell(x: int, y: int) -> bool:
+	return _wreck_cells.has(Vector2i(x, y))
+
+
+## 寻路 / 选点用的"不可通行"：静态地形 + 残骸。
+## A* 于是会绕开残骸，而不是直线撞上去再靠倒车脱困。
+func blocks_nav(x: int, y: int) -> bool:
+	return blocks_tank(x, y) or is_wreck_cell(x, y)
 
 
 ## 阻挡炮弹与视线（水面不挡，形能打不能的射击走廊）
@@ -371,15 +413,31 @@ func blocks_sight(x: int, y: int) -> bool:
 
 # ---------------- 地图生成 ----------------
 
+## 只用它推进"压倒道具"的冷却：Arena 没有别的逐帧逻辑。
+func _process(delta: float) -> void:
+	_crush_cd = maxf(0.0, _crush_cd - delta)
+
+
 func generate(stage: int, terrain_id := 0) -> void:
 	terrain = clampi(terrain_id, 0, TERRAINS.size() - 1)
 	for n in _blocks.values():
 		n.queue_free()
 	_blocks.clear()
 	brick_hp.clear()
+	_wreck_cells.clear()
+	_conceal_cells.clear()
+	_crush_meta.clear()
+	_crush_cells.clear()
 	base_hp = base_max_hp
 	_fortified = false
 	_clear_decals()
+	# 碎砖属于上一张图的破坏痕迹。换关时网格与贴花都会重来，它也必须清掉，
+	# 否则上一关打碎的墙会以"悬在新地图墙面上的一堆碎块"的形式留到下一关。
+	if _debris_mi != null:
+		_debris_mi.queue_free()
+		_debris_mi = null
+		_debris_mm = null
+		_debris_n = 0
 	if _wrecks_root != null:
 		for w in _wrecks_root.get_children():
 			w.queue_free()
@@ -430,6 +488,121 @@ func add_wreck(w: Node3D) -> void:
 		_wrecks_root.name = "Wrecks"
 		add_child(_wrecks_root)
 	_wrecks_root.add_child(w)
+
+
+## 把残骸所在的格子写进 A* 网格。
+##
+## 残骸是真实的物理阻挡（LAYER_BLOCKER），但寻路只知道网格——
+## 于是敌人会朝残骸直线推进，撞上以后靠 `_check_stuck` 倒车脱困，
+## 看起来像"AI 卡了一下"。封格之后它从一开始就绕开。
+##
+## 两个保守条件：
+##   * 已封格数达到 MAX_WRECK_CELLS 就不再封。残骸永久留在场上，
+##     不封顶的话一局后期会把整张图的可通行面积吃掉。
+##   * 封格后必须仍然"所有出生点可达基地"，否则立刻撤销。
+##     残骸可能正好倒在一格宽的走廊里，那条路封了就没有替代路线。
+func note_wreck(pos: Vector3) -> void:
+	if _wreck_cells.size() >= MAX_WRECK_CELLS:
+		return
+	var c := to_cell(pos)
+	if c.x < 1 or c.y < 1 or c.x >= GRID_W - 1 or c.y >= GRID_H - 1:
+		return
+	if blocks_tank(c.x, c.y):
+		return                      # 本来就不可通行，不需要额外标记
+	_wreck_cells[c] = true
+	if not _spawns_connected():
+		_wreck_cells.erase(c)
+		return
+	# 残骸一格宽，但宽体网格会把"邻格变成单格通道"也算进去，所以周围一起刷
+	_refresh_solid_around(c)
+
+
+## 这一格有没有能藏住坦克的植被（灌木 / 芦苇）。
+## 敌人只在 `_can_see` 里用一次，所以 O(1) 的格子查表就够了；
+## 不用每条视线去做逐实例距离检测。
+func is_concealed(pos: Vector3) -> bool:
+	return _conceal_cells.has(to_cell(pos))
+
+
+## 把坦克碾过的铁丝网 / 栅栏放倒。纯视觉：这些道具本来就没有碰撞体，
+## 所以不存在"移除碰撞"这一步；但看到它们一直笔直站着，会让人怀疑
+## 自己是不是真的开过去了。
+##
+## 只查本格与四邻：道具按格摆放，2.4 m 的接触半径不会跨出这一圈。
+## 同一个道具只会倒一次，倒下的实例从格表里摘掉。
+func crush_at(pos: Vector3) -> void:
+	if _crush_meta.is_empty():
+		return
+	if _crush_cd > 0.0:
+		return
+	_crush_cd = 0.12
+	var c := to_cell(pos)
+	for d in [Vector2i.ZERO, Vector2i(1, 0), Vector2i(-1, 0), Vector2i(0, 1), Vector2i(0, -1)]:
+		var key_cell: Vector2i = c + d
+		if not _crush_cells.has(key_cell):
+			continue
+		var hits: Array = _crush_cells[key_cell]
+		var left: Array = []
+		for rec in hits:
+			var key: String = rec[0]
+			var idx: int = rec[1]
+			var meta: Dictionary = _crush_meta[key]
+			var xf: Transform3D = meta["xfs"][idx]
+			var dx := xf.origin.x - pos.x
+			var dz := xf.origin.z - pos.z
+			if dx * dx + dz * dz > 2.4 * 2.4:
+				left.append(rec)
+				continue
+			var down: Dictionary = meta["down"]
+			if down.has(idx):
+				continue
+			down[idx] = true
+			_tip_over(meta["mmi"], xf, idx)
+		if left.is_empty():
+			_crush_cells.erase(key_cell)
+		else:
+			_crush_cells[key_cell] = left
+
+
+## 倒伏：绕局部 X 轴转 82°，再往地面压一点。
+## 网格原点就在地面，所以绕原点转就是绕底座倒下，不会半截插进土里。
+func _tip_over(mmi: MultiMeshInstance3D, xf: Transform3D, idx: int) -> void:
+	if mmi == null or mmi.multimesh == null:
+		return
+	var yaw := xf.basis.get_euler().y
+	var fallen := Transform3D(Basis(Vector3.UP, yaw), xf.origin)
+	fallen = fallen.rotated_local(Vector3.RIGHT, deg_to_rad(82.0))
+	fallen.origin.y += 0.10
+	mmi.multimesh.set_instance_transform(idx, fallen)
+
+
+## 记录可压倒道具的实例表。只在 _scatter_props 建完 MultiMesh 后调用一次。
+func _register_crushable(key: String, mmi: MultiMeshInstance3D, xfs: Array) -> void:
+	_crush_meta[key] = {"mmi": mmi, "xfs": xfs.duplicate(), "down": {}}
+	for i in xfs.size():
+		var origin: Vector3 = (xfs[i] as Transform3D).origin
+		var c := to_cell(origin)
+		# 路障格里的铁丝网是工事的一部分（挡车），不该被旁边开过的车带倒
+		if cell(c.x, c.y) == BARRICADE:
+			continue
+		if not _crush_cells.has(c):
+			_crush_cells[c] = []
+		_crush_cells[c].append([key, i])
+
+
+## 目标点贴到最近的可通行格。
+##
+## 侧绕 / 后撤算出来的是一个几何点，它可能落在墙里或水里；
+## 直接朝那个点转向，车会顶在墙上直到卡死判定介入。
+## 贴到可通行格之后，至少这个方向是"能开过去"的。
+func snap_open(pos: Vector3) -> Vector3:
+	var c := to_cell(pos)
+	if not blocks_nav(c.x, c.y):
+		return pos
+	var n := _nearest_open(c)
+	if n == Vector2i(-1, -1):
+		return pos
+	return cell_center(n.x, n.y)
 
 
 func _new_grid() -> void:
@@ -907,11 +1080,11 @@ func _single_lane_runs(vertical: bool) -> Array:
 
 ## 该空格是不是只有一格宽（沿 vertical 方向延伸、被左右/上下两堵墙夹住）## 寻路的宽度惩罚（_sync_astar）也用它，所以两条判据说的是同一件事
 func _narrow_at(x: int, y: int, vertical: bool) -> bool:
-	if blocks_tank(x, y):
+	if blocks_nav(x, y):
 		return false
 	if vertical:
-		return blocks_tank(x - 1, y) and blocks_tank(x + 1, y)
-	return blocks_tank(x, y - 1) and blocks_tank(x, y + 1)
+		return blocks_nav(x - 1, y) and blocks_nav(x + 1, y)
+	return blocks_nav(x, y - 1) and blocks_nav(x, y + 1)
 
 
 ## 把一段单格通道朝一侧拓
@@ -1016,7 +1189,7 @@ func _spawns_connected() -> bool:
 			var n: Vector2i = c + d
 			if n.x < 0 or n.y < 0 or n.x >= GRID_W or n.y >= GRID_H:
 				continue
-			if seen.has(n) or blocks_tank(n.x, n.y):
+			if seen.has(n) or blocks_nav(n.x, n.y):
 				continue
 			seen[n] = true
 			stack.append(n)
@@ -1049,7 +1222,7 @@ func _sync_astar() -> void:
 ## 把一格的"实心"同步到两张网格上##
 ## 宽体网格额外*单格宽通道**判成实心，判据与地形生成用的 `_narrow_at()` 是同一## 函数，于生成时认为这里转不开"寻路时认为这里过不去"说的是同一件事
 func _apply_solid(c: Vector2i) -> void:
-	var solid := blocks_tank(c.x, c.y)
+	var solid := blocks_nav(c.x, c.y)
 	astar.set_point_solid(c, solid)
 	astar_wide.set_point_solid(c, solid or _narrow_any(c.x, c.y))
 
@@ -1220,11 +1393,11 @@ func random_open_cell(avoid: Array, min_dist: float,
 	for i in 90:
 		var x := randi_range(2, GRID_W - 3)
 		var y := randi_range(5, GRID_H - 5)
-		if cell(x, y) != EMPTY:
+		if cell(x, y) != EMPTY or is_wreck_cell(x, y):
 			continue
 		var open := 0
 		for d in DIRS:
-			if not blocks_tank(x + d.x, y + d.y):
+			if not blocks_nav(x + d.x, y + d.y):
 				open += 1
 		if open < 2:
 			continue
@@ -1297,14 +1470,71 @@ func damage_base(dmg: int) -> void:
 
 
 func _clear_cell(c: Vector2i) -> void:
+	var was := cell(c.x, c.y)
 	grid[c.y][c.x] = EMPTY
 	brick_hp.erase(c)
 	if _blocks.has(c):
 		_blocks[c].queue_free()
 		_blocks.erase(c)
+	# 砖墙塌了要留碎砖：原来整格直接消失，地面干干净净，
+	# 玩家看不出"这里刚才有一堵墙"。碎砖 + 焦痕才让破坏留在场上。
+	if was == BRICK:
+		_spawn_wall_debris(c)
 	_refresh_solid_around(c)
 	_schedule_runs()
 	_schedule_joints()
+
+
+## 一格砖墙碎裂后的地面残留：2~3 块碎砖 + 一层薄焦痕。
+##
+## 用 MultiMesh 而不是 MeshInstance3D：一局打下来能碎上百格墙，
+## 每格三块独立网格就是三百个节点、三百次 draw call。MultiMesh 只加一次 draw call。
+func _spawn_wall_debris(c: Vector2i) -> void:
+	_ensure_debris()
+	if _debris_mm == null:
+		return
+	var center := cell_center(c.x, c.y)
+	var n := randi_range(2, 3)
+	for i in n:
+		var a := randf_range(0.0, TAU)
+		var r := randf_range(0.4, 1.35)
+		var s := randf_range(0.22, 0.44)
+		var t := Transform3D(
+			Basis.from_euler(Vector3(randf_range(-0.25, 0.25), randf_range(0.0, TAU),
+					randf_range(-0.25, 0.25))).scaled(Vector3(s, s * randf_range(0.6, 1.0), s)),
+			center + Vector3(cos(a) * r, s * 0.32, sin(a) * r))
+		if _debris_n < DEBRIS_CAP:
+			_debris_mm.set_instance_transform(_debris_n, t)
+			_debris_n += 1
+			_debris_mm.visible_instance_count = _debris_n
+		else:
+			# 满了就循环覆盖：最新的破坏永远看得见，最旧的自然消失
+			_debris_mm.set_instance_transform(_debris_n % DEBRIS_CAP, t)
+			_debris_n += 1
+	# 焦痕压在最下面，一层就够——砖墙碎裂不该像被炮弹炸过那么黑
+	add_scorch(center, 0.45)
+
+
+func _ensure_debris() -> void:
+	if _debris_mm != null:
+		return
+	_debris_mm = MultiMesh.new()
+	_debris_mm.transform_format = MultiMesh.TRANSFORM_3D
+	# 容量一次分配好，用 visible_instance_count 增长。
+	# 逐个 set instance_count 会反复重分配缓冲区，碎一块墙就抖一下。
+	_debris_mm.instance_count = DEBRIS_CAP
+	_debris_mm.visible_instance_count = 0
+	var box := BoxMesh.new()
+	box.size = Vector3(1.0, 1.0, 1.0)
+	_debris_mm.mesh = box
+	_debris_mi = MultiMeshInstance3D.new()
+	_debris_mi.name = "WallDebris"
+	_debris_mi.multimesh = _debris_mm
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(0.42, 0.20, 0.13)
+	mat.roughness = 0.95
+	_debris_mi.material_override = mat
+	add_child(_debris_mi)
 
 
 ## 铁锹道具：临时把基地外圈换成钢墙
@@ -2475,6 +2705,9 @@ static func _soil_material(idx: int) -> Material:
 			grass = 0.02
 	m.set_shader_parameter("grass_amount", grass)
 	m.set_shader_parameter("large_scale", 1.0)
+	# 熔岩弹坑：地面裂缝里透出橙红的光。这是唯一一张"地面本身是光源"的图，
+	# 不给它一条发光裂缝，熔岩就只是"红褐色的土"。
+	m.set_shader_parameter("lava_amount", 1.0 if nm == "熔岩弹坑" else 0.0)
 	_soil_cache[idx] = m
 	return m
 
@@ -2491,6 +2724,8 @@ uniform vec3 gravel_col : source_color = vec3(0.5);
 uniform vec3 grass_col : source_color = vec3(0.18, 0.24, 0.12);
 uniform float grass_amount = 0.18;
 uniform float large_scale = 1.0;
+uniform float lava_amount = 0.0;
+uniform vec3 lava_col : source_color = vec3(1.0, 0.33, 0.07);
 
 varying vec3 wpos;
 
@@ -2603,6 +2838,17 @@ void fragment() {
 	float bump = mix(0.05, 0.22, detail);
 	NORMAL_MAP = vec3(0.5 + grad.x * bump, 0.5 + grad.y * bump, 1.0);
 	NORMAL_MAP_DEPTH = mix(0.10, 1.15, detail);
+
+	// 熔岩裂缝：只在这张图上生效。用"离 0.5 有多近"的脊线做细缝，
+	// 再用一层低频 gate 把发光限制在成片的区域——整张地都在裂缝就假了。
+	if (lava_amount > 0.001) {
+		float vein = abs(fbm(wpos.xz * 0.30 + 12.0) - 0.5);
+		float crack = 1.0 - smoothstep(0.010, 0.036, vein);
+		float gate = smoothstep(0.40, 0.62, fbm(wpos.xz * 0.040 + 3.0));
+		float glow = crack * gate * lava_amount;
+		col = mix(col, lava_col * 0.55, glow * 0.65);
+		EMISSION += lava_col * glow * 1.8;
+	}
 
 	ALBEDO = col;
 	// 湿泥的反光明显强于干土：粗糙度随湿度下降，SPECULAR 略抬，
@@ -2794,6 +3040,10 @@ func _scatter_props(stage: int) -> void:
 			if (key in PROP_HEAVY or key in PROP_TALL or key == "prop_rubble")
 			else GeometryInstance3D.SHADOW_CASTING_SETTING_OFF)
 		_props_root.add_child(mmi)
+		# 铁丝网 / 栅栏是空地上唯一“立着”的轻道具：坦克压过去要倒，
+		# 否则一穿而过会让玩家以为这层道具根本不存在。
+		if key == "prop_wire":
+			_register_crushable(key, mmi, list)
 
 	# 夜战：给路灯真的挂一盏灯。prop_lamp 原来只是个不发光的水泥杆
 	# 夜里站在路灯下和站在空地上没有区别；一圈暖色光池是"夜间"
@@ -3297,7 +3547,6 @@ func _add_street_lamps() -> void:
 		used.append(c)
 		placed += 1
 		_place_street_lamp(c, lamp_mesh, rng)
-	print("NIGHT streetlamps placed=%d candidates=%d" % [placed, cands.size()])
 
 
 func _place_street_lamp(c: Vector2i, mesh: Mesh, rng: RandomNumberGenerator) -> void:
@@ -3426,7 +3675,6 @@ func _add_night_windows() -> void:
 						cool.append(tr)
 	_make_window_mm(warm, Color(1.0, 0.74, 0.40), "WindowsWarm")
 	_make_window_mm(cool, Color(0.58, 0.76, 1.0), "WindowsCool")
-	print("NIGHT windows warm=%d cool=%d" % [warm.size(), cool.size()])
 
 
 func _make_window_mm(list: Array[Transform3D], col: Color, nname: String) -> void:
@@ -3822,33 +4070,130 @@ func _make_joint_mm(list: Array[Transform3D], col: Color, rough: float,
 	_joints_root.add_child(mmi)
 
 
-## 低强度扬尘：给静止的战场加一点空气感
+## 环境粒子：让"这张图是什么地方"不只看天空颜色。
+##
+## 原来十二张图共用同一层土黄色扬尘：雪原上飘着沙、熔岩弹坑里飘着土，
+## 天空与地面都在说"这里不一样"，空气却在说"都一样"。
+## 现在按地形换一整套：雪原下雪、沙漠起沙暴、熔岩飘灰烬与火星、
+## 丛林有低雾和飞虫、港区有水汽。全部只在画质中档以上发射。
+##
+## 换关时先清掉上一张图的粒子：`_scatter_props` 每关都会调这里，
+## 不清就会一层层叠加，最后十几关的粒子同时存在于场景里。
 func _build_dust() -> void:
+	for n in _ambient_fx:
+		if is_instance_valid(n):
+			n.queue_free()
+	_ambient_fx.clear()
+	_dust = null
+
+	match terrain_name():
+		"雪原哨所":
+			_dust = _ambient_layer("Snow", 620, 15.0, Color(0.93, 0.96, 1.0, 0.55),
+					Vector3(0.18, -1.0, 0.12), 16.0, 1.4, 3.0,
+					Vector3(0.25, -0.9, 0.15), 0.045, 0.11, 11.0, 6.0)
+		"沙漠风暴":
+			_dust = _ambient_layer("Sandstorm", 520, 6.5, Color(0.74, 0.62, 0.42, 0.13),
+					Vector3(1.0, 0.05, 0.25), 20.0, 7.0, 13.0,
+					Vector3(0.0, 0.02, 0.0), 0.30, 0.85, 7.0, 5.0)
+		"熔岩弹坑":
+			_dust = _ambient_layer("Ash", 340, 13.0, Color(0.40, 0.37, 0.36, 0.30),
+					Vector3(0.2, -1.0, 0.1), 18.0, 0.5, 1.3,
+					Vector3(0.15, -0.22, 0.05), 0.04, 0.10, 11.0, 6.0)
+			_ambient_layer("Embers", 110, 4.5, Color(1.0, 0.45, 0.12, 0.80),
+					Vector3(0.0, 1.0, 0.0), 32.0, 0.7, 2.2,
+					Vector3(0.2, 0.35, 0.1), 0.045, 0.11, 1.2, 0.4, true)
+		"丛林小径":
+			_dust = _ambient_layer("Mist", 110, 12.0, Color(0.64, 0.72, 0.64, 0.10),
+					Vector3(1.0, 0.05, 0.2), 24.0, 0.15, 0.5,
+					Vector3(0.0, 0.02, 0.0), 1.10, 2.60, 2.4, 1.2)
+			_ambient_layer("Fireflies", 70, 8.0, Color(0.85, 1.0, 0.35, 0.85),
+					Vector3(0.0, 1.0, 0.0), 180.0, 0.1, 0.4,
+					Vector3(0.0, 0.05, 0.0), 0.03, 0.07, 2.0, 1.2, true)
+		"工业港区":
+			_dust = _ambient_layer("Vapor", 130, 9.0, Color(0.72, 0.80, 0.86, 0.12),
+					Vector3(0.0, 1.0, 0.0), 24.0, 0.2, 0.7,
+					Vector3(0.0, 0.03, 0.0), 0.75, 1.9, 2.0, 1.0)
+		"夜战市区":
+			_dust = _ambient_layer("DuskDust", 150, 9.0, Color(0.50, 0.53, 0.60, 0.10),
+					Vector3(0.5, 0.2, 0.2), 30.0, 0.35, 1.2,
+					Vector3(0.15, -0.03, 0.1), 0.05, 0.14, 6.0, 4.0)
+		_:
+			_dust = _ambient_layer("Dust", 160, 9.0, Color(0.72, 0.66, 0.54, 0.16),
+					Vector3(0.6, 0.25, 0.2), 35.0, 0.4, 1.6,
+					Vector3(0.2, -0.05, 0.1), 0.05, 0.16, 5.0, 3.0)
+
+
+## 一层环境粒子。方向、速度、重力、尺寸全部参数化：
+## 雪是"小、慢、往下"，沙暴是"大、快、横着"，灰烬是"小、慢、往下飘"，
+## 火星与飞虫则走 additive 混合，于是即便在暗处也亮得起来。
+func _ambient_layer(nname: String, amount: int, life: float, col: Color,
+		dir: Vector3, spread: float, v0: float, v1: float,
+		gravity: Vector3, s0: float, s1: float,
+		height: float, box_y: float, additive := false) -> GPUParticles3D:
 	var p := GPUParticles3D.new()
-	p.name = "Dust"
-	p.amount = 160
-	p.lifetime = 9.0
-	p.preprocess = 5.0
+	p.name = nname
+	p.amount = amount
+	p.lifetime = life
+	# preprocess 让粒子在开局第一帧就已经铺满，而不是从空场慢慢长出来
+	p.preprocess = minf(life * 0.8, 6.0)
 	p.visibility_aabb = AABB(
-		Vector3(-GRID_W * CELL * 0.5, 0, -GRID_H * CELL * 0.5),
-		Vector3(GRID_W * CELL, 14.0, GRID_H * CELL))
+		Vector3(-GRID_W * CELL * 0.5, -4.0, -GRID_H * CELL * 0.5),
+		Vector3(GRID_W * CELL, height + 10.0, GRID_H * CELL))
+	p.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 
 	var pm := ParticleProcessMaterial.new()
 	pm.emission_shape = ParticleProcessMaterial.EMISSION_SHAPE_BOX
-	pm.emission_box_extents = Vector3(GRID_W * CELL * 0.5, 5.0, GRID_H * CELL * 0.5)
-	pm.direction = Vector3(0.6, 0.25, 0.2)
-	pm.spread = 35.0
-	pm.initial_velocity_min = 0.4
-	pm.initial_velocity_max = 1.6
-	pm.gravity = Vector3(0.2, -0.05, 0.1)
-	pm.scale_min = 0.05
-	pm.scale_max = 0.16
-	pm.color = Color(0.72, 0.66, 0.54, 0.16)
+	pm.emission_box_extents = Vector3(GRID_W * CELL * 0.5, box_y, GRID_H * CELL * 0.5)
+	pm.direction = dir
+	pm.spread = spread
+	pm.initial_velocity_min = v0
+	pm.initial_velocity_max = v1
+	pm.gravity = gravity
+	pm.scale_min = s0
+	pm.scale_max = s1
+	pm.color = col
 	p.process_material = pm
-	p.draw_pass_1 = _soft_quad(Color(0.72, 0.66, 0.54, 0.16))
-	p.position = Vector3(0, 5.0, 0)
+	p.draw_pass_1 = _ambient_quad(col, additive)
+	p.position = Vector3(0, height, 0)
 	add_child(p)
-	_dust = p
+	_ambient_fx.append(p)
+	return p
+
+
+func _ambient_quad(col: Color, additive: bool) -> Mesh:
+	var q := QuadMesh.new()
+	q.size = Vector2.ONE
+	var m := StandardMaterial3D.new()
+	m.albedo_color = col
+	m.albedo_texture = _soft_dot()
+	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	m.blend_mode = BaseMaterial3D.BLEND_MODE_ADD if additive else BaseMaterial3D.BLEND_MODE_MIX
+	m.billboard_mode = BaseMaterial3D.BILLBOARD_PARTICLES
+	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	m.vertex_color_use_as_albedo = true
+	m.disable_receive_shadows = true
+	q.material = m
+	return q
+
+
+## 履带扬尘的颜色跟随地形。雪原扬起的是雪，沙漠扬起的是沙，
+## 熔岩图上扬起的应该是灰而不是黄土——否则车开过去的轨迹会和背景打架。
+func track_dust_color() -> Color:
+	match terrain_name():
+		"雪原哨所":
+			return Color(0.86, 0.90, 0.95, 0.26)
+		"沙漠风暴":
+			return Color(0.80, 0.69, 0.48, 0.28)
+		"熔岩弹坑":
+			return Color(0.36, 0.32, 0.29, 0.26)
+		"丛林小径":
+			return Color(0.36, 0.36, 0.25, 0.24)
+		"工业港区":
+			return Color(0.56, 0.57, 0.57, 0.22)
+		"夜战市区":
+			return Color(0.44, 0.45, 0.50, 0.20)
+		_:
+			return Color(0.62, 0.56, 0.44, 0.26)
 
 
 ## 植被：墙根与空地上的草簇 + 稀疏灌
@@ -3928,6 +4273,7 @@ func _build_vegetation() -> void:
 				tr.origin = center + dir * rng.randf_range(1.05, 1.86) \
 						+ side * rng.randf_range(-1.45, 1.45)
 				reed_xf.append(tr)
+				_conceal_cells[to_cell(tr.origin)] = true
 
 	if reed_xf.size() > 0:
 		var reeds := MultiMesh.new()
@@ -3968,6 +4314,7 @@ func _build_vegetation() -> void:
 			tr.origin = cell_center(x, y) + Vector3(
 				rng.randf_range(-1.4, 1.4), 0.0, rng.randf_range(-1.4, 1.4))
 			shrub_xf.append(tr)
+			_conceal_cells[to_cell(tr.origin)] = true
 
 	if shrub_xf.size() > 0:
 		var shrub := MultiMesh.new()
@@ -4742,6 +5089,15 @@ func _apply_terrain_env() -> void:
 		_ground_mi.material_override = _soil_material(terrain)
 	_berm_tint()
 	_cliff_tint()
+	# 远山跟着地形走。原来两层山脊是固定的灰绿 / 蓝灰：
+	# 雪原上远处是两块灰山、沙漠里还是灰山，天空换了颜色而地平线没换。
+	# 近山取雾色的暗化版（它本来就该是"雾里的剪影"），
+	# 远山再往天空色里掺一点，于是两张山地之间自然拉开空气透视。
+	if _ridge_mat_near != null and _ridge_mat_far != null:
+		var fog: Color = t["fog"]
+		var sky: Color = t["sky_hor"]
+		_ridge_mat_near.albedo_color = fog.darkened(0.55).lerp(t["soil_high"], 0.16)
+		_ridge_mat_far.albedo_color = fog.lerp(sky, 0.40).darkened(0.22)
 
 
 ## 云量按地形给：沙暴与雪原最厚，夜战最薄（要留出星空）
@@ -4848,6 +5204,11 @@ func _apply_quality(level: int) -> void:
 		_sun.directional_shadow_max_distance = 190.0 if mid else 120.0
 	if _dust != null:
 		_dust.emitting = mid
+	# 雪 / 沙暴 / 灰烬 / 雾 / 飞虫是同一档的环境层，跟着画质一起开关。
+	# _dust 只是其中"主层"，其余的也必须停，否则低画质下仍然满屏粒子。
+	for p in _ambient_fx:
+		if is_instance_valid(p) and p != _dust:
+			(p as GPUParticles3D).emitting = mid
 	if _decal_root != null:
 		_decal_root.visible = mid
 		if not mid:
