@@ -1504,13 +1504,14 @@ func _make_trail(amount: int, life: float, pos: Vector3, dir: Vector3, spread: f
 
 ## 击毁后的残骸：车体保留、炮塔歪斜、炮管下垂、发动机舱冒黑烟。
 ##
-## 原来的 `queue_free()` 让"击毁"只等于一次爆炸特效，1 秒后战场恢复原样；
-## 残骸既是视觉焦点，也是战术掩体。碰撞体放在 LAYER_BLOCKER：
-## 坦克的 mask 包含这一层，炮弹的射线 mask 不包含——于是它"挡车不挡弹"。
+## 原来的 `queue_free()` 让"击毁"只等于一次爆炸特效，1 秒后战场恢复原样。
+## 现在残骸留在场上，但**只在燃烧期挡车**：挡车靠 LAYER_BLOCKER 上的碰撞体，
+## 炮弹的射线 mask 不含这一层，所以它挡车不挡弹。燃烧结束后由 Wreck 自己
+## 塌陷成低矮残壳并关掉碰撞——一具残骸不该永久锁死一条走廊。
 func _spawn_wreck() -> void:
 	if arena == null:
 		return
-	var w := Node3D.new()
+	var w := Wreck.new()
 	w.name = "Wreck"
 	# 必须先挂进场景树，global_position / rotation 才有意义：
 	# 在树外的节点上写 global_position 会刷 "!is_inside_tree()" 并返回单位变换，
@@ -1519,9 +1520,12 @@ func _spawn_wreck() -> void:
 	w.global_position = global_position + Vector3(0, -0.05, 0)
 	w.rotation.y = rotation.y
 	w.rotation.z = randf_range(-0.075, 0.075)
-	# 残骸会挡车，所以要让 A* 知道这一格不能走（见 Arena.note_wreck）。
-	# 必须在位置写完之后调用：封的是"残骸实际落在的那一格"。
-	arena.note_wreck(w.global_position)
+
+	# 碰撞盒与封格必须用同一份尺寸：Arena 按这个**旋转后的脚印**铺格，
+	# Wreck 再按判定结果决定完整阻挡多久（见 Arena.note_wreck）。
+	# 两边不一致的话，物理挡得住的地方寻路会以为能过。
+	var half := Vector2(body_radius * 1.7, body_length * 0.78) * 0.5
+	var info := arena.note_wreck(w.global_position, w.rotation.y, half)
 
 	# 焦黑色作为**颜色**传入，而不是一个纯黑材质覆盖：
 	# `_burn_meshes` 会按面派生材质，原贴图与迷彩轮廓都保留（见该函数注释）。
@@ -1531,11 +1535,12 @@ func _spawn_wreck() -> void:
 	burn.roughness = 0.97
 	burn.metallic = 0.12
 
+	var vis := w.visual()
 	if _model != null:
 		var copy := _model.duplicate() as Node3D
 		copy.position = Vector3.ZERO
 		copy.rotation = Vector3.ZERO
-		w.add_child(copy)
+		vis.add_child(copy)
 		_burn_meshes(copy, burn_col)
 		var t := Assets.find_node(copy, "Turret")
 		if t != null:
@@ -1551,7 +1556,7 @@ func _spawn_wreck() -> void:
 		hull.mesh = hb
 		hull.position = Vector3(0, 0.7, 0)
 		hull.material_override = burn
-		w.add_child(hull)
+		vis.add_child(hull)
 		var turret_mi := MeshInstance3D.new()
 		var tb := BoxMesh.new()
 		tb.size = Vector3(_hull_size.x * 0.6, 0.6, _hull_size.y * 0.5)
@@ -1559,9 +1564,10 @@ func _spawn_wreck() -> void:
 		turret_mi.position = Vector3(0.25, 1.4, 0.2)
 		turret_mi.rotation_degrees = Vector3(0, 18, 12)
 		turret_mi.material_override = burn
-		w.add_child(turret_mi)
+		vis.add_child(turret_mi)
 
-	# 残骸冒烟：比"残血黑烟"更浓、更久，30 秒后自动停，车体留着当掩体
+	# 残骸冒烟：比"残血黑烟"更浓、更久。烟会在塌陷时（或 30 秒上限）停掉，
+	# 车体作为焦黑残壳留在场上。
 	var smoke := _make_wreck_smoke(w)
 	smoke.position = Vector3(0, 1.35, 0)
 	smoke.emitting = true
@@ -1604,6 +1610,10 @@ func _spawn_wreck() -> void:
 	shape.position = Vector3(0, 0.68, 0)
 	body.add_child(shape)
 	w.add_child(body)
+
+	# 残骸的寿命交给它自己管：燃烧期满（或卡死自救提前触发）时塌陷、
+	# 关掉碰撞体、撤销封格。这里一次性把需要的东西交过去。
+	w.setup(arena, body, smoke, fire, sparks, ember, info)
 
 
 ## 把残骸"烧黑"，但**保留原贴图**。

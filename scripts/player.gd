@@ -132,6 +132,16 @@ const SLIDE_MIN_SPEED := 2.0
 ## 方向键的死区：低于此值视为没推方向，车体不再自动找朝向
 const DRIVE_DEADZONE := 0.08
 
+## 残骸卡死自救。踩着油门连续这么久、位移仍不足阈值，就把最近的残骸提前塌掉。
+## 2.5 s 足够排除"贴着墙蹭一下"，又不至于让玩家盯着残骸干等一整个燃烧期。
+const STUCK_RESCUE_TIME := 2.5
+## 判"没在动"的位移阈值（米）。正常行驶 2.5 s 至少走十几米；
+## 被残骸顶住时只有碰撞解算带来的厘米级抖动。
+const STUCK_MIN_MOVE := 0.6
+## 自救只处理残骸：这个半径内没有还没塌的残骸就不动手。顶在砖墙上、
+## 被友军挤住这类情况不该触发清场。
+const STUCK_WRECK_RADIUS := 14.0
+
 var rig: CameraRig
 
 ## 选定的车型 id（TankRoster.ORDER 里的一项）。必须在 add_child() 之前写入：
@@ -173,6 +183,9 @@ var _hold_t := 0.0
 ## 本帧的舵是不是玩家用 A/D 亲自给的（见 _carry_aim_with_steer）。
 ## W 的自动对齐由准星驱动车头，不能反向补准星；只有 A/D 的转角要带着准星一起转。
 var _steer_aim := false
+## 卡死自救的计时与锚点（见 _check_stuck）
+var _stuck_t := 0.0
+var _stuck_anchor := Vector3.ZERO
 var _engine: AudioStreamPlayer3D
 
 
@@ -333,6 +346,8 @@ func tick(delta: float) -> void:
 	var cmd := _relative_drive(fwd, right) if Settings.drive_relative else Vector2(fwd, right)
 	drive(cmd.x, cmd.y, delta)
 	_carry_aim_with_steer(yaw_before)
+	# 残骸卡死自救：必须放在 drive() 之后，读到的才是这一帧解算完的位置
+	_check_stuck(delta, fwd)
 
 	# ---- 转塔：右摇杆是鼠标之外的第二套瞄准 ----
 	_look_with_stick(delta)
@@ -428,6 +443,36 @@ func tick(delta: float) -> void:
 
 
 # ---------------- 驾驶 ----------------
+
+## 残骸卡死自救。
+##
+## 残骸在燃烧期是真实的物理阻挡，而玩家推不动它、炮弹又不检测这一层
+## （见 Tank._spawn_wreck）。如果它正好死在只有一条路的走廊里，玩家在燃烧期
+## 内就是过不去——这一段给玩家一个不依赖地图几何的出口。
+##
+## 只在"踩着油门却几乎不动"时触发，并且只塌最近的残骸：顶在砖墙上、被友军
+## 挤住这类情况不该触发清场。不直接把玩家传送走——传送会连镜头一起跳，
+## 而且很容易把车塞进另一个几何死角。
+func _check_stuck(delta: float, throttle: float) -> void:
+	if game.state != "play" or absf(throttle) < 0.5:
+		_stuck_t = 0.0
+		_stuck_anchor = global_position
+		return
+	_stuck_t += delta
+	if _stuck_t < STUCK_RESCUE_TIME:
+		return
+	# 这一段时间里真的挪开了，就重新计时
+	if global_position.distance_to(_stuck_anchor) > STUCK_MIN_MOVE:
+		_stuck_t = 0.0
+		_stuck_anchor = global_position
+		return
+	if arena != null:
+		arena.collapse_wreck_near(global_position, STUCK_WRECK_RADIUS)
+	# 无论有没有找到残骸都重新计时：没有残骸时也要隔一段时间再试，
+	# 而不是每帧都扫一遍残骸列表
+	_stuck_t = 0.0
+	_stuck_anchor = global_position
+
 
 ## 镜头相对驾驶：把"屏幕上想去的方向"换算成车体的油门与舵角。
 ##

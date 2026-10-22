@@ -37,6 +37,9 @@ const MAX_TRACK := 160
 
 # 基地所在的两格与其外围可加固的砖墙格
 const BASE_CELLS := [Vector2i(11, 21), Vector2i(12, 21)]
+## 基地正上方的两格进出口（`_carve_zones` 凿开的唯一入口）。残骸落在这里
+## 代价最高：整张图只有这一条进基地的路。
+const GATE_CELLS := [Vector2i(11, 20), Vector2i(12, 20)]
 
 ## 边界土坡的断面：(距最外圈墙内侧面的水平距离, 高度)
 ## 内坡陡、坡肩圆、外坡缓；坡脚压到地面以下，坡体才不会与地面留一条硬边。
@@ -276,11 +279,17 @@ var _dust: GPUParticles3D
 ## 环境粒子（雪 / 沙 / 灰烬 / 雾气 / 飞虫）。换关时统一清掉，
 ## 否则每开一关都会多叠一层粒子系统，十几关之后帧率会被吃光。
 var _ambient_fx: Array[Node] = []
-## 残骸占用的格子。写进 A* 网格后敌人会绕开残骸，
+## 残骸占用的格子（Vector2i -> 引用计数）。写进 A* 网格后敌人会绕开残骸，
 ## 而不是一头撞上去、顶到 `_check_stuck` 才倒车。
-## 上限与连通性都在 note_wreck() 里兜底：宁可少封几格，也不能把路封死。
-var _wreck_cells: Dictionary = {}
-const MAX_WRECK_CELLS := 28
+##
+## 用计数而不是布尔值：两具残骸的脚印可能压住同一格，先塌的那具一撤销，
+## 后一具还压着的格子就会被错判成可以通行。
+##
+## 这里不设上限：残骸会在燃烧期结束后塌陷并撤销封格（见 Wreck.collapse），
+## 封格面积天然有界；设上限只会让超出部分的残骸对寻路隐身。
+var _wreck_cells: Dictionary = {}  # Vector2i -> int
+## 关键通道格：河谷渡口。残骸落在这里时燃烧期缩短（见 note_wreck）。
+var _ford_cells: Dictionary = {}
 ## 灌木与芦苇所在的格子：站在这里会被植被遮住，敌人中远距离看不见。
 ## 只收这两种“高到能藏车”的植被；贴地草皮不算——否则半张图都是草丛，
 ## 隐蔽就变成了默认状态。开火后由玩家侧的 expose_t 临时解除。
@@ -403,9 +412,9 @@ func blocks_tank(x: int, y: int) -> bool:
 	return c == BRICK or c == STEEL or c == WATER or c == BARRICADE or c == SAND or c == BASE
 
 
-## 这一格是否躺着残骸。
+## 这一格是否躺着残骸。计数为 0 说明最后压住它的那具已经塌了。
 func is_wreck_cell(x: int, y: int) -> bool:
-	return _wreck_cells.has(Vector2i(x, y))
+	return int(_wreck_cells.get(Vector2i(x, y), 0)) > 0
 
 
 ## 寻路 / 选点用的"不可通行"：静态地形 + 残骸。
@@ -434,6 +443,7 @@ func generate(stage: int, terrain_id := 0) -> void:
 	_blocks.clear()
 	brick_hp.clear()
 	_wreck_cells.clear()
+	_ford_cells.clear()
 	_conceal_cells.clear()
 	_crush_meta.clear()
 	_crush_cells.clear()
@@ -493,7 +503,8 @@ func _clear_decals() -> void:
 		pool.clear()
 
 
-## 残骸挂到独立的根节点下：换关时统一清掉，局内则一直留着当掩体。
+## 残骸挂到独立的根节点下：换关时统一清掉。
+## 局内它只在自己的燃烧期里挡车，之后塌陷成残壳留在场上（见 Wreck）。
 func add_wreck(w: Node3D) -> void:
 	if _wrecks_root == null:
 		_wrecks_root = Node3D.new()
@@ -502,31 +513,131 @@ func add_wreck(w: Node3D) -> void:
 	_wrecks_root.add_child(w)
 
 
-## 把残骸所在的格子写进 A* 网格。
+## 把残骸**实际压住的格子**写进寻路网格，并回报它是不是关键通道。
 ##
 ## 残骸是真实的物理阻挡（LAYER_BLOCKER），但寻路只知道网格——
 ## 于是敌人会朝残骸直线推进，撞上以后靠 `_check_stuck` 倒车脱困，
 ## 看起来像"AI 卡了一下"。封格之后它从一开始就绕开。
 ##
-## 两个保守条件：
-##   * 已封格数达到 MAX_WRECK_CELLS 就不再封。残骸永久留在场上，
-##     不封顶的话一局后期会把整张图的可通行面积吃掉。
-##   * 封格后必须仍然"所有出生点可达基地"，否则立刻撤销。
-##     残骸可能正好倒在一格宽的走廊里，那条路封了就没有替代路线。
-func note_wreck(pos: Vector3) -> void:
-	if _wreck_cells.size() >= MAX_WRECK_CELLS:
-		return
-	var c := to_cell(pos)
-	if c.x < 1 or c.y < 1 or c.x >= GRID_W - 1 or c.y >= GRID_H - 1:
-		return
-	if blocks_tank(c.x, c.y):
-		return                      # 本来就不可通行，不需要额外标记
-	_wreck_cells[c] = true
-	if not _spawns_connected():
+## 三个必须与物理体对齐的点：
+##   * 按**旋转后的真实脚印**铺格，而不是只标中心那一格。残骸碰撞盒 2.5~3.9 m
+##     宽，斜放时外接盒能跨到四格；只标一格的话，旁边那条替代车道在网格里
+##     仍然是通的，于是"判据说能绕开、车却过不去"。
+##   * 同一格可能被两具残骸同时压住，所以用引用计数（见 `_wreck_cells`）。
+##   * 返回值必须能影响物理体：`critical` 为真时由 Wreck 把完整阻挡时长压到
+##     最短，`cells` 为空表示"封了会切断地图、因此没有封格"。物理碰撞体是调用方
+##     建的——判定结果如果传不回去，所有兜底都只是改了寻路的认知而已。
+##
+## `half_extents` 是残骸碰撞盒的半宽、半长（XZ 平面），`yaw` 是车体朝向。
+func note_wreck(pos: Vector3, yaw: float, half_extents: Vector2) -> Dictionary:
+	var added: Array[Vector2i] = []
+	var critical := false
+	for c in _wreck_cells_for(pos, yaw, half_extents):
+		if _is_protected_cell(c):
+			critical = true
+		if blocks_tank(c.x, c.y):
+			continue                      # 本来就不可通行，不需要额外标记
+		_wreck_cells[c] = int(_wreck_cells.get(c, 0)) + 1
+		added.append(c)
+
+	# 封格后必须仍然"所有出生点可达基地"，否则立刻撤销。
+	# 残骸可能正好倒在一格宽的走廊里，那条路封了就没有替代路线。
+	if added.size() > 0 and not _spawns_connected():
+		for c in added:
+			_unmark_wreck_cell(c)
+		var rejected: Array[Vector2i] = []
+		return {"cells": rejected, "critical": true}
+
+	for c in added:
+		_refresh_solid_around(c)
+	return {"cells": added, "critical": critical}
+
+
+## 残骸碰撞盒（绕 Y 旋转的矩形）真正压住的格。
+##
+## 用分离轴判定，而不是"取中心格"或"取外接矩形"：前者漏掉相邻车道，
+## 后者把四角根本没碰到的格子也算进来，两种都会让寻路认知与物理体对不上。
+func _wreck_cells_for(pos: Vector3, yaw: float, half_extents: Vector2) -> Array[Vector2i]:
+	var hw := half_extents.x
+	var hl := half_extents.y
+	# rotation.y 的基在 XZ 平面：局部 X -> (cos, -sin)，局部 Z -> (sin, cos)
+	var ax := Vector2(cos(yaw), -sin(yaw))
+	var az := Vector2(sin(yaw), cos(yaw))
+	var ex := absf(ax.x) * hw + absf(az.x) * hl
+	var ez := absf(ax.y) * hw + absf(az.y) * hl
+	var x0 := int(floor((pos.x - ex - ORIGIN_X) / CELL))
+	var x1 := int(floor((pos.x + ex - ORIGIN_X) / CELL))
+	var z0 := int(floor((pos.z - ez - ORIGIN_Z) / CELL))
+	var z1 := int(floor((pos.z + ez - ORIGIN_Z) / CELL))
+	var out: Array[Vector2i] = []
+	for y in range(z0, z1 + 1):
+		for x in range(x0, x1 + 1):
+			if x < 0 or y < 0 or x >= GRID_W or y >= GRID_H:
+				continue
+			if _obb_overlaps_cell(pos, ax, az, hw, hl, Vector2i(x, y)):
+				out.append(Vector2i(x, y))
+	return out
+
+
+## 旋转矩形与一格 4×4 m 的方块是否相交。
+## 分离轴取两条世界轴 + 两条矩形轴；四条轴上投影都重叠才算相交。
+func _obb_overlaps_cell(pos: Vector3, ax: Vector2, az: Vector2,
+		hw: float, hl: float, c: Vector2i) -> bool:
+	var cc := cell_center(c.x, c.y)
+	var d := Vector2(cc.x - pos.x, cc.z - pos.z)
+	var half := CELL * 0.5
+	for axis: Vector2 in [Vector2(1, 0), Vector2(0, 1), ax, az]:
+		var proj := absf(d.dot(axis))
+		var r_obb := absf(ax.dot(axis)) * hw + absf(az.dot(axis)) * hl
+		var r_cell := absf(axis.x) * half + absf(axis.y) * half
+		if proj > r_obb + r_cell:
+			return false
+	return true
+
+
+## 这一格是不是"残骸不该久留"的关键通道：基地门口与渡口。
+func _is_protected_cell(c: Vector2i) -> bool:
+	return c in GATE_CELLS or _ford_cells.has(c)
+
+
+func _unmark_wreck_cell(c: Vector2i) -> void:
+	var n := int(_wreck_cells.get(c, 0)) - 1
+	if n > 0:
+		_wreck_cells[c] = n
+	else:
 		_wreck_cells.erase(c)
-		return
-	# 残骸一格宽，但宽体网格会把"邻格变成单格通道"也算进去，所以周围一起刷
-	_refresh_solid_around(c)
+
+
+## 残骸塌陷时撤销它封过的格。与 note_wreck() 的计数一一对应。
+func release_wreck(cells: Array) -> void:
+	for c in cells:
+		if not _wreck_cells.has(c):
+			continue
+		_unmark_wreck_cell(c)
+		_refresh_solid_around(c)
+
+
+## 把距离内最近的一具**还没塌**的残骸提前塌掉。
+## 给玩家的卡死自救（Player._check_stuck）与重生点保护（Main._spawn_player）用。
+func collapse_wreck_near(pos: Vector3, radius: float) -> bool:
+	if _wrecks_root == null:
+		return false
+	var best: Wreck = null
+	var best_d := radius * radius
+	for n in _wrecks_root.get_children():
+		if not (n is Wreck):
+			continue
+		var wr := n as Wreck
+		if wr.collapsed:
+			continue
+		var d := wr.global_position.distance_squared_to(pos)
+		if d <= best_d:
+			best_d = d
+			best = wr
+	if best == null:
+		return false
+	best.collapse()
+	return true
 
 
 ## 这一格有没有能藏住坦克的植被（灌木 / 芦苇）。
@@ -718,6 +829,11 @@ func _layout_valley(rng: RandomNumberGenerator, stage: int) -> void:
 			for dy in 2:
 				_put_mirror(bx, y + dy, EMPTY)
 				_put_mirror(bx + 1, y + dy, EMPTY)
+				# 渡口是这张图上仅有的跨水通道，残骸落在这里等于把半张图切断。
+				# 记下来给 note_wreck() 当"关键通道"用。
+				for fx in [bx, bx + 1]:
+					_ford_cells[Vector2i(fx, y + dy)] = true
+					_ford_cells[Vector2i(GRID_W - 1 - fx, y + dy)] = true
 		# 渡口两侧的桥头堡
 		_put_mirror(rng.randi_range(2, GRID_W / 2 - 1), y - 1, BRICK)
 	_scatter_clusters(rng, 5, 0.2)

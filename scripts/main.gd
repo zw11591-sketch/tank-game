@@ -741,6 +741,9 @@ func _spawn_enemy(t: int) -> bool:
 
 func _spawn_player() -> void:
 	var pos := arena.player_spawn()
+	# 重生点如果压着一具还没塌的残骸，先让它塌掉。新车会直接生成在静态碰撞体里，
+	# 而 Tank._settle() 只按网格解交、看不见 LAYER_BLOCKER 上的残骸。
+	arena.collapse_wreck_near(pos, Arena.CELL * 1.2)
 	player = Player.new()
 	# 车型必须在 add_child() 之前写入：Player._ready() 按它装配碰撞体尺寸与全部属性
 	player.tank_id = Settings.selected_tank if TankRoster.has(Settings.selected_tank) \
