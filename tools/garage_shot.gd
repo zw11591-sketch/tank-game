@@ -21,12 +21,21 @@ var _main: Node
 var _idx := 0
 var _f := 0
 var _busy := false
+## 探针会临时改画面设置，而 Main 的开局流程会 save_cfg()。
+## 不还回去，每跑一次截图就会把本地界面缩放/窗口尺寸改成探针的那套。
+var _prev := {}
 
 
 func _ready() -> void:
+	_keep_settings()
 	Settings.display_mode = Settings.Disp.WINDOWED
 	Settings.windowed_size = Vector2i(1600, 900)
+	# 界面缩放必须钉在 100%：它存在 user:// 里，本地调试时可能被调到 200%，
+	# 那会让设计空间缩到 960x540 再放大 2 倍输出——截图还是 1920x1080，
+	# 但字与边框全是放大的，跟默认设置下的实际观感差一倍。
+	Settings.hud_scale = 1.0
 	Settings.apply_display()
+	Settings.apply_render()
 	DirAccess.make_dir_recursive_absolute(DIR)
 	_main = load("res://scenes/Main.tscn").instantiate()
 	add_child(_main)
@@ -56,7 +65,30 @@ func _physics_process(_d: float) -> void:
 	if _idx + 1 < TankRoster.ORDER.size():
 		_pick(_idx + 1)
 	else:
+		_restore_settings()
 		get_tree().quit(0)
+
+
+## 探针会把画面设置临时改成"固定构图"的一组值
+func _keep_settings() -> void:
+	_prev = {
+		"hud_scale": Settings.hud_scale,
+		"display_mode": Settings.display_mode,
+		"windowed_size": Settings.windowed_size,
+		"brightness": Settings.brightness,
+		"quality": Settings.quality,
+	}
+
+
+func _restore_settings() -> void:
+	Settings.hud_scale = _prev["hud_scale"]
+	Settings.display_mode = _prev["display_mode"]
+	Settings.windowed_size = _prev["windowed_size"]
+	Settings.brightness = _prev["brightness"]
+	Settings.quality = _prev["quality"]
+	Settings.apply_display()
+	Settings.apply_render()
+	Settings.save_cfg()
 
 
 ## 逐车型打印名册数值：截图只能看出"有没有"，数值要靠这里核对。

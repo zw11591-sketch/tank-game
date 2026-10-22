@@ -14,6 +14,9 @@ const SETTLE := 90
 var _idx := 0
 var _f := 0
 var _busy := false
+## 探针会临时改画面设置，而 Main 的开局流程会 save_cfg()。
+## 不还回去，每跑一次验收就会把本地界面缩放/窗口尺寸改成探针的那套。
+var _prev := {}
 
 
 func _main() -> Node:
@@ -22,10 +25,20 @@ func _main() -> Node:
 
 func _ready() -> void:
 	await get_tree().process_frame
+	_prev = {
+		"hud_scale": Settings.hud_scale,
+		"display_mode": Settings.display_mode,
+		"windowed_size": Settings.windowed_size,
+		"brightness": Settings.brightness,
+		"quality": Settings.quality,
+	}
 	Settings.display_mode = Settings.Disp.WINDOWED
 	Settings.windowed_size = Vector2i(1280, 720)
 	Settings.brightness = 1.0
 	Settings.quality = Settings.Quality.HIGH
+	# 界面缩放钉在 100%：它存在 user:// 里，本地可能被调到 200%，
+	# 那样输出图是 960x540 的设计空间放大 2 倍，HUD 会比默认设置大一倍。
+	Settings.hud_scale = 1.0
 	Settings.apply_display()
 	Settings.apply_render()
 	DirAccess.make_dir_recursive_absolute(DIR)
@@ -55,11 +68,28 @@ func _physics_process(_d: float) -> void:
 			main.player.shield_t = 0.0
 	if _f == 120:
 		_measure(main)
+		# 关卡横幅是过场提示，截图前抹掉：它是 HUD 叠加层，既不在取景判据里，
+		# 又正好压在画面中央，留在图里只会让"车体占比"这张参考图读不出重点。
+		main.banner_text = ""
+		main._banner_t = 0.0
 		await _shot("FRAME_%d_%s" % [_idx, str(Arena.TERRAINS[TERRAINS[_idx]]["layout"])])
 		if _idx + 1 < TERRAINS.size():
 			_start(_idx + 1)
 		else:
+			_restore_settings()
 			get_tree().quit(0)
+
+
+## 把 `_ready()` 里临时改掉的画面设置写回去。
+func _restore_settings() -> void:
+	Settings.hud_scale = _prev["hud_scale"]
+	Settings.display_mode = _prev["display_mode"]
+	Settings.windowed_size = _prev["windowed_size"]
+	Settings.brightness = _prev["brightness"]
+	Settings.quality = _prev["quality"]
+	Settings.apply_display()
+	Settings.apply_render()
+	Settings.save_cfg()
 
 
 func _measure(main) -> void:

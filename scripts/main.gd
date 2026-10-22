@@ -129,6 +129,20 @@ var _opt_row := 0
 const DIFF_NAMES := ["简单", "普通", "困难"]
 const SELECT_ROWS := 4
 
+## 车库标题的字号与顶边距。1080p 设计空间（界面缩放 100%）沿用 62px / y=90，
+## 与改造前完全一致；界面缩放 200% 时可见区只剩 960x540，62px 的标题要占掉
+## y 90~174，而左栏 15 行文字垂直居中后从 y 45 起排、最宽到 x 350，
+## 两者在 x 263~350 直接叠在一起（标题压住"关卡 / 地形"两行）。
+## 所以矮屏改用 40px 并压到顶部，把标题带下面整块让给左栏与右栏。
+const GARAGE_TITLE_FS := 40
+const GARAGE_TITLE_TOP := 24.0
+const GARAGE_TITLE_FS_TALL := 62
+const GARAGE_TITLE_TOP_TALL := 90.0
+## 分档阈值：左栏 15 行按设计字号要 540 px，加上 62px 标题带（84）与呼吸量
+## 至少要 700 px。低于 800 就说明这一档缩放已经排不开，改走紧凑排版。
+const GARAGE_TALL_H := 800.0
+const GARAGE_TITLE_GAP := 16.0
+
 
 func _ready() -> void:
 	randomize()
@@ -1343,6 +1357,8 @@ func _show_menu(title: String, body: String) -> void:
 	if garage:
 		_layout_garage()
 	else:
+		_title_l.add_theme_font_size_override("font_size", GARAGE_TITLE_FS_TALL)
+		_title_l.offset_top = GARAGE_TITLE_TOP_TALL
 		if body != "":
 			_menu_l.text = body
 		_fit_menu_text()
@@ -1395,45 +1411,84 @@ func _hide_menu() -> void:
 ## 车库的两栏布局。位置按当前可见区域的尺寸算，而不是写死 1920x1080——
 ## 项目用 stretch/aspect=expand，超宽屏下可见区域比设计空间更宽，
 ## 写死的坐标会把右栏推到屏幕外。
+##
+## 标题带在这一档高度下先定下来：高屏沿用老构图（62px / y=90），矮屏换成紧凑档
+## （40px / y=24）。标题字号与左栏起点必须出自同一档——只改其一，标题就会压住
+## 左栏的"关卡 / 地形"两行（视觉缩放 200% 时可见区 960x540，正是这一档）。
 func _layout_garage() -> void:
 	var vp := get_viewport().get_visible_rect().size
 	var left_w := minf(560.0, vp.x * 0.34)
 	var right_x := maxf(left_w + 40.0, vp.x * 0.45)
 	var right_w := minf(700.0, vp.x - right_x - 60.0)
 
-	_select_l.position = Vector2(60.0, 0.0)
-	_select_l.offset_top = 0.0
-	_select_l.offset_bottom = vp.y
-	_select_l.size = Vector2(left_w, vp.y)
-	_select_l.add_theme_constant_override("line_spacing", 8)
+	var compact := vp.y < GARAGE_TALL_H
+	var title_fs: int = GARAGE_TITLE_FS if compact else GARAGE_TITLE_FS_TALL
+	var title_top: float = GARAGE_TITLE_TOP if compact else GARAGE_TITLE_TOP_TALL
+	_title_l.add_theme_font_size_override("font_size", title_fs)
+	_title_l.offset_top = title_top
 
-	_preview_tex.position = Vector2(right_x, vp.y * 0.18)
-	_preview_tex.size = Vector2(right_w, right_w * 0.52)
+	# 标题带的下沿：标题的字高由当前字号算出，而不是写死一个 y。
+	# 界面缩放到 200% 时可见区只有 540 高，标题带多吃 20 px，左栏就少排一行。
+	var title_h := ThemeDB.fallback_font.get_height(title_fs)
+	var content_top := title_top + title_h + GARAGE_TITLE_GAP
+	var content_h := maxf(vp.y - content_top - 24.0, 120.0)
+
+	_select_l.position = Vector2(60.0, content_top)
+	_select_l.offset_top = content_top
+	_select_l.offset_bottom = content_top + content_h
+	_select_l.size = Vector2(left_w, content_h)
+
+	# 转台仍然按屏幕高度的 18% 起排，只是不允许顶到标题带里面：
+	# 1080p 设计空间下 18% 是 194，本来就低于标题带，构图与改动前一致；
+	# 可见区只剩 540 高时 18% 是 97，也必须让到标题带下沿。
+	var preview_y := maxf(content_top, vp.y * 0.18)
+	# 转台最多占右栏可用高度的 45%：属性卡要按 NEED_H 排版，转台把高度全吃掉，
+	# 卡片就只能缩到读不出来的字号。1080p 下 0.52 × 700 = 364，本来就低于这条线，
+	# 构图不变；矮屏上则是转台让位给数值。
+	var avail_h := maxf(vp.y - preview_y - 40.0, 120.0)
+	var preview_h := minf(right_w * 0.52, avail_h * 0.45)
+	_preview_tex.position = Vector2(right_x, preview_y)
+	_preview_tex.size = Vector2(right_w, preview_h)
 
 	_card.position = Vector2(right_x, _preview_tex.position.y + _preview_tex.size.y + 6.0)
 	_card.size = Vector2(right_w, vp.y - _card.position.y - 40.0)
 
-	_fit_garage_text(left_w)
+	_fit_garage_text(left_w, content_h)
 
 
-## 左栏字号按栏宽反算，从设计值 20 一路收到 12。
+## 左栏字号按栏宽与栏高反算。
 ##
 ## 栏宽不是常数：界面缩放（`content_scale_factor`）把设计空间放大后，可见区域
 ## 反而变窄（缩放 200% 时左栏只有约 326 px）。写死一个字号必然在某档缩放下折行，
-## 而 AUTOWRAP 折在词中间就读不通了。所以这里量到"最宽的一行刚好排得下"为止。
-func _fit_garage_text(width: float) -> void:
+## 而 AUTOWRAP 折在词中间就读不通了。所以这里量到"最宽的一行刚好排得下"为止，
+## 从设计值 20 一路收到 11。
+##
+## 栏高同样不是常数：标题带占掉顶部之后，15 行文字只剩约 420 px。
+## 所以先收行距（8 → 0，这是可压缩的余量），收不动再缩字号（这是可读性）。
+func _fit_garage_text(width: float, height: float) -> void:
 	const DESIGN_FS := 20
-	const MIN_FS := 12
+	const MIN_FS := 11
+	const SPACINGS := [8, 6, 4, 2, 0]
 	var f := ThemeDB.fallback_font
 	var widest := 0.0
 	for rel in [true, false]:
 		for line in InputSetup.controls_text(rel).split("\n"):
 			widest = maxf(widest, f.get_string_size(line,
 					HORIZONTAL_ALIGNMENT_LEFT, -1, DESIGN_FS).x)
+	var lines := _select_l.text.split("\n").size()
 	var fs := DESIGN_FS
-	while fs > MIN_FS and widest * (float(fs) / DESIGN_FS) > width - 8.0:
+	while fs >= MIN_FS:
+		if widest * (float(fs) / DESIGN_FS) <= width - 8.0:
+			for sp in SPACINGS:
+				if lines * (f.get_height(fs) + sp) <= height:
+					_select_l.add_theme_font_size_override("font_size", fs)
+					_select_l.add_theme_constant_override("line_spacing", sp)
+					return
 		fs -= 1
-	_select_l.add_theme_font_size_override("font_size", fs)
+	# 兜底：最小字号 + 零行距。宁可挤，也不能让最后几行被裁掉——
+	# 被裁掉的是"返回"提示与设置项，玩家会以为按键失灵。
+	_select_l.add_theme_font_size_override("font_size", MIN_FS)
+	_select_l.add_theme_constant_override("line_spacing", 0)
 
 
 # ---------------- 存档 ----------------
