@@ -1,9 +1,9 @@
 class_name Arena
 extends Node3D
-## 3D 战场：网格化地形、可破坏掩体、基地、A* 寻路网格与视线查
+## 3D 战场：网格化地形、可破坏掩体、基地、A* 寻路网格与视线查询。
 ## 
-## 网格坐标 (x, y) y +Z 增长，因下方"(y  是玩家基地一侧，
-## 玩家默认-Z（画面深处）前进。所有几何体均在运行时用图元网格生成
+## 网格坐标 (x, y) 中 y 沿 +Z 增长，因此"下方"(y 大) 是玩家基地一侧，
+## 玩家默认朝 -Z（画面深处）前进。所有几何体均在运行时用图元网格生成。
 const CELL := 4.0
 const GRID_W := 24
 const GRID_H := 24
@@ -14,11 +14,12 @@ const EMPTY := 0
 const BRICK := 1
 const STEEL := 2
 const WATER := 3
-## 路障格：沙袋 / 拒马 / 残骸堆成的低矮障碍。挡车不挡弹不挡视线## 于是"能打过去但开不过，与水面是同一类规则，战术上多一种可用地
+## 路障格：沙袋 / 拒马 / 残骸堆成的低矮障碍。挡车不挡弹不挡视线，
+## 于是"能打过去但开不过去"，与水面是同一类规则，战术上多一种可用地形。
 const BARRICADE := 4
 const BASE := 5
-## 半高掩体：一排沙袋墙。挡住车体、挡不住炮弹与视线
-## 玩家能躲在后面只露出炮塔开火，这是"全高实体之外最缺的一类掩
+## 半高掩体：一排沙袋墙。挡住车体、挡不住炮弹与视线——
+## 玩家能躲在后面只露出炮塔开火，这是"全高实体块"之外最缺的一类掩体。
 const SAND := 6
 
 const BRICK_H := 3.0
@@ -34,17 +35,14 @@ const BRICK_HP := 60
 const MAX_SCORCH := 90
 const MAX_TRACK := 160
 
-# 基地所在的两格与其外围可加固的砖墙
+# 基地所在的两格与其外围可加固的砖墙格
 const BASE_CELLS := [Vector2i(11, 21), Vector2i(12, 21)]
 
-## 边界土坡的断面：(距最外圈墙内侧面的水平距
-## 高度)
-## 内坡陡、坡肩圆、外坡缓；坡脚压到地面以下，坡体才不会与地面留一条硬边
-## 放在类常量里是为了让 `_cliff_surface_y()` 能按同一份断面算坡面高度
-## 坡面顶点会被低频起伏（_cliff_swell）同时平
-## out 与缩
-## y
-## 散落石头如果直接查这份名义断面，就会浮在坡面上方
+## 边界土坡的断面：(距最外圈墙内侧面的水平距离, 高度)
+## 内坡陡、坡肩圆、外坡缓；坡脚压到地面以下，坡体才不会与地面留一条硬边。
+## 放在类常量里是为了让 `_cliff_surface_y()` 能按同一份断面算坡面高度。
+## 坡面顶点会被低频起伏（_cliff_swell）同时平移 out、缩放 y，
+## 散落石头如果直接查这份名义断面，就会浮在坡面上方。
 const CLIFF_PROFILE := [
 	Vector2(0.0, -1.4),
 	Vector2(0.9, 0.6),
@@ -57,25 +55,35 @@ const CLIFF_PROFILE := [
 	Vector2(14.6, -1.4),
 ]
 
-## 地形表。每一项同时决定两件事：掩体的摆法（layout）与整张图的光照色调## 玩法规则对所有地形一致——变的是掩体密度、通路形状与可视环境，
-## 所以同一套操控与 AI 在六张图上都成立，但战斗节奏完全不同##
-## 配光照时有一条硬约束*敌人必须看得*。可读性不是感觉，是两个能量出来的## （tools/vis_probe.gd 逐张图测5 米外放一辆中型敌车，侧身受光，量像素）：
-##   enemyLum >= 0.20   敌车自身像素的平均亮度。低于这个值，车体在普通显示器##                      已经压进黑场，朝向、炮管、受击面全都读不出来##   weber    >= 0.10   敌车与紧邻背景的亮度|Le-Lb|/Lb。亮度够但差值不够，
-##                      就是"迷彩生效"——车和地面同一个灰阶，轮廓挑不出来## 两条缺一不可，而且*结果**判据：下面这些颜色与强度只是手段，改完必须重
+## 地形表。每一项同时决定两件事：掩体的摆法（layout）与整张图的光照色调。
+## 玩法规则对所有地形一致——变的是掩体密度、通路形状与可视环境，
+## 所以同一套操控与 AI 在六张图上都成立，但战斗节奏完全不同。
+## 配光照时有一条硬约束：**敌人必须看得见**。可读性不是感觉，是两个能量出来的数
+## （tools/vis_probe.gd 逐张图测 5 米外放一辆中型敌车，侧身受光，量像素）：
+##   enemyLum >= 0.20   敌车自身像素的平均亮度。低于这个值，车体在普通显示器上
+##                      已经压进黑场，朝向、炮管、受击面全都读不出来。
+##   weber    >= 0.10   敌车与紧邻背景的亮度|Le-Lb|/Lb。亮度够但差值不够，
+##                      就是"迷彩生效"——车和地面同一个灰阶，轮廓挑不出来。
+## 两条缺一不可，而且是**结果**判据：下面这些颜色与强度只是手段，改完必须重测。
 ## 
 ## 以前这里写的是手段判据（ambient >= 0.80 / sun_energy >= 0.90 / fog <= 0.0055），
-## 十二张图全部"达标"，但夜战与熔岩两张图实测 enemyLum 只有 0.11-0.16## 原因ambient *乘在天空颜色上的系数**而不是光量：夜图天空本身就接近黑## 系数填到 0.82 乘出来仍然是 0.15。所以手段判据根本没在约束任何东西
+## 十二张图全部"达标"，但夜战与熔岩两张图实测 enemyLum 只有 0.11-0.16。
+## 原因是 ambient 是**乘在天空颜色上的系数**而不是光量：夜图天空本身就接近黑，
+## 系数填到 0.82 乘出来仍然是 0.15。所以手段判据根本没在约束任何东西——
 ## 这就场景太暗看不见敌的根。现在环境光_apply_terrain_env() 兜底
-## （见 AMBIENT_SKY_REF），判据也换成直接量敌车##
-## layout 取值见 _build_layout()##   ruins 街区废墟 / fortress 纵向回廊 / valley 水网渡口
-##   maze 细墙迷宫 / badlands 开阔荒/ snow 冰原哨所
+## （见 AMBIENT_SKY_REF），判据也换成直接量敌车。
+## layout 取值见 _build_layout()：
+##   ruins 街区废墟 / fortress 纵向回廊 / valley 水网渡口
+##   maze 细墙迷宫 / badlands 开阔荒原 / snow 冰原哨所
 ##   docks 工业港区 / crater 环形弹坑 / jungle 丛林小径 / night 夜战市区
 ##   desert 沙漠沙垄 / rail 铁路枢纽
-## 环境光兜底的参考天空亮度。天空（上半+ 地平 + 下半球加权）的亮度到这个值时## 纯天空环境光已经足够把阴影面提出黑场；低于它就按比例掺入显式环境色补
-## 于是"这张图很仍然成立（太阳、雾、地面色都没动），但阴影面不会掉进纯黑，
-## 车体朝向与受击面始终读得出来——压的是色调，不是信
+## 环境光兜底的参考天空亮度。天空（上半球 + 地平 + 下半球加权）的亮度到这个值时，
+## 纯天空环境光已经足够把阴影面提出黑场；低于它就按比例掺入显式环境色补足。
+## 于是"这张图很暗"仍然成立（太阳、雾、地面色都没动），但阴影面不会掉进纯黑，
+## 车体朝向与受击面始终读得出来——压的是色调，不是信息。
 const AMBIENT_SKY_REF := 0.26
-## 显式环境色最多占到多少。留一点天空成分，环境光才仍有地形的冷暖倾向## 不会十二张图共用一盏白
+## 显式环境色最多占到多少。留一点天空成分，环境光才仍有地形的冷暖倾向，
+## 不会十二张图共用一盏白灯。
 const AMBIENT_FILL_MAX := 0.62
 
 const TERRAINS := [
@@ -92,7 +100,7 @@ const TERRAINS := [
 	{
 		# 要塞回廊：纵向回廊把天空挡掉大半，环境光几乎只剩补光，
 		# 所以它是重点提亮的两张图之一（原读数 0.14，判据 0.20）。
-		# 定住相机后重测：45 米外敌车最暗一面 0.32（见 tools/vis_probe.gd）。
+		# 定住相机后重测：45 米外敌车的最暗一面 0.32（见 tools/vis_probe.gd）。
 		# enemy_lift 只抬车体底光，不抬整场环境光，否则画面又回到平光。
 		"name": "要塞回廊", "layout": "fortress",
 		"sky_top": Color(0.05, 0.07, 0.12), "sky_hor": Color(0.24, 0.27, 0.33),
@@ -144,7 +152,7 @@ const TERRAINS := [
 		"props": 0.20,
 	},
 	{
-		# 纵向船坞 + 码头水道。掩体极密、通路笔直，是最适合埋伏与贴脸的一张图
+		# 纵向船坞 + 码头水道。掩体极密、通路笔直，是最适合埋伏与贴脸的一张图。
 		"name": "工业港区", "layout": "docks",
 		"sky_top": Color(0.07, 0.11, 0.17), "sky_hor": Color(0.38, 0.44, 0.48),
 		"gnd_bot": Color(0.06, 0.08, 0.09), "gnd_hor": Color(0.24, 0.28, 0.30),
@@ -155,16 +163,16 @@ const TERRAINS := [
 		"props": 0.34, "exposure": 1.06, "enemy_lift": 0.85,
 	},
 	{
-		# 同心环形掩体：中央是一座火山口阵地，越往里打越难退，适合打攻防拉
-		# 色调是熔岩红，但红光的亮度本身就低（同样强度的红光比白光暗三成）
-		# 所以这里的太阳与补光都要比视觉印象更强，否则整张图糊成一片暗
-		# 敌车连轮廓都挑不出来——实测修enemyLum 只有 0.09
+		# 同心环形掩体：中央是一座火山口阵地，越往里打越难退，适合打攻防拉锯。
+		# 色调是熔岩红，但红光的亮度本身就低（同样强度的红光比白光暗三成），
+		# 所以这里的太阳与补光都要比视觉印象更强，否则整张图糊成一片暗红、
+		# 敌车连轮廓都挑不出来——实测修前 enemyLum 只有 0.09。
 		# 
 		# 全场最难看清的一张图：亮的是成片沙袋与熔岩，敌车却是深红棕，
-		# 背光那一面与亮背景差0.42 的韦伯对比度——轮廓挑得出来，车本身却压进黑里
-		# （实enemyLum 最0.12，判0.20）。这里给的是曝光 + 环境光两档：
+		# 背光那一面与亮背景差出 0.42 的韦伯对比度——轮廓挑得出来，车本身却压进黑里
+		# （实测 enemyLum 最暗 0.12，判据 0.20）。这里给的是曝光 + 环境光两档：
 		# 曝光把暗部整体抬起来（ACES 在低光端更陡，抬暗部比抬亮部划算），
-		# 环境光再单独补一档背光面的入射量
+		# 环境光再单独补一档背光面的入射量。
 		"name": "熔岩弹坑", "layout": "crater",
 		"sky_top": Color(0.16, 0.06, 0.07), "sky_hor": Color(0.74, 0.34, 0.16),
 		"gnd_bot": Color(0.12, 0.06, 0.05), "gnd_hor": Color(0.44, 0.22, 0.14),
@@ -175,7 +183,7 @@ const TERRAINS := [
 		"props": 0.24, "exposure": 2.05, "enemy_lift": 0.40,
 	},
 	{
-		# 斜向小径织成的网。视野短、拐角多，炮塔回转速度在这里比机动更值钱
+		# 斜向小径织成的网。视野短、拐角多，炮塔回转速度在这里比机动更值钱。
 		"name": "丛林小径", "layout": "jungle",
 		"sky_top": Color(0.08, 0.16, 0.14), "sky_hor": Color(0.44, 0.54, 0.34),
 		"gnd_bot": Color(0.05, 0.09, 0.06), "gnd_hor": Color(0.20, 0.30, 0.17),
@@ -186,16 +194,16 @@ const TERRAINS := [
 		"props": 0.40, "enemy_lift": 0.40,
 	},
 	{
-		# 夜间街区：全场最暗的一张图，但"只能压低色调，不能压掉敌人的轮廓
-		# 旧配置（sun 0.42 / ambient 0.34 / 0.0095 近黑）实enemyLum 只有 0.11
-		# sun / ambient 提到 0.92 / 0.82 之后仍然只有 0.15——因ambient
-		# 乘在天空色上的系数，而这张图的天空本身就接近黑，怎么乘都是黑
-		# 现在月光重配：月光本身加强、地面反照率翻倍、再给一档曝光补
-		# 结果仍然是整场最暗的一张（场景亮度约为白天图的一半），但车看得见
+		# 夜间街区：全场最暗的一张图，但"暗"只能压低色调，不能压掉敌人的轮廓。
+		# 旧配置（sun 0.42 / ambient 0.34 / 雾 0.0095 近黑）实测 enemyLum 只有 0.11，
+		# 把 sun / ambient 提到 0.92 / 0.82 之后仍然只有 0.15——因为 ambient 是
+		# 乘在天空色上的系数，而这张图的天空本身就接近黑，怎么乘都是黑。
+		# 现在按"月光夜"重配：月光本身加强、地面反照率翻倍、再给一档曝光补偿。
+		# 结果仍然是整场最暗的一张（场景亮度约为白天图的一半），但车看得见。
 		# 
-		# 补一档曝光（1.32 -> 1.50）：重配之后实测最暗一面仍有 0.19
+		# 补一档曝光（1.32 -> 1.50）：重配之后实测最暗一面仍有 0.19 的样本
 		# （判据 0.20，见 tools/vis_probe.gd），差一口气。曝光抬的是暗部。
-		# 整场最暗的定位没变（sceneLum 0.24，全场最低），暗部却过了线。
+		# 所以"整场最暗"的定位没变（sceneLum 0.24，全场最低），暗部却过了线。
 		"name": "夜战市区", "layout": "night",
 		"sky_top": Color(0.06, 0.09, 0.18), "sky_hor": Color(0.20, 0.24, 0.34),
 		"gnd_bot": Color(0.075, 0.08, 0.095), "gnd_hor": Color(0.20, 0.215, 0.25),
@@ -203,15 +211,15 @@ const TERRAINS := [
 		"fill": Color(0.56, 0.61, 0.80),
 		"fog": Color(0.20, 0.225, 0.27), "fog_density": 0.0042, "ambient": 0.95,
 		# 地面反照率向中性灰收：
-		# 0.24,0.26,0.33) 的蓝分量比红38%
-		# 在满屏都是地面的第三人称视角里，这就整张图泡在蓝墨水的来
-		# 冷色只留给月光与天空，地面本身按湿沥青的中性灰
+		# （0.24, 0.26, 0.33）的蓝分量比红高 38%。
+		# 在满屏都是地面的第三人称视角里，这就是"整张图泡在蓝墨水里"的来源。
+		# 冷色只留给月光与天空，地面本身按湿沥青的中性灰走。
 		"soil_low": Color(0.115, 0.12, 0.128), "soil_high": Color(0.245, 0.25, 0.265),
 		"props": 0.30, "exposure": 1.62, "enemy_lift": 2.0,
 	},
 	{
-		# 沙漠风暴：斜向沙垄把开阔地切成几条长廊，沙尘把交战距离压到中段
-		# 掩体长而薄，所绕到沙垄另一比正面对推更划算
+		# 沙漠风暴：斜向沙垄把开阔地切成几条长廊，沙尘把交战距离压到中段。
+		# 掩体长而薄，所以"绕到沙垄另一头"比正面对推更划算。
 		"name": "沙漠风暴", "layout": "desert",
 		"sky_top": Color(0.42, 0.34, 0.20), "sky_hor": Color(0.80, 0.64, 0.38),
 		"gnd_bot": Color(0.28, 0.22, 0.13), "gnd_hor": Color(0.62, 0.50, 0.30),
@@ -223,7 +231,7 @@ const TERRAINS := [
 	},
 	{
 		# 铁路枢纽：平行的车厢与站台。纵向通路极长、横向穿越口稀少，
-		# 于是"在哪一几乎决定了这一次交火的胜负
+		# 于是"在哪一排"几乎决定了这一次交火的胜负。
 		"name": "铁路枢纽", "layout": "rail",
 		"sky_top": Color(0.10, 0.12, 0.16), "sky_hor": Color(0.46, 0.42, 0.38),
 		"gnd_bot": Color(0.08, 0.08, 0.08), "gnd_hor": Color(0.26, 0.25, 0.24),
@@ -244,12 +252,14 @@ var base_max_hp := 300
 var terrain := 0
 
 var astar := AStarGrid2D.new()
-## 宽体寻路网格：把单格宽通道也当作不可通行##
-## 普通网格只这一格是不是实心"，于4.7 m 宽的 Boss 会把 4 m 宽的通道
-## 当成正常路线，开进去之后车身左右各压进砖0.345 m
-## （tools/_BossCorridorProbe.tscn）——玩家看到的就是"坦克穿墙"## 车体轮廓比一格还宽的那些车改走这张网格，于是它会绕远路，而不是硬
+## 宽体寻路网格：把单格宽通道也当作不可通行。
+## 普通网格只问"这一格是不是实心"，于是 4.7 m 宽的 Boss 会把 4 m 宽的通道
+## 当成正常路线，开进去之后车身左右各压进砖墙 0.345 m
+## （tools/_BossCorridorProbe.tscn）——玩家看到的就是"坦克穿墙"。
+## 车体轮廓比一格还宽的那些车改走这张网格，于是它会绕远路，而不是硬挤。
 ## 
-## 只在**有绕行路*时生效：宽网格上无路可走`find_path(..., true)` 会退## 普通网格，宁可挤一次也不能AI 因为地图构造而站在那儿不
+## 只在**有绕行路线**时生效：宽网格上无路可走时 `find_path(..., true)` 会退回
+## 普通网格，宁可挤一次也不能让 AI 因为地图构造而站在那儿不动。
 var astar_wide := AStarGrid2D.new()
 
 var _blocks: Dictionary = {}          # Vector2i -> Node3D
@@ -295,11 +305,10 @@ var _ridge_mat_far: StandardMaterial3D
 ## 场地外的一圈土丘：只负责把"盒子边缘"藏进起伏的地平线
 var _berm: MultiMeshInstance3D
 var _berm_mat: StandardMaterial3D
-## 最外圈钢墙的可见替身：一圈实心球体拼成的土坡。碰撞仍按格，外观不再是一排方
+## 最外圈钢墙的可见替身：一圈实心球体拼成的土坡。碰撞仍按格，外观不再是一排方块。
 var _cliff: MeshInstance3D
 var _cliff_mat: ShaderMaterial
-## 坡体每一块的颜色扰动。球体共用一份材质，
-## MultiMesh 的实例色打散重复
+## 坡体每一块的颜色扰动。球体共用一份材质，靠 MultiMesh 的实例色打散重复。
 var _cliff_shade: Array[Color] = []
 var _ground_mi: MeshInstance3D
 var _roads_root: Node3D
@@ -334,7 +343,7 @@ var _sun: DirectionalLight3D
 var _fill: DirectionalLight3D
 static var _decal_cache: Dictionary = {}
 static var _decal_normal_cache: Dictionary = {}
-## 地形 地面材质。噪声贴图生成有成本，按地形缓存一次即
+## 地形 → 地面材质。噪声贴图生成有成本，按地形缓存一次即可。
 static var _soil_cache: Dictionary = {}
 
 
@@ -405,7 +414,7 @@ func blocks_nav(x: int, y: int) -> bool:
 	return blocks_tank(x, y) or is_wreck_cell(x, y)
 
 
-## 阻挡炮弹与视线（水面不挡，形能打不能的射击走廊）
+## 阻挡炮弹与视线（水面不挡，形成"能打不能过"的射击走廊）
 func blocks_sight(x: int, y: int) -> bool:
 	var c := cell(x, y)
 	return c == BRICK or c == STEEL or c == BASE
@@ -452,7 +461,7 @@ func generate(stage: int, terrain_id := 0) -> void:
 	_carve_zones()
 	_ensure_connectivity()
 	_plan_barricades(rng, stage)
-	# 收窄检查必须放在路障之后：路障把双车道挤成单车道同样是"转不出去"的来
+	# 收窄检查必须放在路障之后：路障把双车道挤成单车道同样是"转不出去"的来源。
 	_widen_lanes()
 	_rebuild_all()
 	_refresh_base_visual()
@@ -468,7 +477,10 @@ func terrain_name() -> String:
 	return TERRAINS[terrain]["name"]
 
 
-## 敌车涂装的可读性底光。默0.035；暗图在地形表里enemy_lift 抬高## 判据tools/vis_probe.gd enemyLum 0.205 m、三方向两朝向取最暗）## 之所以按地形给值而不是全图统一调亮环境光：环境光一抬，暗部与受光面一## 变亮，画面又回到"没有体积"的平光；底光只作用在车体上，场景对比不受影响
+## 敌车涂装的可读性底光。默认 0.035；暗图在地形表里用 enemy_lift 抬高。
+## 判据是 tools/vis_probe.gd 的 enemyLum ≥ 0.20（45 m、三方向两朝向取最暗）。
+## 之所以按地形给值而不是全图统一调亮环境光：环境光一抬，暗部与受光面一起
+## 变亮，画面又回到"没有体积"的平光；底光只作用在车体上，场景对比不受影响。
 func enemy_readability() -> float:
 	return float((TERRAINS[terrain] as Dictionary).get("enemy_lift", 0.035))
 
@@ -481,7 +493,7 @@ func _clear_decals() -> void:
 		pool.clear()
 
 
-## 残骸挂到独立的根节点下：换关时统一清掉，局内则一直留着当掩
+## 残骸挂到独立的根节点下：换关时统一清掉，局内则一直留着当掩体。
 func add_wreck(w: Node3D) -> void:
 	if _wrecks_root == null:
 		_wrecks_root = Node3D.new()
@@ -623,7 +635,7 @@ func _border() -> void:
 		grid[y][GRID_W - 1] = STEEL
 
 
-## 左右镜像放置，保证地图对称、双方进攻路线公
+## 左右镜像放置，保证地图对称、双方进攻路线公平
 func _put_mirror(x: int, y: int, t: int) -> void:
 	if y < 1 or y >= GRID_H - 1 or x < 1 or x >= GRID_W - 1:
 		return
@@ -633,7 +645,9 @@ func _put_mirror(x: int, y: int, t: int) -> void:
 		grid[y][mx] = t
 
 
-## 地形分派。每种布局只负责往网格里摆 BRICK / STEEL / WATER## 基地、出生走廊与连通性由后续统一_place_base / _carve_zones / _ensure_connectivity 兜底## 所以新增一种地形不必再操心"会不会把路堵
+## 地形分派。每种布局只负责往网格里摆 BRICK / STEEL / WATER；
+## 基地、出生走廊与连通性由后续统一的 _place_base / _carve_zones / _ensure_connectivity 兜底，
+## 所以新增一种地形不必再操心"会不会把路堵死"。
 func _build_layout(rng: RandomNumberGenerator, stage: int) -> void:
 	match String(TERRAINS[terrain]["layout"]):
 		"fortress":
@@ -662,13 +676,13 @@ func _build_layout(rng: RandomNumberGenerator, stage: int) -> void:
 			_layout_ruins(rng, stage)
 
 
-## 街区废墟：成团的掩体 + 一两条横向水带。节奏最均衡，是默认战场
+## 街区废墟：成团的掩体 + 一两条横向水带。节奏最均衡，是默认战场。
 func _layout_ruins(rng: RandomNumberGenerator, stage: int) -> void:
 	_scatter_clusters(rng, 9 + mini(stage, 6), 0.14 + minf(stage * 0.05, 0.28))
 	_water_bands(rng, 1 if stage < 3 else 2, 1)
 
 
-## 要塞回廊：纵向长墙切出几条平行通道，交战变抢走与侧向偷
+## 要塞回廊：纵向长墙切出几条平行通道，交战变成"抢走廊"与侧向偷袭。
 func _layout_fortress(rng: RandomNumberGenerator, stage: int) -> void:
 	var steel_ratio := 0.45 + minf(stage * 0.04, 0.3)
 	for cx in [3, 7, 11]:
@@ -678,9 +692,9 @@ func _layout_fortress(rng: RandomNumberGenerator, stage: int) -> void:
 			var t: int = STEEL if rng.randf() < steel_ratio else BRICK
 			for i in seg:
 				_put_mirror(cx, y + i, t)
-			# 段与段之间留 2~3 格的横向穿越
+			# 段与段之间留 2~3 格的横向穿越口
 			y += seg + rng.randi_range(2, 3)
-	# 横向短墙：把长走廊切断成若干段，避免变成纯粹的对狙长
+	# 横向短墙：把长走廊切断成若干段，避免变成纯粹的对狙长廊
 	for i in 5 + mini(stage, 4):
 		var x := rng.randi_range(2, GRID_W / 2 - 1)
 		var y := rng.randi_range(6, GRID_H - 7)
@@ -688,8 +702,8 @@ func _layout_fortress(rng: RandomNumberGenerator, stage: int) -> void:
 			_put_mirror(x + dx, y, BRICK)
 
 
-## 河谷渡口：三条水带把战场横向切开，只留少数几处可通行的渡
-## 水面挡车不挡弹，于是隔河对射与争夺渡口成了主
+## 河谷渡口：三条水带把战场横向切开，只留少数几处可通行的渡口。
+## 水面挡车不挡弹，于是隔河对射与争夺渡口成了主线。
 func _layout_valley(rng: RandomNumberGenerator, stage: int) -> void:
 	var bands := 2 if stage < 3 else 3
 	for i in bands:
@@ -698,7 +712,7 @@ func _layout_valley(rng: RandomNumberGenerator, stage: int) -> void:
 		for x in range(1, GRID_W - 1):
 			grid[y][x] = WATER
 			grid[y + 1][x] = WATER
-		# 每条水带开两处渡口（镜像，双方机会对等
+		# 每条水带开两处渡口（镜像，双方机会对等）
 		for k in 2:
 			var bx := rng.randi_range(2, GRID_W / 2 - 2)
 			for dy in 2:
@@ -709,7 +723,7 @@ func _layout_valley(rng: RandomNumberGenerator, stage: int) -> void:
 	_scatter_clusters(rng, 5, 0.2)
 
 
-## 迷宫街区~3 格一道细墙织成的网，近战缠斗与拐角遭遇为
+## 迷宫街区：2~3 格一道细墙织成的网，近战缠斗与拐角遭遇为主。
 func _layout_maze(rng: RandomNumberGenerator, stage: int) -> void:
 	var fill := 0.6 + minf(stage * 0.03, 0.18)
 	for gy in range(5, GRID_H - 5, 3):
@@ -725,7 +739,7 @@ func _layout_maze(rng: RandomNumberGenerator, stage: int) -> void:
 		_put_mirror(1, y, EMPTY)
 
 
-## 开阔荒原：极少的大块掩+ 一池死水。远距离机动战，几乎无处躲藏
+## 开阔荒原：极少的大块掩体 + 一池死水。远距离机动战，几乎无处躲藏。
 func _layout_badlands(rng: RandomNumberGenerator, stage: int) -> void:
 	for i in 4 + mini(stage / 2, 3):
 		var x := rng.randi_range(2, GRID_W / 2 - 2)
@@ -742,7 +756,7 @@ func _layout_badlands(rng: RandomNumberGenerator, stage: int) -> void:
 			_put_mirror(rng.randi_range(3, 5) + dx, py + dy, WATER)
 
 
-## 雪原哨所：大片冰+ 零散沙袋哨位。通路被湖面挤得很窄，走位代价
+## 雪原哨所：大片冰湖 + 零散沙袋哨位。通路被湖面挤得很窄，走位代价高。
 func _layout_snow(rng: RandomNumberGenerator, stage: int) -> void:
 	for i in 2 + mini(stage / 3, 2):
 		var cx := rng.randi_range(3, GRID_W / 2 - 1)
@@ -755,10 +769,10 @@ func _layout_snow(rng: RandomNumberGenerator, stage: int) -> void:
 	_scatter_clusters(rng, 6 + mini(stage, 4), 0.3)
 
 
-## 工业港区：纵向船坞成排排列，中间夹两条码头水
-## 通路笔直而密集，交战距离被压到很近——这是最适合贴脸与埋伏的一张图
+## 工业港区：纵向船坞成排排列，中间夹两条码头水道。
+## 通路笔直而密集，交战距离被压到很近——这是最适合贴脸与埋伏的一张图。
 func _layout_docks(rng: RandomNumberGenerator, stage: int) -> void:
-	# 船坞：每3 格一排纵向钢制长条，排与排之间就是泊位通道
+	# 船坞：每隔 3 格一排纵向钢制长条，排与排之间就是泊位通道
 	for cx in [2, 5, 8, 11]:
 		var y := 5
 		while y < GRID_H - 7:
@@ -766,7 +780,7 @@ func _layout_docks(rng: RandomNumberGenerator, stage: int) -> void:
 			for i in seg:
 				_put_mirror(cx, y + i, STEEL if rng.randf() < 0.6 else BRICK)
 			y += seg + rng.randi_range(2, 3)
-	# 两条纵向水道：挡车不挡弹，把港区切成"看得见打得到却过不去"的几
+	# 两条纵向水道：挡车不挡弹，把港区切成"看得见打得到却过不去"的几块
 	for cx in [3, GRID_W - 4]:
 		var y0 := rng.randi_range(6, 9)
 		var len_ := rng.randi_range(5, 8) + mini(stage, 4)
@@ -774,7 +788,7 @@ func _layout_docks(rng: RandomNumberGenerator, stage: int) -> void:
 			var y := y0 + dy
 			if y < GRID_H - 6:
 				grid[y][cx] = WATER
-	# 横向货箱堆：打断过长的直线对
+	# 横向货箱堆：打断过长的直线对狙
 	for i in 4 + mini(stage, 4):
 		var x := rng.randi_range(2, GRID_W / 2 - 2)
 		var y := rng.randi_range(6, GRID_H - 8)
@@ -782,14 +796,15 @@ func _layout_docks(rng: RandomNumberGenerator, stage: int) -> void:
 			_put_mirror(x + dx, y, BRICK)
 
 
-## 熔岩弹坑：三圈同心环形掩体，每圈只开两个缺口且逐圈错开## 往里推进要连破三道口子，退出去同样要绕——攻防拉锯最明显的一张图
+## 熔岩弹坑：三圈同心环形掩体，每圈只开两个缺口且逐圈错开。
+## 往里推进要连破三道口子，退出去同样要绕——攻防拉锯最明显的一张图。
 func _layout_crater(rng: RandomNumberGenerator, stage: int) -> void:
 	var cx := GRID_W / 2
 	var cy := GRID_H / 2
 	var rings := [9, 6, 3]
 	for ri in rings.size():
 		var r: int = rings[ri]
-		# 每圈的两个缺口按圈号错开，于是三圈的缺口不会连成一条直
+		# 每圈的两个缺口按圈号错开，于是三圈的缺口不会连成一条直线
 		var gate := (ri * 2 + rng.randi_range(0, 1)) % 4
 		for dy in range(-r, r + 1):
 			for dx in range(-r, r + 1):
@@ -800,31 +815,31 @@ func _layout_crater(rng: RandomNumberGenerator, stage: int) -> void:
 				var y := cy + dy
 				if x < 1 or x >= GRID_W - 1 or y < 4 or y >= GRID_H - 5:
 					continue
-				# 沿着缺口方向开口：8 个扇区里的两个留
+				# 沿着缺口方向开口：把 8 个扇区里的两个留空
 				var sector := int((atan2(float(dy), float(dx)) + PI) / (PI * 0.25)) % 8
 				if sector == gate or sector == (gate + 4) % 8:
 					continue
 				grid[y][x] = STEEL if ri == rings.size() - 1 else BRICK
-	# 中央熔池：挡车不挡弹，中心阵地因此只能绕着
+	# 中央熔池：挡车不挡弹，中心阵地因此只能绕着打
 	for dy in range(-1, 2):
 		for dx in range(-1, 2):
 			grid[cy + dy][cx + dx] = WATER
 	_scatter_clusters(rng, 4 + mini(stage / 2, 3), 0.25)
 
 
-## 丛林小径：斜向的短墙织成网，视野被切得很
-## 每个拐角都可能贴脸遭遇，炮塔回转速度在这里比机动性更值钱
+## 丛林小径：斜向的短墙织成网，视野被切得很碎。
+## 每个拐角都可能贴脸遭遇，炮塔回转速度在这里比机动性更值钱。
 func _layout_jungle(rng: RandomNumberGenerator, stage: int) -> void:
 	var lines := 10 + mini(stage, 6)
 	for i in lines:
 		var x := rng.randi_range(2, GRID_W / 2)
 		var y := rng.randi_range(5, GRID_H - 8)
 		var len_ := rng.randi_range(3, 6)
-		# 斜向推进5° 的短墙既挡视线又不会围成封闭的死
+		# 斜向推进：45° 的短墙既挡视线又不会围成封闭的死格
 		var sx := 1 if rng.randf() < 0.5 else -1
 		for k in len_:
 			_put_mirror(x + k * sx, y + k, BRICK if rng.randf() < 0.88 else STEEL)
-	# 两三处林间水
+	# 两三处林间水洼
 	for i in 2 + mini(stage / 3, 2):
 		var wx := rng.randi_range(3, GRID_W / 2 - 2)
 		var wy := rng.randi_range(7, GRID_H - 9)
@@ -834,7 +849,7 @@ func _layout_jungle(rng: RandomNumberGenerator, stage: int) -> void:
 
 
 ## 夜战市区：规整的方形街区 + 窄街。能见度最低，
-## 炮口焰与曳光弹成了判断敌人位置的主要线索
+## 炮口焰与曳光弹成了判断敌人位置的主要线索。
 func _layout_night(rng: RandomNumberGenerator, stage: int) -> void:
 	# 2x2 的街块按 3 格间距排布，街道因此永远是贯通的
 	for by in range(5, GRID_H - 7, 4):
@@ -851,14 +866,15 @@ func _layout_night(rng: RandomNumberGenerator, stage: int) -> void:
 	_water_bands(rng, 1, 1)
 
 
-## 沙漠风暴：几道斜向沙垄（砖）+ 零星岩堆（钢 一小片绿洲## 沙垄长而薄，正面绕不过去就得吃亏，于是机动与绕后比对推更有价
+## 沙漠风暴：几道斜向沙垄（砖）+ 零星岩堆（钢）+ 一小片绿洲。
+## 沙垄长而薄，正面绕不过去就得吃亏，于是机动与绕后比对推更有价值。
 func _layout_desert(rng: RandomNumberGenerator, stage: int) -> void:
 	for i in 5 + mini(stage / 2, 4):
 		var x := rng.randi_range(2, GRID_W / 2)
 		var y := rng.randi_range(5, GRID_H - 10)
 		var len_ := rng.randi_range(4, 8)
 		var sx := 1 if rng.randf() < 0.5 else -1
-		# 两格进一格的缓坡：沙垄斜着铺开，又不会围成封闭的死
+		# 两格进一格的缓坡：沙垄斜着铺开，又不会围成封闭的死格
 		for k in len_:
 			_put_mirror(x + k * sx, y + int(k / 2), BRICK)
 	for i in 3 + mini(stage / 2, 3):
@@ -869,8 +885,8 @@ func _layout_desert(rng: RandomNumberGenerator, stage: int) -> void:
 	_water_bands(rng, 1, 1)
 
 
-## 铁路枢纽：几排纵向车厢（钢）夹着站台（砖），每排留错开的穿越口
-## 再用几道横向检修道把过长的纵向通路切断
+## 铁路枢纽：几排纵向车厢（钢）夹着站台（砖），每排留错开的穿越口；
+## 再用几道横向检修道把过长的纵向通路切断。
 func _layout_rail(rng: RandomNumberGenerator, stage: int) -> void:
 	for cx in [2, 6, 10]:
 		var y := 4 + rng.randi_range(0, 2)
@@ -893,7 +909,7 @@ func _layout_rail(rng: RandomNumberGenerator, stage: int) -> void:
 			_put_mirror(x + dx, y, BRICK)
 
 
-## 成团掩体：细长块比方块更适合当掩体，所3x3 以上的块会被压成一
+## 成团掩体：细长块比方块更适合当掩体，所以 3x3 以上的块会被压成一条。
 func _scatter_clusters(rng: RandomNumberGenerator, clusters: int, steel_ratio: float) -> void:
 	for i in clusters:
 		var x := rng.randi_range(2, GRID_W / 2)
@@ -911,7 +927,7 @@ func _scatter_clusters(rng: RandomNumberGenerator, clusters: int, steel_ratio: f
 				_put_mirror(x + dx, y + dy, t)
 
 
-## 横向水带：切断通路、留出对射走
+## 横向水带：切断通路、留出对射走廊
 func _water_bands(rng: RandomNumberGenerator, bands: int, thickness: int) -> void:
 	for i in bands:
 		var y := rng.randi_range(6, GRID_H - 9)
@@ -953,7 +969,8 @@ func _carve_zones() -> void:
 	grid[20][12] = EMPTY
 
 
-## 保证每个敌人出生点都能走到基地，否则沿直线凿开砖墙## 迷宫与要塞这类高密度地形要凿的格子更多，所以上限给得宽
+## 保证每个敌人出生点都能走到基地，否则沿直线凿开砖墙。
+## 迷宫与要塞这类高密度地形要凿的格子更多，所以上限给得宽。
 func _ensure_connectivity() -> void:
 	_sync_astar()
 	var goal := Vector2i(11, 19)
@@ -979,16 +996,16 @@ func _carve_line(from: Vector2i, to: Vector2i) -> void:
 			return
 
 
-## 路障格规划：把一部分空格变成低矮的工事障碍（沙袋 / 拒马 / 残骸 / 管材
+## 路障格规划：把一部分空格变成低矮的工事障碍（沙袋 / 拒马 / 残骸 / 管材）。
 ## 
 ## 散布物过去只是贴在地上的 MultiMesh 装饰——看着是障碍物，开过去却毫无反应，
-## 这正穿越障碍最直接的来源。现在凡是看着实心的散布物都独占一
-## 进入网格、带真实碰撞体，于是寻路、视线、炮弹与车体碰撞四者说的是同一件事##
+## 这正是"穿越障碍物"最直接的来源。现在凡是看着实心的散布物都独占一格、
+## 进入网格、带真实碰撞体，于是寻路、视线、炮弹与车体碰撞四者说的是同一件事。
 ## 路障挡车但不挡弹、不挡视线，所以它不是墙的替代品，而是一种新的战术地形：
-## 能隔着沙袋对射，却不能直接压过
+## 能隔着沙袋对射，却不能直接压过去。
 ## 
-## 每放一格都立刻重验"所有出生点仍能走到基地"，放不下就原样退回
-## 于是"路障把地图堵在构造上不可能发生，不需要事后调参去规避
+## 每放一格都立刻重验"所有出生点仍能走到基地"，放不下就原样退回——
+## 于是"路障把地图堵死"在构造上不可能发生，不需要事后调参去规避。
 func _plan_barricades(rng: RandomNumberGenerator, stage: int) -> void:
 	const DIRS := [Vector2i(1, 0), Vector2i(-1, 0), Vector2i(0, 1), Vector2i(0, -1)]
 	var want := 8 + mini(stage, 8)
@@ -1000,8 +1017,8 @@ func _plan_barricades(rng: RandomNumberGenerator, stage: int) -> void:
 		var y := rng.randi_range(5, GRID_H - 7)
 		if grid[y][x] != EMPTY or not _scatterable(x, y):
 			continue
-		# 贴着已有掩体长出来的路障才像战场工事；孤零零堵在空地中央既难看又容易挡路
-		# 所以只给它四分之一的概
+		# 贴着已有掩体长出来的路障才像战场工事；孤零零堵在空地中央既难看又容易挡路，
+		# 所以只给它四分之一的概率
 		var touching := false
 		for d in DIRS:
 			if blocks_tank(x + d.x, y + d.y):
@@ -1012,8 +1029,8 @@ func _plan_barricades(rng: RandomNumberGenerator, stage: int) -> void:
 
 		var mx := GRID_W - 1 - x
 		var mirrored: bool = mx != x and grid[y][mx] == EMPTY and _scatterable(mx, y)
-		# 四成路障改成长条沙袋墙：同样挡车不挡，但它是连续的一段实体视觉，
-		# 比一堆油桶更像掩体，也给"半高掩体"这条路补上一种可读的语言
+		# 四成路障改成长条沙袋墙：同样是"挡车不挡弹"，但它是连续的一段实体视觉，
+		# 比一堆油桶更像掩体，也给"半高掩体"这条路补上一种可读的语言。
 		var kind := SAND if rng.randf() < 0.4 else BARRICADE
 		grid[y][x] = kind
 		if mirrored:
@@ -1026,22 +1043,31 @@ func _plan_barricades(rng: RandomNumberGenerator, stage: int) -> void:
 			grid[y][mx] = EMPTY
 
 
-## 单格宽通道对车体是"转向死区"##
-## 车体要自由回转，需要一块短边不小于**车身对角*的空地：游隼 3.59 × 5.25 m## 对角6.34 m，而一格只4 m。实测（tools/TurnProbe.tscn）单格走廊里按住 A
-## 两秒，车体只转了 9.9° 就再也转不动——玩家读到的就是"左右转向不灵## Boss.70 m 宽）更直接：在单格走廊里整条车身压进砖墙 0.35 m
-## （tools/_BossCorridorProbe.gd），这就有时候还能看到坦克穿##
-## 所以地形生成完之后把所有单格通道拓宽一格（4 m 8 m）。规则是"只做加法"##   * BRICK / BARRICADE 优先；STEEL（永久工事）也允许清，但排在砖块之后##     原来的规则是"钢墙一律不，可单格通道的两侧经常正好是两排钢墙
-## 铁轨（terrain 11）每张图22~28 格单格通道，两*全是** STEEL##     于是最需要拓宽的那三张图一格都没拓宽过（tools/_LaneDiag.tscn）；
+## 单格宽通道对车体是"转向死区"。
+## 车体要自由回转，需要一块短边不小于**车身对角线**的空地：游隼 3.59 × 5.25 m，
+## 对角线 6.34 m，而一格只有 4 m。实测（tools/TurnProbe.tscn）单格走廊里按住 A
+## 两秒，车体只转了 9.9° 就再也转不动——玩家读到的就是"左右转向不灵活"。
+## Boss（4.70 m 宽）更直接：在单格走廊里整条车身压进砖墙 0.35 m
+## （tools/_BossCorridorProbe.gd），这就是"有时候还能看到坦克穿墙"。
+## 所以地形生成完之后把所有单格通道拓宽一格（4 m → 8 m）。规则是"只做加法"：
+##   * 清 BRICK / BARRICADE 优先；STEEL（永久工事）也允许清，但排在砖块之后。
+##     原来的规则是"钢墙一律不动"，可单格通道的两侧经常正好是两排钢墙——
+##     铁轨（terrain 11）每张图有 22~28 格单格通道，两侧**全是** STEEL，
+##     于是最需要拓宽的那三张图一格都没拓宽过（tools/_LaneDiag.tscn）；
 ##   * WATER（水网）与基地格、基地外围加固墙（_fortify_cells）不动：
-##     水是"能打不能的地形，抽干它等于改规则##   * 至少要有**连续 2 *可以拓宽才动
-## 格是几何下限而不是随手取的：
-##     车体55.6° 时外接盒最大，恰好等于对角6.34 m；只拓宽一格形成的##     4 × 8 m 的壁龛，仍然容不下车身回转，连续两格扩出 8 × 8 m 才够##   * 只剩一格长的孤门洞"退而求其次：清掉一侧的一格，局部净宽变8 m##     这种格子容不下原地掉头，Boss.70 m 宽）能平直通过
-## 而它原来在这里是0.345 m 的车身压进两侧砖
+##     水是"能打不能过"的地形，抽干它等于改规则；
+##   * 至少要有**连续 2 格**可以拓宽才动；
+##     两格是几何下限而不是随手取的：
+##     车体在 55.6° 时外接盒最大，恰好等于对角线 6.34 m；只拓宽一格形成的是
+##     4 × 8 m 的壁龛，仍然容不下车身回转，连续两格扩出 8 × 8 m 才够；
+##   * 只剩一格长的孤立"门洞"退而求其次：清掉一侧的一格，局部净宽变成 8 m。
+##     这种格子容不下原地掉头，但 Boss（4.70 m 宽）能平直通过——
+##     而它原来在这里是把 0.345 m 的车身压进两侧砖墙。
 ## 
-## 于是"通道再窄也能开过去、但只能在个别地方调变成"整条通道都能调头"
+## 于是"通道再窄也能开过去、但只能在个别地方调头"变成"整条通道都能调头"。
 func _widen_lanes() -> void:
-	# 多趟：每趟拓宽之后，新露出来的墙面上又可能出现新的单格段
-	# 实测（tools/_LaneDiag.tscn）第 4 趟之后剩余单格段不再随趟数下
+	# 多趟：每趟拓宽之后，新露出来的墙面上又可能出现新的单格段。
+	# 实测（tools/_LaneDiag.tscn）第 4 趟之后剩余单格段不再随趟数下降。
 	for _pass in 4:
 		if not _widen_lanes_once():
 			return
@@ -1050,7 +1076,7 @@ func _widen_lanes() -> void:
 func _widen_lanes_once() -> bool:
 	var changed := false
 	# 先纵向（左右夹住）再横向（上下夹住）。同一条通道整段朝同一侧拓宽，
-	# 结果是一条干净8 m 通道，而不是锯齿状的壁
+	# 结果是一条干净的 8 m 通道，而不是锯齿状的壁龛。
 	for vertical in [true, false]:
 		for run in _single_lane_runs(vertical):
 			if _widen_lane_run(run, vertical):
@@ -1058,7 +1084,8 @@ func _widen_lanes_once() -> bool:
 	return changed
 
 
-## 被两侧实心格夹住、只剩一格宽的空地，按列（纵向通道）或按行（横向通道## 切成连续段。段长可以只1 格：那是一个门洞，Boss 的通行宽度同样重要
+## 被两侧实心格夹住、只剩一格宽的空地，按列（纵向通道）或按行（横向通道）
+## 切成连续段。段长可以只有 1 格：那是一个门洞，对 Boss 的通行宽度同样重要。
 func _single_lane_runs(vertical: bool) -> Array:
 	var out: Array = []
 	var outer := GRID_W if vertical else GRID_H
@@ -1078,7 +1105,8 @@ func _single_lane_runs(vertical: bool) -> Array:
 	return out
 
 
-## 该空格是不是只有一格宽（沿 vertical 方向延伸、被左右/上下两堵墙夹住）## 寻路的宽度惩罚（_sync_astar）也用它，所以两条判据说的是同一件事
+## 该空格是不是只有一格宽（沿 vertical 方向延伸、被左右/上下两堵墙夹住）。
+## 寻路的宽度惩罚（_sync_astar）也用它，所以两条判据说的是同一件事。
 func _narrow_at(x: int, y: int, vertical: bool) -> bool:
 	if blocks_nav(x, y):
 		return false
@@ -1087,12 +1115,12 @@ func _narrow_at(x: int, y: int, vertical: bool) -> bool:
 	return blocks_nav(x, y - 1) and blocks_nav(x, y + 1)
 
 
-## 把一段单格通道朝一侧拓
+## 把一段单格通道朝一侧拓宽。
 func _widen_lane_run(run: Array, vertical: bool) -> bool:
 	var step := Vector2i(1, 0) if vertical else Vector2i(0, 1)
 
-	# 1) 路障造成的收窄：先拆路障。它本来就是"可绕的临时工，拆它比拆两
-	# 永久砖墙便宜，也不会改变地图的结
+	# 1) 路障造成的收窄：先拆路障。它本来就是"可绕的临时工事"，拆它比拆两格
+	#    永久砖墙便宜，也不会改变地图的结构。
 	var barricades: Array = []
 	for c in run:
 		for s in [1, -1]:
@@ -1105,8 +1133,8 @@ func _widen_lane_run(run: Array, vertical: bool) -> bool:
 			grid[t.y][t.x] = EMPTY
 		return true
 
-	# 2) 地形造成的收窄：两侧各找最长的一段可拓宽格（2 格起），同长时取拆钢更少
-	# 那一侧。能拆砖就不动钢——钢墙是"永久工事"，只有绕不开时才牺牲
+	# 2) 地形造成的收窄：两侧各找最长的一段可拓宽格（2 格起），同长时取拆钢更少的
+	#    那一侧。能拆砖就不动钢——钢墙是"永久工事"，只有绕不开时才牺牲它。
 	var best: Array = []
 	var best_cost := 1 << 30
 	for s in [1, -1]:
@@ -1128,10 +1156,10 @@ func _widen_lane_run(run: Array, vertical: bool) -> bool:
 			grid[t.y][t.x] = EMPTY
 		return true
 
-	# 3) 只剩一格长的孤立门洞：两侧凑不出连续两格，退而清一
-	# 局部净宽因此从 4 m 变成 8 m——容不下原地掉头，但 4.70 m 宽的 Boss
-	# 平直通过（原来在这里它左右各压进砖墙 0.345 m）。只对长1 的段动手
-	# 长段这样处理会在一面墙上打出一排门
+	# 3) 只剩一格长的孤立门洞：两侧凑不出连续两格，退而清一格。
+	#    局部净宽因此从 4 m 变成 8 m——容不下原地掉头，但 4.70 m 宽的 Boss 能
+	#    平直通过（原来在这里它左右各压进砖墙 0.345 m）。只对长度 1 的段动手：
+	#    长段这样处理会在一面墙上打出一排门洞。
 	if run.size() == 1:
 		var c: Vector2i = run[0]
 		var pick := Vector2i(-1, -1)
@@ -1150,7 +1178,7 @@ func _widen_lane_run(run: Array, vertical: bool) -> bool:
 	return false
 
 
-## 一段可拓宽格的"代价"：拆钢墙比拆砖墙贵。清一色砖= 0
+## 一段可拓宽格的"代价"：拆钢墙比拆砖墙贵。清一色砖块 = 0。
 func _stretch_cost(stretch: Array) -> int:
 	var n := 0
 	for t in stretch:
@@ -1159,9 +1187,10 @@ func _stretch_cost(stretch: Array) -> int:
 	return n
 
 
-## 这一格能不能为了拓宽通道而清
+## 这一格能不能为了拓宽通道而清掉。
 ## 
-## BRICK / BARRICADE 是首选，STEEL 也允许（调用方会优先选砖块那一侧，## `_stretch_cost`）。水、基地格、基地加固圈、基地正面进出口两侧一律不
+## BRICK / BARRICADE 是首选，STEEL 也允许（调用方会优先选砖块那一侧，见
+## `_stretch_cost`）。水、基地格、基地加固圈、基地正面进出口两侧一律不动。
 func _widenable(x: int, y: int) -> bool:
 	if x < 1 or y < 1 or x >= GRID_W - 1 or y >= GRID_H - 1:
 		return false
@@ -1177,7 +1206,8 @@ func _widenable(x: int, y: int) -> bool:
 	return true
 
 
-## 从基地门口泛洪，检查所有敌人出生点与玩家出生格是否仍然可达## 直接grid 而不astar，所以可以在地图构造中途随意调
+## 从基地门口泛洪，检查所有敌人出生点与玩家出生格是否仍然可达。
+## 直接读 grid 而不碰 astar，所以可以在地图构造中途随意调用。
 func _spawns_connected() -> bool:
 	const DIRS := [Vector2i(1, 0), Vector2i(-1, 0), Vector2i(0, 1), Vector2i(0, -1)]
 	var start := Vector2i(11, 19)
@@ -1219,8 +1249,9 @@ func _sync_astar() -> void:
 			_apply_solid(Vector2i(x, y))
 
 
-## 把一格的"实心"同步到两张网格上##
-## 宽体网格额外*单格宽通道**判成实心，判据与地形生成用的 `_narrow_at()` 是同一## 函数，于生成时认为这里转不开"寻路时认为这里过不去"说的是同一件事
+## 把一格的"实心"同步到两张网格上。
+## 宽体网格额外把**单格宽通道**判成实心，判据与地形生成用的 `_narrow_at()` 是同一个
+## 函数，于是"生成时认为这里转不开"与"寻路时认为这里过不去"说的是同一件事。
 func _apply_solid(c: Vector2i) -> void:
 	var solid := blocks_nav(c.x, c.y)
 	astar.set_point_solid(c, solid)
@@ -1231,8 +1262,9 @@ func _narrow_any(x: int, y: int) -> bool:
 	return _narrow_at(x, y, true) or _narrow_at(x, y, false)
 
 
-## 拆掉 / 重建一格之后，刷新它自己与周围一圈的两张网格##
-## 单格宽是一*邻居关系**：拆掉一格墙会让邻格变成"，所以只刷自## 是不够的——不刷邻格的话，宽体网格会一直认为那条路走不通，Boss 就永远绕
+## 拆掉 / 重建一格之后，刷新它自己与周围一圈的两张网格。
+## 单格宽是一个**邻居关系**：拆掉一格墙会让邻格从"窄"变成"宽"，所以只刷自己
+## 是不够的——不刷邻格的话，宽体网格会一直认为那条路走不通，Boss 就永远绕远。
 func _refresh_solid_around(c: Vector2i) -> void:
 	for dy in range(-1, 2):
 		for dx in range(-1, 2):
@@ -1241,8 +1273,10 @@ func _refresh_solid_around(c: Vector2i) -> void:
 				_apply_solid(n)
 
 
-## 返回世界坐标路径点（不含起点）。目标格不可通行时退回到最近的可通行邻格##
-## `wide` true 时走宽体网格：单格宽通道视为不可通行。Boss 这类车体比一格还## 的目标不能进那种通道（进去就0.345 m 的穿墙，astar_wide 的注释）## 宽网格上无路可走时退回普通网格——绕不过去的时候，能挤过去也比起步就不动好
+## 返回世界坐标路径点（不含起点）。目标格不可通行时退回到最近的可通行邻格。
+## `wide` 为 true 时走宽体网格：单格宽通道视为不可通行。Boss 这类车体比一格还宽
+## 的目标不能进那种通道（进去就是 0.345 m 的穿墙，见 astar_wide 的注释）。
+## 宽网格上无路可走时退回普通网格——绕不过去的时候，能挤过去也比起步就不动好。
 func find_path(from: Vector3, to: Vector3, wide := false) -> Array:
 	var g := astar_wide if wide else astar
 	var a := to_cell(from)
@@ -1274,7 +1308,7 @@ func _nearest_open(c: Vector2i, g: AStarGrid2D = astar) -> Vector2i:
 	return Vector2i(-1, -1)
 
 
-## 网格步进的视线判定：水面与空地不挡视
+## 网格步进的视线判定：水面与空地不挡视线
 func has_line_of_sight(from: Vector3, to: Vector3) -> bool:
 	var d := to - from
 	d.y = 0.0
@@ -1294,23 +1328,25 @@ func has_line_of_sight(from: Vector3, to: Vector3) -> bool:
 
 # ---------------- 几何约束 ----------------
 
-## 把一个半径为 radius 的圆推出所有实心格，返回修正后的坐
+## 把一个半径为 radius 的圆推出所有实心格，返回修正后的坐标。
 ## 
-## move_and_slide() 只保这一步不会穿过去"：高速、刁钻入射角、被另一辆坦克挤
-## 或者刚好站在砖墙被炸开又被加固还原的格子上，都可能让车体啃进掩体里## 网格本身是规则的，所以这里直接做一次圆-矩形解交当硬约束
-## 于是"穿过障碍在几何上不再可能发生，而不是靠调参去降低概
+## move_and_slide() 只保证"这一步不会穿过去"：高速、刁钻入射角、被另一辆坦克挤压、
+## 或者刚好站在砖墙被炸开又被加固还原的格子上，都可能让车体啃进掩体里。
+## 网格本身是规则的，所以这里直接做一次圆-矩形解交当硬约束——
+## 于是"穿过障碍物"在几何上不再可能发生，而不是靠调参去降低概率。
 ## 
-## from 是上一个确认安全的位置。两件事靠它##   1. 圆心已经完全陷进某格时，来的方向"退出去。原来取最浅的那条边，
-##      在单格厚的墙里会把车从墙的另一侧弹出来——那本身就是一次穿
-## 2. 实在解不开时（被夹在两堵墙之间）直接回退from，宁可顿一下也不穿
+## from 是上一个确认安全的位置。两件事靠它：
+##   1. 圆心已经完全陷进某格时，沿着来的方向退出去。原来取最浅的那条边，
+##      在单格厚的墙里会把车从墙的另一侧弹出来——那本身就是一次穿墙。
+##   2. 实在解不开时（被夹在两堵墙之间）直接回退到 from，宁可顿一下也不穿墙。
 func depenetrate(pos: Vector3, radius: float, from := Vector3.INF) -> Vector3:
 	var out := pos
 	var half := CELL * 0.5
 	var has_from: bool = from.x < INF
 	for _pass in 3:
-		# 分方向累计最深的推出量，最后一次性合
+		# 分方向累计最深的推出量，最后一次性合成。
 		# 关键在于对向的两面墙（单格宽走廊）会在这里相互抵消，车体停在走廊中线上；
-		# 原来逐格依次写回坐标，两边的墙会轮流把车推来推去，表现就是走廊里卡死
+		# 原来逐格依次写回坐标，两边的墙会轮流把车推来推去，表现就是走廊里卡死。
 		var push_px := 0.0
 		var push_nx := 0.0
 		var push_pz := 0.0
@@ -1349,14 +1385,14 @@ func depenetrate(pos: Vector3, radius: float, from := Vector3.INF) -> Vector3:
 		out.x += off.x
 		out.z += off.y
 
-	# 三趟还没解开：被夹在两面墙中间。退回上一个安全点，顿一帧远好过穿墙
+	# 三趟还没解开：被夹在两面墙中间。退回上一个安全点，顿一帧远好过穿墙。
 	if has_from and blocks_tank(to_cell(out).x, to_cell(out).y):
 		return from
 	return out
 
 
-## 圆心已经落在实心格内部时的脱出方
-## 有来向就朝来向退（沿主轴退出最近的那条边），否则退最浅的一条边"
+## 圆心已经落在实心格内部时的脱出方向。
+## 有来向就朝来向退（沿主轴退出最近的那条边），否则退回"最浅的一条边"。
 func _eject_inside(pos: Vector3, center: Vector3, half: float, radius: float,
 		from: Vector3, has_from: bool) -> Vector2:
 	if has_from:
@@ -1383,10 +1419,11 @@ func _eject_inside(pos: Vector3, center: Vector3, half: float, radius: float,
 
 
 ## 随机取一个适合空投补给的空格：避开出生走廊与基地周边，
-## 并要求至少两面通路，免得补给落在死胡同里拿不到##
-## avoid / min_dist 是硬性回避（基地与玩家当前位置）## soft_avoid / soft_dist 用于彼此拉开距离（已落地的其它补给）
-## 分成两档是因离基地远"别和另一个箱子挤在一要求的距离差了一个量
-## 找不到合适位置返Vector3.INF
+## 并要求至少两面通路，免得补给落在死胡同里拿不到。
+## avoid / min_dist 是硬性回避（基地与玩家当前位置），
+## soft_avoid / soft_dist 用于彼此拉开距离（已落地的其它补给）——
+## 分成两档是因为"离基地远"和"别和另一个箱子挤在一起"要求的距离差了一个量级。
+## 找不到合适位置返回 Vector3.INF。
 func random_open_cell(avoid: Array, min_dist: float,
 		soft_avoid: Array = [], soft_dist: float = 0.0) -> Vector3:
 	const DIRS := [Vector2i(1, 0), Vector2i(-1, 0), Vector2i(0, 1), Vector2i(0, -1)]
@@ -1417,9 +1454,9 @@ func random_open_cell(avoid: Array, min_dist: float,
 	return Vector3.INF
 
 
-# ---------------- 破坏与伤----------------
+# ---------------- 破坏与伤害 ----------------
 
-## 单点命中一格。返"brick" / "brick_break" / "steel" / "base" / "none"
+## 单点命中一格。返回 "brick" / "brick_break" / "steel" / "base" / "none"
 func hit_cell(c: Vector2i, dmg: int, pierce_steel: bool) -> String:
 	var t := cell(c.x, c.y)
 	if t == BRICK:
@@ -1441,7 +1478,7 @@ func hit_cell(c: Vector2i, dmg: int, pierce_steel: bool) -> String:
 	return "none"
 
 
-## HE 溅射：清除半径内的砖
+## HE 溅射：清除半径内的砖墙
 func splash_cells(center: Vector3, radius: float, dmg: int) -> int:
 	var broken := 0
 	var c0 := to_cell(center)
@@ -1563,7 +1600,7 @@ func _respawn_block(c: Vector2i) -> void:
 	_schedule_joints()
 
 
-# ---------------- 几何体构----------------
+# ---------------- 几何体构建 ----------------
 
 func _rebuild_all() -> void:
 	for y in GRID_H:
@@ -1602,7 +1639,7 @@ func _spawn_block(c: Vector2i) -> void:
 
 	var body := StaticBody3D.new()
 	body.position = cell_center(c.x, c.y) + Vector3(0, h * 0.5, 0)
-	# 水面、路障与沙袋墙只挡坦克不挡炮弹：放到3 层，炮弹射线不检测该
+	# 水面、路障与沙袋墙只挡坦克不挡炮弹：放到第 3 层，炮弹射线不检测该层
 	body.collision_layer = 4 if (t == WATER or t == BARRICADE or t == SAND) else 1
 	body.collision_mask = 0
 	body.set_meta("cell", c)
@@ -1619,8 +1656,8 @@ func _spawn_block(c: Vector2i) -> void:
 		box.size.y = 2.4
 		shape.position = Vector3(0, 1.2 - h * 0.5, 0)
 	elif t == SAND:
-		# 沙袋墙只1.1 m 高，但碰撞体给到 1.8 m：坦克是"浮空运动"
-		# 没有踏台阶的自由度，宁可让碰撞体略高，也不要在贴墙时出现骑上去的抖动
+		# 沙袋墙只有 1.1 m 高，但碰撞体给到 1.8 m：坦克是"浮空运动"，
+		# 没有踏台阶的自由度，宁可让碰撞体略高，也不要在贴墙时出现骑上去的抖动。
 		box.size.y = 1.8
 		shape.position = Vector3(0, 0.9 - h * 0.5, 0)
 	shape.shape = box
@@ -1633,9 +1670,9 @@ func _spawn_block(c: Vector2i) -> void:
 		return
 
 	if t == BARRICADE:
-		# 路障的外观由 _scatter_props 的重型散布物提供（沙/ 拒马 / 残骸 / 管材），
-		# 所以这里通常不挂任何网格。只有模型整体缺失时才退回一块矮土垒
-		# 免得出现"看不见却撞得的隐形墙
+		# 路障的外观由 _scatter_props 的重型散布物提供（沙袋 / 拒马 / 残骸 / 管材），
+		# 所以这里通常不挂任何网格。只有模型整体缺失时才退回一块矮土垒，
+		# 免得出现"看不见却撞得到"的隐形墙。
 		if Assets.mesh_of("prop_sandbags") == null:
 			_attach_block_primitive(body, t, h, mat_key)
 	elif t == SAND:
@@ -1837,9 +1874,10 @@ func _attach_block_primitive(body: StaticBody3D, t: int, h: float, mat_key: Stri
 	body.add_child(mi)
 
 
-## 沙袋墙：三排错缝的袋子，一整格一draw call##
-## 半高掩体的价值在挡住车体、露出炮：碰撞在 layer 3（挡车不挡弹），
-## 视觉必须是一段连续的实体，而不是几件零散道具——玩家要能一眼读## "这里能蹲、后面能开。袋子的位置用格哈希做稳定抖动，换关不会
+## 沙袋墙：三排错缝的袋子，一整格一次 draw call。
+## 半高掩体的价值在于"挡住车体、露出炮塔"：碰撞在 layer 3（挡车不挡弹），
+## 视觉必须是一段连续的实体，而不是几件零散道具——玩家要能一眼读出
+## "这里能蹲、后面能开火"。袋子的位置用格哈希做稳定抖动，换关不会闪。
 func _attach_sandbag_cover(body: StaticBody3D, c: Vector2i, h: float) -> void:
 	var bag := SphereMesh.new()
 	bag.radius = 0.34
@@ -1892,26 +1930,26 @@ func _shade_brick(c: Vector2i, ratio: float) -> void:
 	if now == int(_built_state.get(c, 0)):
 		return
 	_schedule_runs()
-	# 受损态第一次换上时崩一把碎砖，让"墙快塌了"这件事有听觉与视觉反馈
+			# 受损态第一次换上去时崩一把碎砖，让"墙快塌了"这件事有听觉与视觉反馈
 	if now == 2:
 		var body: Node3D = _blocks[c]
 		Fx.debris(_blocks_root, body.global_position, Vector3.UP, Color(0.5, 0.26, 0.17))
 
 
-## 格坐稳定伪随机数。用乘法散列而非 randi()，保证同一张地图可复现
+## 格坐标 → 稳定伪随机数。用乘法散列而非 randi()，保证同一张地图可复现。
 func _cell_hash(c: Vector2i, salt: int) -> int:
 	var v := (c.x * 73856093) ^ (c.y * 19349663) ^ (salt * 83492791)
 	return absi(v) % 1000003
 
 
 func _build_ground() -> void:
-	# 地面要比最外圈钢墙多铺出一大圈：近处山脊在 84 m，地面半98 m 才盖得住
-	# 山脚，否则俯视时能看地面78 m 就断的硬边与一条天空缝
+	# 地面要比最外圈钢墙多铺出一大圈：近处山脊在 84 m，地面半径 98 m 才盖得住
+	# 山脚，否则俯视时能看到"地面到 78 m 就断了"的硬边与一条天空缝。
 	var size := Vector2(GRID_W * CELL + 100.0, GRID_H * CELL + 100.0)
 	var mi := MeshInstance3D.new()
 	var pm := PlaneMesh.new()
 	pm.size = size
-	# 细分48x48：顶点多了才吃得住后面的光照SDFGI，单片四边形会出大块色阶
+	# 细分到 48x48：顶点多了才吃得住后面的光照与 SDFGI，单片四边形会出大块色阶
 	pm.subdivide_width = 48
 	pm.subdivide_depth = 48
 	mi.mesh = pm
@@ -1931,11 +1969,12 @@ func _build_ground() -> void:
 	add_child(body)
 
 
-## 土路：从基地通向三条进攻线的一段低对比色带##
+## 土路：从基地通向三条进攻线的一段低对比色带。
 ## 十二张图原来都是"均匀噪声地面 + 随机掩体"，玩家没有路径引导，
 ## 每张图也没有记忆点。土路不改碰撞、不挡视线，只做两件事：
-##   1. 把出生点与基地连起来，告诉玩主攻方向在哪"##   2. 用两道车辙与大尺度明度变化打破地面的均匀
-## 路径直接复用 A* 网格，所以它一定绕开砖墙与水面，不会画进掩体
+##   1. 把出生点与基地连起来，告诉玩家"主攻方向在哪"；
+##   2. 用两道车辙与大尺度明度变化打破地面的均匀感。
+## 路径直接复用 A* 网格，所以它一定绕开砖墙与水面，不会画进掩体里。
 func _build_roads() -> void:
 	if _roads_root != null:
 		_roads_root.queue_free()
@@ -2086,15 +2125,16 @@ void fragment() {
 	return _road_mat
 
 
-## 远景剪影：两圈低模山树线，把"地面平面切到天空"的硬边吃
+## 远景剪影：两圈低模山脊/树线，把"地面平面切到天空"的硬边吃掉。
 ## 
-## 原来 96x96 的场地外只有一156 m 的地面，再往外直接是天空## 相机压低之后，地平线会像一张纸的边缘。这里放两圈朝内的单面山脊：
-## 内圈低而近（树土坡），外圈高而远（山脊），颜色按地形雾色更新## 于是雾能把它们和天空接起来，而不用真的做地形起伏
+## 原来 96x96 的场地外只有一块 156 m 的地面，再往外直接是天空；
+## 相机压低之后，地平线会像一张纸的边缘。这里放两圈朝内的单面山脊：
+## 内圈低而近（树线/土坡），外圈高而远（山脊），颜色按地形雾色更新，
+## 于是雾能把它们和天空接起来，而不用真的做地形起伏。
 func _build_berms() -> void:
-	# 场地外一圈低矮土
-	# m 的方盒子外面原来是一整片平到地平线的地面
-	# 从任何角度看都是"盒子放在一张纸；土丘把墙外的空白填成起伏的郊野
-	# 同时挡住地面与山脊之间的接缝。纯视觉，不带碰撞，不进入寻路网
+	# 场地外一圈低矮土丘：96 m 的方盒子外面原来是一整片平到地平线的地面，
+	# 从任何角度看都是"盒子放在一张纸上"；土丘把墙外的空白填成起伏的郊野，
+	# 同时挡住地面与山脊之间的接缝。纯视觉，不带碰撞，不进入寻路网格。
 	var sphere := SphereMesh.new()
 	sphere.radius = 1.0
 	sphere.height = 2.0
@@ -2141,18 +2181,16 @@ func _berm_tint() -> void:
 			t["fog"] as Color, 0.28)
 
 
-## 最外圈不再
-## 4 m 一块的钢墙##
+## 最外圈不再用 4 m 一块的钢墙。
 ## 边界碰撞仍由最外圈钢墙格负责（挡车、挡弹、寻路都不变），但这些格不生成可见网格：
-## 按格拼出来的 4.4 m 方块从第三人称视角看就是一圈灰色围墙，把战场读成一个盒子
-## 这里换成一圈土坡：坡脚压在最外圈钢墙的内侧面
-## 4 m），坡顶 3.4~5.8 m
-## 坡顶插拒马。纯视觉、无碰撞、不进寻路
+## 按格拼出来的 4.4 m 方块从第三人称视角看就是一圈灰色围墙，把战场读成一个盒子。
+## 这里换成一圈土坡：坡脚压在最外圈钢墙的内侧面（约 4 m），坡顶 3.4~5.8 m，
+## 坡顶插拒马。纯视觉、无碰撞、不进寻路。
 ## 
 ## 坡体由互相重叠的**实心扁球**堆成，而不是一条自定义坡面。薄壳坡面靠 winding 算法线，
 ## 四条边里总有两条边的顶点顺序是反的：一半坡面背光发黑、另一半过曝，看上去像一
-## 白黑相间的碎片；即使显式给法线，单面坡也会自己接住自己的阴影，在坡腰压出大片黑斑
-## 球体没有这两个问题——法线由几何保证，自遮挡也就是正常的体积阴影
+## 片白黑相间的碎片；即使显式给法线，单面坡也会自己接住自己的阴影，在坡腰压出大片黑斑。
+## 球体没有这两个问题——法线由几何保证，自遮挡也就是正常的体积阴影。
 func _build_boundary_cliff() -> void:
 	if _cliff != null:
 		_cliff.queue_free()
@@ -2163,19 +2201,15 @@ func _build_boundary_cliff() -> void:
 	var trees: Array[Transform3D] = []
 	_cliff_shade.clear()
 
-	# 断面
-	# 距最外圈墙内侧面的水平距
-	# 高度)
-	# 内坡陡、坡肩圆、外坡缓。坡脚压到地面以下，坡体就不会与地面留一条硬边
+	# 断面：(距最外圈墙内侧面的水平距离, 高度)
+	# 内坡陡、坡肩圆、外坡缓。坡脚压到地面以下，坡体就不会与地面留一条硬边。
 	var profile := CLIFF_PROFILE
 	var pcount := profile.size()
 	var steps := 88
 
-	# 四条边的顶点先全部算出来：法线要用相邻点做有限差分
-	# 端点各多
-	# 3%，让四条边在角上互相叠住——用球堆时角部露出的
-	# 黑色竖缝，就
-	# 两排物体没有真正接上"造成的
+	# 四条边的顶点先全部算出来：法线要用相邻点做有限差分。
+	# 端点各多 3%，让四条边在角上互相叠住——用球堆时角部露出的
+	# 黑色竖缝，就是"两排物体没有真正接上"造成的。
 	var rows: Array = []
 	var normals: Array = []
 	for side in 4:
@@ -2187,8 +2221,7 @@ func _build_boundary_cliff() -> void:
 		for i in steps + 1:
 			var u := lerpf(-0.03, 1.03, float(i) / float(steps))
 			var base := _cliff_point(side, u, 0.0, 0.0)
-			# 低频起伏：整条坡
-			# 2~3 个缓包，而不是一排等高的
+			# 低频起伏：整条坡有 2~3 个缓包，而不是一条等高的直坡。
 			var wob := _cliff_swell(side, u)
 			var row: Array = []
 			for j in pcount:
@@ -2226,11 +2259,9 @@ func _build_boundary_cliff() -> void:
 		rows.append(side_rows)
 		normals.append(side_normals)
 
-		# 坡顶拒马：每 3 段放一组，坡线因此
-		# 防线"的读法
-		# 高度必须跟着坡面的起伏走：坡肩的 y 会被 _cliff_swell 缩放
-		# 固定
-		# 5.2 m 会让一半拒马悬在坡顶上方
+		# 坡顶拒马：每 3 段放一组，坡线因此有"防线"的读法。
+		# 高度必须跟着坡面的起伏走：坡肩的 y 会被 _cliff_swell 缩放，
+		# 固定 5.2 m 会让一半拒马悬在坡顶上方。
 		for k in 26:
 			if k % 3 != 1:
 				continue
@@ -2245,29 +2276,24 @@ func _build_boundary_cliff() -> void:
 					+ Vector3(0, _cliff_surface_y(side, u, 5.4) - 0.12 * rs, 0)
 			rim.append(tr)
 
-		# 坡面散石与枯树：连续坡面解决了黑缝，但一条光滑的土墙同样不可信
-		# 石头压在坡面上（不悬空），枯树只放在坡肩，远看才是一条有人活动痕迹的边界
+		# 坡面散石与枯树：连续坡面解决了黑缝，但一条光滑的土墙同样不可信。
+		# 石头压在坡面上（不悬空），枯树只放在坡肩，远看才是一条有人活动痕迹的边界。
 		# 
-		# 两个约束
-		# * 只铺**内坡**（out <= 5.0）。原先铺
-		# 9.8 m，外坡上的石头从场地里看
-		#     正好高出坡顶剪影，背后又没有坡面可依，于是整条坡顶上方是一
-		# "悬空漂浮的砖块带"（tools/shots/BOUNDARY_north.png）
-		# * 高度
-		# _cliff_surface_y() 算，而不是查名义断面：坡面顶点被
-		#     _cliff_swell 同时平移
-		# out、缩放了 y，差量最大约 1.1 m
+		# 两个约束：
+		# * 只铺**内坡**（out <= 5.0）。原先铺到 9.8 m，外坡上的石头从场地里看
+		#   正好高出坡顶剪影，背后又没有坡面可依，于是整条坡顶上方是一条
+		#   "悬空漂浮的砖块带"（tools/shots/BOUNDARY_north.png）。
+		# * 高度按 _cliff_surface_y() 算，而不是查名义断面：坡面顶点被
+		#   _cliff_swell 同时平移了 out、缩放了 y，差量最大约 1.1 m。
 		for k in 30:
 			var u := (float(k) + rng.randf()) / 30.0
 			# 越靠近坡脚石头越密：重力把碎屑留在下面，坡肩只留零星几块
-			# 均匀铺满会让整条坡变
-			# 一条等间距的碎石带"，反而看出是程序撒的
+			# 均匀铺满会让整条坡变成一条等间距的碎石带，反而看出是程序撒的。
 			var out := lerpf(0.9, 4.6, pow(rng.randf(), 1.55))
 			var base := _cliff_point(side, u, 0.0, 0.0)
 			var outward2 := -_cliff_inward(side)
 			var y := _cliff_surface_y(side, u, out)
-			# 0.85~1.6：prop_rubble 单个石块的直径只
-			# 0.16~0.5 m
+			# 0.85~1.6：prop_rubble 单个石块的直径只有 0.16~0.5 m，
 			# 缩到 0.5 以下就只剩几颗黑点，反而比不撒更像渲染错误
 			var rs2 := rng.randf_range(0.85, 1.6)
 			var rtr := Transform3D.IDENTITY
@@ -2294,9 +2320,7 @@ func _build_boundary_cliff() -> void:
 		for i in steps + 1:
 			for j in pcount:
 				var p: Vector3 = side_rows[i][j]
-				# 明度扰动只负责打
-				# 一整片同色土坡"，色调交
-				# _cliff_tint
+				# 明度扰动只负责打散"一整片同色土坡"，色调交给 _cliff_tint。
 				var hsh := fposmod(sin(p.x * 12.9898 + p.z * 78.233) * 43758.5453, 1.0)
 				var sh := 0.80 + 0.26 * hsh
 				# 坡脚压暗、坡肩微亮：即使没有 AO，坡体也有上下层
@@ -2347,8 +2371,7 @@ func _cliff_point(side: int, u: float, out: float, y: float) -> Vector3:
 			return Vector3(span, y, a)
 
 
-## 每条
-## 指向场地内侧"的水平方
+## 每条边的"指向场地内侧"的水平方向。
 func _cliff_inward(side: int) -> Vector3:
 	match side:
 		0:
@@ -2361,25 +2384,19 @@ func _cliff_inward(side: int) -> Vector3:
 			return Vector3.LEFT
 
 
-## 边界坡线的低频起伏。整条坡
-## 2~3 个缓包，高低差约 ±17%
-## 坡面顶点与散落物必须用同一个函数，否则石头会浮在坡面上
+## 边界坡线的低频起伏。整条坡有 2~3 个缓包，高低差约 ±17%。
+## 坡面顶点与散落物必须用同一个函数，否则石头会浮在坡面上。
 static func _cliff_swell(side: int, u: float) -> float:
 	return sin(u * TAU * 1.7 + side * 1.9) * 0.55 \
 			+ sin(u * TAU * 4.3 + side * 0.7) * 0.22
 
 
-## 坡面
-## (side, u, out) 处的实际高度
+## 坡面 (side, u, out) 处的实际高度。
 ## 
-## `_build_boundary_cliff` 生成顶点时，坡肩以上的点会按 `_cliff_swell` 缩放高度
-## 并把 out 一起平移；散落的石
-## 枯树如果直接
-## CLIFF_PROFILE 的名义值，
-## 就会浮在坡面之上（tools/shots/BOUNDARY_north.png 里那
-## 悬空砖块
-## ）
-## 这里按同一套变形后的断面做线性插值，散落物才能真的压在土里
+## `_build_boundary_cliff` 生成顶点时，坡肩以上的点会按 `_cliff_swell` 缩放高度，
+## 并把 out 一起平移；散落的石头与枯树如果直接查 CLIFF_PROFILE 的名义值，
+## 就会浮在坡面之上（tools/shots/BOUNDARY_north.png 里那些悬空砖块）。
+## 这里按同一套变形后的断面做线性插值，散落物才能真的压在土里。
 static func _cliff_surface_y(side: int, u: float, out: float) -> float:
 	var wob := _cliff_swell(side, u)
 	var prev_o := 0.0
@@ -2435,13 +2452,12 @@ static func _cliff_material() -> ShaderMaterial:
 
 static var _cliff_shader: Shader
 
-## 边界土坡的材质
+## 边界土坡的材质。
 ## 
-## 只有顶点色的连续坡面会读成一
-## 棕色的墙"
-## 9 个分段乘 9 个断面点
-## 顶多给出几米一档的明暗，近看仍然是光滑挤出体。这里把土壤 / 碎石 /
-## 三层按世界坐标混起来，再用解析高度场补一层法线，坡面才有颗粒与受光变化
+## 只有顶点色的连续坡面会读成"一整片棕色的墙"；
+## 9 个分段乘 9 个断面点顶多给出几米一档的明暗，近看仍然是光滑挤出体。
+## 这里把土壤 / 碎石 / 植被三层按世界坐标混起来，再用解析高度场补一层法线，
+## 坡面才有颗粒与受光变化。
 const _CLIFF_SHADER := """
 shader_type spatial;
 render_mode diffuse_burley, specular_schlick_ggx;
@@ -2559,9 +2575,7 @@ func _cliff_scatter(list: Array[Transform3D], key: String, nname: String) -> voi
 	mmi.name = nname
 	mmi.multimesh = mm
 	# 石头要投影：坡面上的散石如果只有背光面、没有落在坡面上的接触阴影，
-	# 远看就是一条悬空的黑点带。一
-	# MultiMesh 只有一个阴
-	# pass，代价可接受
+	# 远看就是一条悬空的黑点带。一次 MultiMesh 只有一个阴影 pass，代价可接受。
 	mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
 	add_child(mmi)
 
@@ -2666,13 +2680,14 @@ func _make_ridge_ring(radius: float, min_h: float, max_h: float, seed: int,
 	return mi
 
 
-## 地面材质：世界空间的三平面程序化混合，而不是一张平铺噪声贴
+## 地面材质：世界空间的三平面程序化混合，而不是一张平铺噪声贴图。
 ## 
-## 原来的做法是 512 噪声 × uv1_scale 14 + 一detail4 次重复在 4 m 一格的
-## 尺度上肉眼可数，而且 roughness 恒为 1、没有法线，受光下就是一块哑光纸
-## 现在按世界坐标混/ 碎石 / 三套颜色，再用大尺度明度14 次重## 彻底打散；法线由同一套高度场解析求出，地面的碎石与车辙边缘终于有受光变化##
-## 三平面投影对水平地面不是必须的（只有 XZ 一个面），但它让同一shader
-## 以后可以直接套到斜坡与土堆上，不必为地形起伏再写一套材
+## 原来的做法是 512 噪声 × uv1_scale 14 + 一层 detail：14 次重复在 4 m 一格的
+## 尺度上肉眼可数，而且 roughness 恒为 1、没有法线，受光下就是一块哑光纸板。
+## 现在按世界坐标混合"土 / 碎石 / 草"三套颜色，再用大尺度明度把 14 次重复
+## 彻底打散；法线由同一套高度场解析求出，地面的碎石与车辙边缘终于有受光变化。
+## 三平面投影对水平地面不是必须的（只有 XZ 一个面），但它让同一个 shader
+## 以后可以直接套到斜坡与土堆上，不必为地形起伏再写一套材质。
 static func _soil_material(idx: int) -> Material:
 	if _soil_cache.has(idx):
 		return _soil_cache[idx]
@@ -2877,7 +2892,8 @@ static func _noise_tex(size: int, freq: float, low: Color, high: Color) -> Noise
 	return t
 
 
-## 水面：法线扰+ 深度边缘渐变 + 屏幕空间折射## 玩法规则不变——碰撞体仍是"挡车不挡，这里只换视
+## 水面：法线扰动 + 深度边缘渐变 + 屏幕空间折射。
+## 玩法规则不变——碰撞体仍是"挡车不挡弹"，这里只换视觉。
 func _water_material() -> Material:
 	if _water_mat != null:
 		return _water_mat
@@ -2949,14 +2965,16 @@ void fragment() {
 
 # ---------------- 场景散布 ----------------
 
-## 散布物分三类，差别在看着能不能开过去"必须和实际一致：
+## 散布物分三类，差别在于"看着能不能开过去"必须和实际一致：
 ##
-##   HEAVY  沙袋 / 拒马 / 残骸 / 管材 / 弹药/ 油桶——看着实心##          只摆BARRICADE 格里，每格塞几件填满，背后有真实碰撞
-## TALL   路灯 / 枯树——立起来的高杆，视觉上绝不可能开过去##          所以同样只摆在 BARRICADE 格里，当工事里立着的那根杆
-## FLAT   碎石 / 铁丝网——压过去才合理的东西，随便撒在空地上，不带碰
+##   HEAVY  沙袋 / 拒马 / 残骸 / 管材 / 弹药箱 / 油桶——看着实心，
+##          只摆在 BARRICADE 格里，每格塞几件填满，背后有真实碰撞体。
+##   TALL   路灯 / 枯树——立起来的高杆，视觉上绝不可能开过去，
+##          所以同样只摆在 BARRICADE 格里，当工事里立着的那根杆子。
+##   FLAT   碎石 / 铁丝网——压过去才合理的东西，随便撒在空地上，不带碰撞。
 ## 
-## 过去路灯与枯树走的是 FLAT 这条路：一5 米的水泥灯杆撒在空地上却没有碰撞体，
-## 开过去直接穿过去——这就是"穿越障碍里最刺眼的一
+## 过去路灯与枯树走的是 FLAT 这条路：一根 5 米的水泥灯杆撒在空地上却没有碰撞体，
+## 开过去直接穿过去——这就是"穿越障碍物"里最刺眼的一种。
 const PROP_HEAVY: Array[String] = [
 	"prop_sandbags", "prop_hedgehog", "prop_wreck", "prop_pipe",
 	"prop_ammocrate", "prop_barrel",
@@ -2964,9 +2982,9 @@ const PROP_HEAVY: Array[String] = [
 const PROP_TALL: Array[String] = ["prop_lamp", "prop_deadtree"]
 const PROP_FLAT: Array[String] = ["prop_rubble", "prop_wire"]
 
-## 路障格的三种"故事：同一片街区里的工事不再随机堆料，
+## 路障格的三种"故事组"：同一片街区里的工事不再随机堆料，
 ## 而是一处被击毁的车队、一个哨卡、一个维修点。相邻路障格会分到同一组，
-## 三四个格子连起来就读得出"这里发生过什，而不是均匀撒点
+## 三四个格子连起来就读得出"这里发生过什么"，而不是均匀撒点。
 const PROP_THEMES := [
 	["prop_wreck", "prop_barrel", "prop_pipe", "prop_ammocrate"],       # 被击毁的车队
 	["prop_sandbags", "prop_hedgehog", "prop_wire", "prop_ammocrate"],  # 哨卡
@@ -2974,14 +2992,17 @@ const PROP_THEMES := [
 ]
 
 ## 各散布物的水平足迹半径（米）。只有它决定能不能塞进一格：
-## 残骸本体就有 3x4 米，照原样再放大 1.3 倍会整整越过格子边界## 伸进旁边那个没有碰撞体的空格里去——于看着是障碍物，开过去毫无反应"## 格半宽是 2.0 米，所以摆放时一律按 (2.0 - 偏移 - 0.1) / 足迹 去压缩尺
+## 残骸本体就有 3x4 米，照原样再放大 1.3 倍会整整越过格子边界，
+## 伸进旁边那个没有碰撞体的空格里去——于是"看着是障碍物，开过去毫无反应"。
+## 格半宽是 2.0 米，所以摆放时一律按 (2.0 - 偏移 - 0.1) / 足迹 去压缩尺寸。
 const PROP_FOOT := {
 	"prop_sandbags": 1.7, "prop_hedgehog": 1.2, "prop_wreck": 2.6, "prop_pipe": 1.6,
 	"prop_ammocrate": 0.7, "prop_barrel": 0.4, "prop_lamp": 1.0, "prop_deadtree": 0.9,
 }
 
 
-## 在空格里散布道具与碎石。每种道具一MultiMeshInstance3D，于是无论摆了多少个## 每种也只是一draw call。出生走廊、玩家活动区与基地通道一律避开，不影响玩法
+## 在空格里散布道具与碎石。每种道具一个 MultiMeshInstance3D，于是无论摆了多少个，
+## 每种也只是一次 draw call。出生走廊、玩家活动区与基地通道一律避开，不影响玩法。
 func _scatter_props(stage: int) -> void:
 	if _props_root != null:
 		_props_root.queue_free()
@@ -3032,9 +3053,9 @@ func _scatter_props(stage: int) -> void:
 		var mmi := MultiMeshInstance3D.new()
 		mmi.name = key
 		mmi.multimesh = mm
-		# 重型道具（沙袋、拒马、残骸、管材）开阴影：它们有体积
-		# 贴在地上不投影就会像贴纸；碎石、铁丝网仍是轻量平面道具，继续关
-		# 这两类本来就只出现在路障格，实例数有限，阴影 pass 可以承受
+		# 重型道具（沙袋、拒马、残骸、管材）开阴影：它们有体积，
+		# 贴在地上不投影就会像贴纸；碎石、铁丝网仍是轻量平面道具，继续关。
+		# 这两类本来就只出现在路障格，实例数有限，阴影 pass 可以承受。
 		mmi.cast_shadow = (
 			GeometryInstance3D.SHADOW_CASTING_SETTING_ON
 			if (key in PROP_HEAVY or key in PROP_TALL or key == "prop_rubble")
@@ -3045,9 +3066,9 @@ func _scatter_props(stage: int) -> void:
 		if key == "prop_wire":
 			_register_crushable(key, mmi, list)
 
-	# 夜战：给路灯真的挂一盏灯。prop_lamp 原来只是个不发光的水泥杆
-	# 夜里站在路灯下和站在空地上没有区别；一圈暖色光池是"夜间"
-	# "暗蓝色白最直接的分界。数量封顶，避免几十盏点光把帧率吃掉
+	# 夜战：给路灯真的挂一盏灯。prop_lamp 原来只是个不发光的水泥杆，
+	# 夜里站在路灯下和站在空地上没有区别；一圈暖色光池是"夜间"与
+	# "暗蓝色白天"最直接的分界。数量封顶，避免几十盏点光把帧率吃掉。
 	if terrain_name() == "夜战市区" and slots.has("prop_lamp"):
 		_add_lamp_lights(slots["prop_lamp"])
 
@@ -3055,11 +3076,11 @@ func _scatter_props(stage: int) -> void:
 	_build_dust()
 
 
-## 墙根生活痕迹"：轮胎堆、木板堆、倒伏电线
+## 墙根的"生活痕迹"：轮胎堆、木板堆、倒伏电线杆。
 ## 
 ## 这三种都不带碰撞、都很矮（坦克压过去合理），所以只贴着墙根摆，
-## 不占用可通行区域。它们解决的道具只有十种、且都像贴纸"的问题：
-## 一个维修点会同时出现油桶、木箱、轮胎和木板，而不再只有同几件模型
+## 不占用可通行区域。它们解决的是"道具只有十种、且都像贴纸"的问题：
+## 一个维修点会同时出现油桶、木箱、轮胎和木板，而不再只有同几件模型。
 func _build_junk(rng: RandomNumberGenerator) -> void:
 	var tires: Array[Transform3D] = []
 	var planks: Array[Transform3D] = []
@@ -3078,7 +3099,7 @@ func _build_junk(rng: RandomNumberGenerator) -> void:
 				continue
 			if _road_cells.has(Vector2i(x, y)):
 				continue
-			# 只贴墙根：找一格相邻的实体
+			# 只贴墙根：找一格相邻的实体墙
 			var walls: Array[Vector2i] = []
 			for d in dirs:
 				var t := cell(x + d.x, y + d.y)
@@ -3096,18 +3117,12 @@ func _build_junk(rng: RandomNumberGenerator) -> void:
 			tr = tr.rotated(Vector3.UP, rng.randf_range(0.0, TAU))
 			tr = tr.scaled(Vector3.ONE * rng.randf_range(0.9, 1.15))
 			tr.origin = pos
-			# 大部分是生活杂物，少量是一处被放弃的反坦克炮位
-			# 它比轮胎堆更
-			# 这里打过
-			# 的叙事重量，但数量必须少，否则满街都是炮
-			# 墙根
-			# 生活痕迹"按概率分到九类。前四类是旧的一批，
-			# 后五类补的是"维修
-			# / 哨卡"里常见、但原来完全没有的物件：
-			# 弹药箱堆、油
-			# 水桶、备用负重轮、弹壳堆、卷起的伪装网
-			# 它们都很矮（不超
-			# 0.8 m），坦克压过去合理，所以不带碰
+			# 大部分是生活杂物，少量是一处被放弃的反坦克炮位。
+			# 它比轮胎堆更有"这里打过仗"的叙事重量，但数量必须少，否则满街都是炮。
+			# 墙根的"生活痕迹"按概率分到九类。前四类是旧的一批，
+			# 后五类补的是"维修 / 哨卡"里常见、但原来完全没有的物件：
+			# 弹药箱堆、油桶 / 水桶、备用负重轮、弹壳堆、卷起的伪装网。
+			# 它们都很矮（不超过 0.8 m），坦克压过去合理，所以不带碰撞。
 			var roll := rng.randf()
 			if roll < 0.060:
 				guns.append(tr)
@@ -3141,7 +3156,7 @@ func _build_junk(rng: RandomNumberGenerator) -> void:
 
 ## 被放弃的反坦克炮：炮盾、炮管、两只轮子、一条大
 ## 
-## 尺寸压到 3.2 m 以内，贴着墙根摆；没有碰撞，坦克碾过去是合理的
+## 尺寸压到 3.2 m 以内，贴着墙根摆；没有碰撞，坦克碾过去是合理的。
 func _abandoned_gun_mesh() -> ArrayMesh:
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
@@ -3158,10 +3173,7 @@ func _abandoned_gun_mesh() -> ArrayMesh:
 	barrel.height = 2.15
 	barrel.radial_segments = 10
 	barrel.material = ph
-	# 炮管
-	# -Z 伸出去：圆柱默认
-	# Y，绕 X
-	# 90°
+	# 炮管朝 -Z 伸出去：圆柱默认沿 Y，绕 X 转 90°。
 	st.append_from(barrel, 0, Transform3D(
 			Basis(Vector3.RIGHT, PI * 0.5), Vector3(0, 1.18, -1.15)))
 
@@ -3208,7 +3220,7 @@ func _junk_mm(list: Array[Transform3D], mesh: Mesh, col: Color, rough: float,
 	_props_root.add_child(mmi)
 
 
-## 轮胎堆：三只轮胎错开叠起来，远看是黑色的一摞，近看有圆的轮
+## 轮胎堆：三只轮胎错开叠起来，远看是黑色的一摞，近看有圆的轮廓
 func _tire_stack_mesh() -> ArrayMesh:
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
@@ -3217,9 +3229,9 @@ func _tire_stack_mesh() -> ArrayMesh:
 	tire.outer_radius = 0.43
 	tire.rings = 12
 	tire.ring_segments = 6
-	# SurfaceTool 会把源网格的材质一起带过来；图元不挂材质时 append_from 会刷
-	# "Parameter material is null"。这里给一个占位材质，最终外观仍MultiMesh
-	# material_override 决定
+	# SurfaceTool 会把源网格的材质一起带过来；图元不挂材质时 append_from 会报错
+	# "Parameter material is null"。这里给一个占位材质，最终外观仍由 MultiMesh 的
+	# material_override 决定。
 	tire.material = StandardMaterial3D.new()
 	for k in 3:
 		var tr := Transform3D.IDENTITY.rotated(Vector3.UP, float(k) * 0.55)
@@ -3229,7 +3241,7 @@ func _tire_stack_mesh() -> ArrayMesh:
 	return st.commit() as ArrayMesh
 
 
-## 木板堆：四块长度不一的板子叠放，带一点自然错
+## 木板堆：四块长度不一的板子叠放，带一点自然错位
 func _plank_pile_mesh() -> ArrayMesh:
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
@@ -3244,7 +3256,7 @@ func _plank_pile_mesh() -> ArrayMesh:
 	return st.commit() as ArrayMesh
 
 
-## 倒伏的电线杆：一根躺在地上的圆杆 + 一端的横担，最这里以前通电"
+## 倒伏的电线杆：一根躺在地上的圆杆 + 一端的横担，最像"这里以前通电"
 func _fallen_pole_mesh() -> ArrayMesh:
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
@@ -3277,9 +3289,8 @@ func _fallen_pole_mesh() -> ArrayMesh:
 	return st.commit() as ArrayMesh
 
 
-## 弹药箱堆：两只并排、一只压在上面。尺寸压
-## 1.4 m 以内
-## 贴墙根摆时不会探进旁边的通行
+## 弹药箱堆：两只并排、一只压在上面。尺寸压在 1.4 m 以内，
+## 贴墙根摆时不会探进旁边的通行带。
 func _crate_stack_mesh() -> ArrayMesh:
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
@@ -3299,7 +3310,7 @@ func _crate_stack_mesh() -> ArrayMesh:
 		var tr := Transform3D(Basis(Vector3.UP, yaw), pos)
 		st.append_from(box, 0, tr)
 		# 箱盖压条：两道深色横条，远看能读
-		# 木箱"而不是一块土黄色方块
+		# "木箱"而不是一块土黄色方块
 		for sx in [-1.0, 1.0]:
 			var strip := BoxMesh.new()
 			strip.size = Vector3(0.80, 0.045, 0.04)
@@ -3310,11 +3321,8 @@ func _crate_stack_mesh() -> ArrayMesh:
 	return st.commit() as ArrayMesh
 
 
-## 油桶/水桶堆：三只立着、一只倒着，带提手与桶盖
-## 原来只有一只孤零零
-## prop_barrel，墙根缺
-## 这里有人在补
-## 的成组读
+## 油桶 / 水桶堆：三只立着、一只倒着，带提手与桶盖。
+## 原来只有一只孤零零的 prop_barrel，墙根缺少"这里有人在补给"的成组读法。
 func _jerrycan_cluster_mesh() -> ArrayMesh:
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
@@ -3346,8 +3354,8 @@ func _jerrycan_cluster_mesh() -> ArrayMesh:
 
 
 ## 备用负重轮：两只立着靠在墙根，中间露出轮毂
-## 行走部分在车上被侧裙挡住，墙根这两只反而成了最直观
-## 坦克修过"的证
+## 行走部分在车上被侧裙挡住，墙根这两只反而成了最直观的
+## "坦克修过"的证据。
 func _spare_wheel_pair_mesh() -> ArrayMesh:
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
@@ -3373,10 +3381,8 @@ func _spare_wheel_pair_mesh() -> ArrayMesh:
 	return st.commit() as ArrayMesh
 
 
-## 弹壳堆：十几枚黄铜弹壳散在墙根，有躺有叠
-## 很小的道具，但它
-## 这里刚打过一
-## 最廉价也最准确的痕
+## 弹壳堆：十几枚黄铜弹壳散在墙根，有躺有叠。
+## 很小的道具，但它是"这里刚打过一仗"最廉价也最准确的痕迹。
 func _shell_pile_mesh() -> ArrayMesh:
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
@@ -3400,9 +3406,8 @@ func _shell_pile_mesh() -> ArrayMesh:
 	return st.commit() as ArrayMesh
 
 
-## 卷起的伪装网：两卷长短不一的网
-## + 两道捆带
-## 网卷是软塌的圆柱，和木箱、油桶的硬边形成对比，墙根的道具才不会全是方
+## 卷起的伪装网：两卷长短不一的网 + 两道捆带。
+## 网卷是软塌的圆柱，和木箱、油桶的硬边形成对比，墙根的道具才不会全是方块。
 func _camo_roll_mesh() -> ArrayMesh:
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
@@ -3438,14 +3443,15 @@ func _camo_roll_mesh() -> ArrayMesh:
 	return st.commit() as ArrayMesh
 
 
-## 把一个路障格塞满：主件居+ 两三件配件围在边上，偶尔再立一根高
+## 把一个路障格塞满：主件居中 + 两三件配件围在边上，偶尔再立一根高杆。
 ## 
-## 格子整格都有碰撞体，所以视觉上必须填得够满，玩家才不会觉得"明明有缝却过不去"## 反过来，任何一件都不许探出格子边界，否则它会伸进旁边没有碰撞体的空格，
-## 变成一看得见、撞不到"的假障碍——那正是穿越障碍物的观感来源
+## 格子整格都有碰撞体，所以视觉上必须填得够满，玩家才不会觉得"明明有缝却过不去"；
+## 反过来，任何一件都不许探出格子边界，否则它会伸进旁边没有碰撞体的空格，
+## 变成一个"看得见、撞不到"的假障碍——那正是穿越障碍物的观感来源。
 func _fill_barricade(rng: RandomNumberGenerator, slots: Dictionary, x: int, y: int) -> void:
 	var center := cell_center(x, y)
-	# 4x4 格为一个街区取主题：相邻路障格大概率落在同一组，
-	# 于是"残骸 + 油桶 + 管材"会挨在一起，而不是每格各讲各的故
+	# 按 4x4 格为一个街区取主题：相邻路障格大概率落在同一组，
+	# 于是"残骸 + 油桶 + 管材"会挨在一起，而不是每格各讲各的故事。
 	var theme_id := _cell_hash(Vector2i(x / 4, y / 4), 77) % PROP_THEMES.size()
 	var theme: Array = PROP_THEMES[theme_id]
 	var main: String = theme[_cell_hash(Vector2i(x, y), 23) % 2]
@@ -3458,8 +3464,8 @@ func _fill_barricade(rng: RandomNumberGenerator, slots: Dictionary, x: int, y: i
 		var off := Vector3(cos(a) * d, 0.0, sin(a) * d)
 		slots[key].append(_prop_xform(rng, key, center, off, 1.05))
 
-	# 高杆只出现在实心格里，所立着的东西一定撞得到"这条规则不会被破
-	# 哨卡主题更常立路灯，维修点更常立枯树
+	# 高杆只出现在实心格里，所以"立着的东西一定撞得到"这条规则不会被破坏。
+	# 哨卡主题更常立路灯，维修点更常立枯树。
 	var tall_chance := 0.25
 	if theme_id == 1:
 		tall_chance = 0.55
@@ -3483,10 +3489,13 @@ func _fill_barricade(rng: RandomNumberGenerator, slots: Dictionary, x: int, y: i
 		slots[tall].append(_prop_xform(rng, tall, center, off2, 1.0))
 
 
-## 夜战街灯与窗口灯##
-## 之前的夜图本质上把白天调：路灯只作为路障格里 15~55% 概率## 高杆出现，玩家出生点与主街上经常一根都没有，整张图就是一层均匀的蓝## 这里按街道补两样只在夜战市区生成的东西：
+## 夜战街灯与窗口灯。
+## 之前的夜图本质上是"把白天调暗"：路灯只作为路障格里 15~55% 概率的
+## 高杆出现，玩家出生点与主街上经常一根都没有，整张图就是一层均匀的蓝。
+## 这里按街道补两样只在夜战市区生成的东西：
 ##   - 沿街灯杆：贴墙、亮灯、带真实碰撞与暖色光池，封顶 12 盏；
-##   - 临街窗口：一MultiMesh 画完的暖/冷两色自发光窗，一个店面一眼就能读出来## 白天地形两个函数都在第一行返回，零开销
+##   - 临街窗口：一张 MultiMesh 画完的暖/冷两色自发光窗，一个店面一眼就能读出来。
+## 白天地形两个函数都在第一行返回，零开销。
 func _build_night_street() -> void:
 	if terrain_name() != "夜战市区" or _props_root == null:
 		return
@@ -3499,15 +3508,15 @@ func _add_street_lamps() -> void:
 	if lamp_mesh == null:
 		return
 	# 候选：空格、不在路面上、至少贴着一面砖/钢墙。优先临街（旁边有路面）
-	# 或夹在两堵墙之间——这两种位置才是真实街角"
+	# 或夹在两堵墙之间——这两种位置才是真实的"街角"。
 	var cands: Array[Vector2i] = []
 	for y in range(2, GRID_H - 2):
 		for x in range(1, GRID_W - 1):
 			var c := Vector2i(x, y)
 			if cell(x, y) != EMPTY or _road_cells.has(c):
 				continue
-			# 与道具散布用同一套避让：出生走廊、基地通道与玩家活动区不放灯杆
-			# 否则 0.3 m 的碰撞体可能正好立在坦克出生点前
+			# 与道具散布用同一套避让：出生走廊、基地通道与玩家活动区不放灯杆，
+			# 否则 0.3 m 的碰撞体可能正好立在坦克出生点前面。
 			if not _scatterable(x, y):
 				continue
 			var walls := 0
@@ -3526,7 +3535,7 @@ func _add_street_lamps() -> void:
 	rng.seed = 515151 + terrain * 313
 	# 按离玩家出生点的距离排序：出生点附近的主街先立灯，玩家一开局就看得到
 	# 脚下的暖色光池；否则 12 盏灯会被均匀撒到 96 m 见方的地图边缘，
-	# 出生点周围仍然是一片蓝
+	# 出生点周围仍然是一片蓝。
 	var spawn_cell := to_cell(player_spawn())
 	cands.sort_custom(func(a: Vector2i, b: Vector2i) -> bool:
 		return Vector2(a - spawn_cell).length_squared() \
@@ -3536,7 +3545,7 @@ func _add_street_lamps() -> void:
 	for c in cands:
 		if placed >= 12:
 			break
-		# 抽稀：同一条街每隔 3 格以上才再立一
+		# 抽稀：同一条街每隔 3 格以上才再立一根
 		var clear := true
 		for u in used:
 			if absi(u.x - c.x) + absi(u.y - c.y) < 3:
@@ -3569,7 +3578,7 @@ func _place_street_lamp(c: Vector2i, mesh: Mesh, rng: RandomNumberGenerator) -> 
 
 	var pos: Vector3 = center + Vector3(wall_dir.x, 0, wall_dir.y) * 1.12
 	var arm := Vector3(-wall_dir.x, 0, -wall_dir.y)
-	# 灯臂在模型里指向 Godot -Z，转arm 方向即可
+	# 灯臂在模型里指向 Godot 的 -Z，转到 arm 方向即可
 	var yaw := atan2(-arm.x, -arm.z) + rng.randf_range(-0.06, 0.06)
 	var basis := Basis(Vector3.UP, yaw)
 	var tr := Transform3D(basis, pos)
@@ -3580,8 +3589,8 @@ func _place_street_lamp(c: Vector2i, mesh: Mesh, rng: RandomNumberGenerator) -> 
 	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
 	_props_root.add_child(mi)
 
-	# 灯杆要真的挡车：没有碰撞体的高杆看着是障碍物，开过去毫无反应"的典
-	# 半径0.30 m（杆0.11 + 底座 0.30），高度 4.8 m，放在世界层
+	# 灯杆要真的挡车：没有碰撞体的高杆是"看着是障碍物，开过去毫无反应"的典型。
+	# 半径取 0.30 m（杆身 0.11 + 底座 0.30），高度 4.8 m，放在世界层。
 	var body := StaticBody3D.new()
 	body.position = pos + Vector3(0, 2.4, 0)
 	body.collision_layer = 1
@@ -3594,7 +3603,7 @@ func _place_street_lamp(c: Vector2i, mesh: Mesh, rng: RandomNumberGenerator) -> 
 	body.add_child(cs)
 	_props_root.add_child(body)
 
-	# 灯头位置：模型局(0, 4.84, -0.90)
+	# 灯头位置：模型局部 (0, 4.84, -0.90)
 	var head: Vector3 = tr * Vector3(0, 4.78, -0.90)
 	var light := OmniLight3D.new()
 	light.light_color = Color(1.0, 0.72, 0.38)
@@ -3633,7 +3642,9 @@ static func _lamp_bulb_material() -> StandardMaterial3D:
 	return m
 
 
-## 临街窗口：只贴在钢墙朝空格的那一面，暖色为主、冷色点缀## 用两套材质（冷）各一MultiMesh，总共两个 draw call## 比逐窗MeshInstance3D 便宜两个数量
+## 临街窗口：只贴在钢墙朝空格的那一面，暖色为主、冷色点缀。
+## 用两套材质（暖 / 冷）各一个 MultiMesh，总共两个 draw call。
+## 比逐窗一个 MeshInstance3D 便宜两个数量级。
 func _add_night_windows() -> void:
 	var warm: Array[Transform3D] = []
 	var cool: Array[Transform3D] = []
@@ -3650,7 +3661,7 @@ func _add_night_windows() -> void:
 			for d in dirs:
 				if cell(x + d.x, y + d.y) != EMPTY:
 					continue
-				# 只给临街立面开窗，概率压到 14%：窗太多会变马赛克楼"
+				# 只给临街立面开窗，概率压到 14%：窗太多会变成"马赛克楼"
 				if rng.randf() > 0.14:
 					continue
 				var rows := [1.42, 2.62] if h > 3.4 else [1.34, 2.18]
@@ -3703,7 +3714,8 @@ func _make_window_mm(list: Array[Transform3D], col: Color, nname: String) -> voi
 	_props_root.add_child(mi)
 
 
-## 夜战路灯：在部分灯杆顶部挂一盏暖色点+ 一个自发光灯泡## 上限 8 盏——街道灯已经提供了主要光池，这里只补路障格里的零散高
+## 夜战路灯：在部分灯杆顶部挂一盏暖色点光 + 一个自发光灯泡。
+## 上限 8 盏——街道灯已经提供了主要光池，这里只补路障格里的零散高杆。
 func _add_lamp_lights(lamps: Array) -> void:
 	var n := mini(lamps.size(), 8)
 	var bulb_mat := StandardMaterial3D.new()
@@ -3737,7 +3749,7 @@ func _add_lamp_lights(lamps: Array) -> void:
 		_props_root.add_child(bulb)
 
 
-## 按足迹把尺寸压到格内。cap 是期望的最大放大倍数，实际取它与"塞得进去"的较小
+## 按足迹把尺寸压到格内。cap 是期望的最大放大倍数，实际取它与"塞得进去"的较小值。
 func _prop_xform(rng: RandomNumberGenerator, key: String, center: Vector3,
 		off: Vector3, cap: float) -> Transform3D:
 	var foot: float = PROP_FOOT.get(key, 1.0)
@@ -3762,10 +3774,12 @@ func _scatterable(x: int, y: int) -> bool:
 	return true
 
 
-## 水岸：沿每一格水面的临岸边缘贴一条会呼吸的泡沫带，并在岸上压一条湿
+## 水岸：沿每一格水面的临岸边缘贴一条会呼吸的泡沫带，并在岸上压一条湿泥。
 ## 
-## 水面 shader 本身做了深度渐变与折射，但岸边是硬切的——没有泡沫线## 水就像一蓝玻璃板"嵌在地里。这里按格判断哪几条边临岸，
-## MultiMesh + INSTANCE_CUSTOM 把四条边的开合状态传shader## 于是整片水网只有两次 draw call：水面泡沫与岸上湿泥
+## 水面 shader 本身做了深度渐变与折射，但岸边是硬切的——没有泡沫线，
+## 水就像一块蓝玻璃板嵌在地里。这里按格判断哪几条边临岸，
+## 用 MultiMesh + INSTANCE_CUSTOM 把四条边的开合状态传给 shader，
+## 于是整片水网只有两次 draw call：水面泡沫与岸上湿泥。
 func _build_shoreline() -> void:
 	if _shore_root != null:
 		_shore_root.queue_free()
@@ -3791,7 +3805,7 @@ func _build_shoreline() -> void:
 				if mask != 0:
 					foam_cells.append([Vector2i(x, y), mask])
 			elif t == EMPTY:
-				# 岸这一侧：哪条边的邻居是水"决定湿泥压在哪一
+				# 岸这一侧：按"哪条边的邻居是水"决定湿泥压在哪一边
 				if cell(x + 1, y) == WATER:
 					mask |= 1
 				if cell(x - 1, y) == WATER:
@@ -3823,7 +3837,7 @@ func _make_shore_mm(cells: Array, y: float, mat: Material, nname: String) -> voi
 		var tr := Transform3D.IDENTITY
 		tr.origin = cell_center(c.x, c.y) + Vector3(0, y, 0)
 		mm.set_instance_transform(i, tr)
-		# 把四位边掩码压进 INSTANCE_CUSTOM.r；shader 里乘16 还原
+		# 把四位边掩码压进 INSTANCE_CUSTOM.r；shader 里乘回 16 还原
 		mm.set_instance_custom_data(i, Color(float(mask) / 16.0, 0.0, 0.0, 1.0))
 	var mmi := MultiMeshInstance3D.new()
 	mmi.name = nname
@@ -3840,7 +3854,7 @@ func _foam_material() -> ShaderMaterial:
 	var m := ShaderMaterial.new()
 	m.shader = _foam_shader
 	var t: Dictionary = TERRAINS[clampi(terrain, 0, TERRAINS.size() - 1)]
-	# 泡沫不是纯白：取地平色提亮，阴天的水岸才不会出现一荧光
+	# 泡沫不是纯白：取地平色提亮，阴天的水岸才不会出现一圈"荧光白"
 	m.set_shader_parameter("foam_col", (t["sky_hor"] as Color).lerp(Color(1, 1, 1), 0.55))
 	return m
 
@@ -3971,9 +3985,11 @@ void fragment() {
 """
 
 
-## 连续墙的接缝壁柱##
-## 墙体按格生成（破坏、寻路、碰撞都必须按格，这是对的），但视觉上每 4 m 一## 网格边界会让 12 m 的墙读成"三块积木"。这里在同类墙格之间压一根竖向壁柱：
-## 壁柱跨过拼缝、略凸出墙面，连续墙于是有一条连续的结构线，而不是三块各自收边的方块## 它只是视觉层——碰撞、血量、寻路都没有
+## 连续墙的接缝壁柱。
+## 墙体按格生成（破坏、寻路、碰撞都必须按格，这是对的），但视觉上每 4 m 一条
+## 网格边界会让 12 m 的墙读成"三块积木"。这里在同类墙格之间压一根竖向壁柱：
+## 壁柱跨过拼缝、略凸出墙面，连续墙于是有一条连续的结构线，而不是三块各自收边的方块。
+## 它只是视觉层——碰撞、血量、寻路都没有变。
 func _schedule_joints() -> void:
 	_joints_dirty = true
 	if _joints_pending:
@@ -4036,9 +4052,9 @@ func _refresh_joints() -> void:
 
 func _joint_xform(pos: Vector3, h: float, on_x: bool) -> Transform3D:
 	var tr := Transform3D.IDENTITY
-	# 壁柱必须比墙体更宽，否则会整根埋在墙里看不见
-	# 墙块±3% 的横向尺寸抖动（4.0 格内最大约 4.09 m），所以取 4.18 m
-	# 每侧凸出5 cm，正好是一条能读出"这里是结构线"的浅壁柱
+	# 壁柱必须比墙体更宽，否则会整根埋在墙里看不见。
+	# 墙块有 ±3% 的横向尺寸抖动（4.0 格内最大约 4.09 m），所以取 4.18 m：
+	# 每侧凸出约 5 cm，正好是一条能读出"这里是结构线"的浅壁柱。
 	var thin := 0.26
 	var wide := CELL * 1.045
 	var hh := h * 0.995
@@ -4196,10 +4212,12 @@ func track_dust_color() -> Color:
 			return Color(0.62, 0.56, 0.44, 0.26)
 
 
-## 植被：墙根与空地上的草簇 + 稀疏灌
+## 植被：墙根与空地上的草簇 + 稀疏灌木。
 ## 
-## 原来整张图只有路障格25% 概率出现一棵枯树，地面是纯噪声
-## 没有植被，地形看起来没人住过"。草簇用交叉双面+ alpha 剪切## 一MultiMesh 画完；灌木是三个低模球合并成的团，另一draw call## 风摆写在顶点着色器里，不增加任CPU 开销
+## 原来整张图只有路障格里 25% 概率出现一棵枯树，地面是纯噪声——
+## 没有植被，地形看起来就"没人住过"。草簇用交叉双面片 + alpha 剪切，
+## 一次 MultiMesh 画完；灌木是三个低模球合并成的团，另一次 draw call。
+## 风摆写在顶点着色器里，不增加任何 CPU 开销。
 func _build_vegetation() -> void:
 	if _veg_root != null:
 		_veg_root.queue_free()
@@ -4249,7 +4267,7 @@ func _build_vegetation() -> void:
 		_veg_root.add_child(gm)
 
 	# 芦苇：只长在临岸一格，沿水线成簇。水岸原来只有一条硬边，
-	# 泡沫解决"水有没有，芦苇解岸是不是活的"——它们是同一件事的两
+	# 泡沫解决"水有没有岸"，芦苇解决"岸是不是活的"——它们是同一件事的两半。
 	var reed_xf: Array[Transform3D] = []
 	for y in range(1, GRID_H - 1):
 		for x in range(1, GRID_W - 1):
@@ -4267,7 +4285,7 @@ func _build_vegetation() -> void:
 			for i in rng.randi_range(5, 11):
 				var tr := Transform3D.IDENTITY
 				var s := rng.randf_range(0.9, 1.35)
-				# 草叶网格0.48 m；芦苇要高出水面一截，所以只Y
+				# 草叶网格高 0.48 m；芦苇要高出水面一截，所以只拉 Y
 				tr = tr.scaled(Vector3(s, s * rng.randf_range(1.55, 2.35), s))
 				tr = tr.rotated(Vector3.UP, rng.randf_range(0.0, TAU))
 				tr.origin = center + dir * rng.randf_range(1.05, 1.86) \
@@ -4291,7 +4309,7 @@ func _build_vegetation() -> void:
 		_veg_root.add_child(rm)
 
 	# 灌木：只贴着墙根长，密度低。它们没有碰撞——这是纯装饰层，
-	# 不能让人误以这一丛能当掩
+	# 不能让人误以为"这一丛能当掩体"。
 	var shrub_xf: Array[Transform3D] = []
 	for y in range(2, GRID_H - 2):
 		for x in range(2, GRID_W - 2):
@@ -4355,7 +4373,7 @@ func _grass_factor() -> float:
 			return 0.35
 
 
-## 交叉双面片：两片 90° 相交的四边形，任何角度看都有草叶，而不是一张纸
+## 交叉双面片：两片 90° 相交的四边形，任何角度看都有草叶，而不是一张纸。
 func _grass_card_mesh() -> ArrayMesh:
 	var verts := PackedVector3Array()
 	var uvs := PackedVector2Array()
@@ -4430,14 +4448,15 @@ void fragment() {
 	var t: Dictionary = TERRAINS[clampi(terrain, 0, TERRAINS.size() - 1)]
 	var low: Color = t["soil_low"]
 	var high: Color = t["soil_high"]
-	# 用地面亮度的上限去混草色：草比土亮一点、绿一点就
-	# 原来直接soil_low（画面的最暗色）去乘，草的背光面在阴影里就是一块黑
+	# 用地面亮度的上限去混草色：草比土亮一点、绿一点就够。
+	# 原来直接拿 soil_low（画面的最暗色）去乘，草的背光面在阴影里就是一块黑。
 	m.set_shader_parameter("tint", high.lerp(Color(0.15, 0.20, 0.09), 0.34))
 	return m
 
 
-## 芦苇：同一套草叶网格与风摆，换成更黄、更高的水岸
-## 单独一个材质而不是给草调色，是因为芦苇要一直长到水线里## 与空地上的草簇在颜色上必须有区分，否则岸边看起来只是"草长得高"
+## 芦苇：同一套草叶网格与风摆，换成更黄、更高的水岸色。
+## 单独一个材质而不是给草调色，是因为芦苇要一直长到水线里，
+## 与空地上的草簇在颜色上必须有区分，否则岸边看起来只是"草长得高"。
 func _reed_material() -> ShaderMaterial:
 	var sh := Shader.new()
 	sh.code = """
@@ -4481,7 +4500,7 @@ static func _grass_tex() -> Texture2D:
 	var n := 64
 	var img := Image.create(n, n, false, Image.FORMAT_RGBA8)
 	# 透明像素也填上草色（alpha=0）。填成纯黑的话，mipmap 会把 1~2 px 宽的
-	# 草叶与黑底平均，远处每一簇都变成"上面绿、下面黑"的脏
+	# 草叶与黑底平均，远处每一簇都变成"上面绿、下面黑"的脏块。
 	img.fill(Color(0.52, 0.58, 0.38, 0.0))
 	var rng := RandomNumberGenerator.new()
 	rng.seed = 4242
@@ -4505,7 +4524,7 @@ static func _grass_tex() -> Texture2D:
 	return tex
 
 
-## 灌木：三个低模球错位合并，远看是一团有体积的叶簇，而不是一颗球
+## 灌木：三个低模球错位合并，远看是一团有体积的叶簇，而不是一颗球。
 func _shrub_mesh() -> ArrayMesh:
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
@@ -4566,21 +4585,21 @@ static func _soft_dot() -> Texture2D:
 	return t
 
 
-# ---------------- 贴花：战场痕----------------
+# ---------------- 贴花：战场痕迹 ----------------
 
-## 爆炸烧灼痕。半径按爆炸规模缩放，超出上限时回收最旧的一
+## 爆炸烧灼痕。半径按爆炸规模缩放，超出上限时回收最旧的一枚。
 func add_scorch(pos: Vector3, size := 1.0) -> void:
 	_push_decal(pos, randf_range(0.0, TAU), Vector3(4.0 * size, 2.0, 4.0 * size),
 		"scorch", 0.86, _scorches, MAX_SCORCH)
 
 
-## HE 弹坑：比烧灼痕更小更
+## HE 弹坑：比烧灼痕更小更深
 func add_crater(pos: Vector3, size := 1.0) -> void:
 	_push_decal(pos, randf_range(0.0, TAU), Vector3(2.6 * size, 1.6, 2.6 * size),
 		"crater", 0.95, _scorches, MAX_SCORCH)
 
 
-## 履带印：左、右两条平行的链节带，而不是一3.2×1.5 的糊
+## 履带印：左、右两条平行的链节带，而不是一块 3.2×1.5 的糊斑。
 func add_track(pos: Vector3, yaw: float) -> void:
 	var right := Vector3(cos(yaw), 0.0, -sin(yaw))
 	for side in [-1.0, 1.0]:
@@ -4615,9 +4634,10 @@ func _push_decal(pos: Vector3, yaw: float, size: Vector3, kind: String,
 
 
 ## 三种痕迹各有一张程序化贴图。原来烧灼、弹坑、履带印共用同一张软圆，
-## 区别只有颜色和尺寸，所以地面上的痕迹看起来都是"棕色圆斑"##
+## 区别只有颜色和尺寸，所以地面上的痕迹看起来都是"棕色圆斑"。
 ## scorch：不规则外缘 + 内部斑驳的炭黑；
-## crater：中心凹陷、四周一圈翻起的土沿## track：一条链节带（两侧有履带板缺口），左右两条由 add_track 摆出
+## crater：中心凹陷、四周一圈翻起的土沿；
+## track：一条链节带（两侧有履带板缺口），左右两条由 add_track 摆出来。
 static func _decal_tex(kind: String) -> Texture2D:
 	if _decal_cache.has(kind):
 		return _decal_cache[kind]
@@ -4717,7 +4737,7 @@ func _build_base_node() -> void:
 	if not _build_base_model():
 		_build_base_primitive()
 
-	# 基地光柱，远处也能一眼看
+	# 基地光柱，远处也能一眼看到
 	var light := OmniLight3D.new()
 	light.light_color = Color(0.4, 0.9, 1.0)
 	light.light_energy = 3.0
@@ -4741,7 +4761,7 @@ func _build_base_node() -> void:
 		_base_node.add_child(body)
 
 
-## 碉堡模型：射击口-Z（敌人来向），与 gen_base.py 的坐标约定一致，无需额外旋转
+## 碉堡模型：射击口朝 -Z（敌人来向），与 gen_base.py 的坐标约定一致，无需额外旋转
 func _build_base_model() -> bool:
 	_base_model = Assets.instantiate(Assets.BASE_KEY)
 	if _base_model == null:
@@ -4770,8 +4790,8 @@ func _build_base_primitive() -> void:
 	_base_node.add_child(_base_flag)
 
 
-## 基地血量反馈：旗面与信号灯（M_Accent）从青蓝烧到警告
-## 两条路径表达的是同一条视觉语言，只是着色对象不
+## 基地血量反馈：旗面与信号灯（M_Accent）从青蓝烧到警告红。
+## 两条路径表达的是同一条视觉语言，只是着色对象不同。
 func _refresh_base_visual() -> void:
 	if _base_node == null:
 		_build_base_node()
@@ -4815,13 +4835,15 @@ func _mat(c: Color, rough: float, metal: float) -> StandardMaterial3D:
 
 
 ## 黄昏战场基调。环境本体一次建好，具体开哪些效果交给 _apply_quality 按档位决定，
-## 所以低画质能退回改造前的轻量环境，高画质才SSAO/SSIL/SDFGI/体积
+## 所以低画质能退回改造前的轻量环境，高画质才上 SSAO/SSIL/SDFGI/体积雾。
 static var _sky_shader: Shader
 
-## 天空：渐+ 太阳/月亮+ 云层 + 星空##
-## 只用天空着色器能拿到的东西（视线方向、主光方颜色、时间），不引入任何贴图##   - 地平线附近加一层雾霭带，把"地面平面切到天空"的硬边吃掉；
+## 天空：渐变 + 太阳/月亮盘 + 云层 + 星空。
+## 只用天空着色器能拿到的东西（视线方向、主光方向/颜色、时间），不引入任何贴图：
+##   - 地平线附近加一层雾霭带，把"地面平面切到天空"的硬边吃掉；
 ##   - 主光方向画一个带柔边的日盘（夜里就是月盘，尺寸由 uniform 控制）；
-##   - 高频 fbm 云层，靠近主光的一侧被染成暖色##   - 深色天空（sky_top 亮度低）自动叠一层星场，夜里才有"星空"而不暗蓝色白
+##   - 高频 fbm 云层，靠近主光的一侧被染成暖色；
+##   - 深色天空（sky_top 亮度低）自动叠一层星场，夜里才有"星空"而不是"暗蓝色白天"。
 const _SKY_SHADER := """
 shader_type sky;
 
@@ -4935,8 +4957,8 @@ func _build_environment() -> void:
 	env.background_mode = Environment.BG_SKY
 
 	var sky := Sky.new()
-	# 自定义天空：渐变 + 太阳/月亮+ 云层 + 星空。原来的 ProceduralSkyMaterial
-	# 只有一个渐变球，没有太阳盘也没有星空，夜战图就只是"把白天调
+	# 自定义天空：渐变 + 太阳/月亮盘 + 云层 + 星空。原来的 ProceduralSkyMaterial
+	# 只有一个渐变球，没有太阳盘也没有星空，夜战图就只是"把白天调暗"。
 	if _sky_shader == null:
 		_sky_shader = Shader.new()
 		_sky_shader.code = _SKY_SHADER
@@ -4950,12 +4972,12 @@ func _build_environment() -> void:
 	env.ambient_light_energy = 0.75
 	env.reflected_light_source = Environment.REFLECTION_SOURCE_SKY
 
-	# ACES Filmic 更能压住爆炸与炮口焰的高光，不会一开火就糊成白块
+	# ACES 比 Filmic 更能压住爆炸与炮口焰的高光，不会一开火就糊成白块
 	env.tonemap_mode = Environment.TONE_MAPPER_ACES
 	env.tonemap_exposure = 1.0
-	# white=6 会把整个中间调压进曲线的低段：爆炸不再过曝，但墙、地面和
-	# 一起变暗部"，夜回廊的敌车因此跌破可读性下限。收3.0 之后
-	# 中间调抬回一档，高光仍由 glow ACES 肩部兜住
+	# white=6 会把整个中间调压进曲线的低段：爆炸不再过曝，但墙、地面和车
+	# 一起变暗，夜回廊的敌车因此跌破可读性下限。收到 3.0 之后
+	# 中间调抬回一档，高光仍由 glow 与 ACES 肩部兜住。
 	env.tonemap_white = 3.0
 
 	env.glow_enabled = true
@@ -5010,16 +5032,16 @@ func _build_environment() -> void:
 	_sun.directional_shadow_split_2 = 0.14
 	_sun.directional_shadow_split_3 = 0.42
 	_sun.directional_shadow_blend_splits = true
-	# bias 调小 + normal_bias 兜底：坦克在墙根下不再出现悬空的接触阴影
-	# normal_bias 1.4 收到 1.05.4 会把墙根与车底的接触阴影整体推离物体
-	# 远看像物件浮在地面上.05 仍高于默认值，足以压住斜射太阳下的阴影痤疮
+	# bias 调小 + normal_bias 兜底：坦克在墙根下不再出现悬空的接触阴影。
+	# normal_bias 从 1.4 收到 1.05：1.4 会把墙根与车底的接触阴影整体推离物体，
+	# 远看像物件浮在地面上；1.05 仍高于默认值，足以压住斜射太阳下的阴影痤疮。
 	_sun.shadow_bias = 0.035
 	_sun.shadow_normal_bias = 1.05
 	add_child(_sun)
 
-	# 冷色天空填充光：把阴影面从死黑提回来，车体侧面的轮廓才读得出
-	# 一盏不投影的平行光，开销可以忽略，所以它不随画质档位关闭
-	# 低画质玩家同样需要看得见敌人
+	# 冷色天空填充光：把阴影面从死黑提回来，车体侧面的轮廓才读得出来。
+	# 一盏不投影的平行光，开销可以忽略，所以它不随画质档位关闭——
+	# 低画质玩家同样需要看得见敌人。
 	_fill = DirectionalLight3D.new()
 	_fill.rotation_degrees = Vector3(-62.0, 140.0, 0.0)
 	_fill.light_energy = 0.3
@@ -5030,8 +5052,9 @@ func _build_environment() -> void:
 	_apply_terrain_env()
 
 
-## 把当前地形的色调写进天空、太阳、雾与地面材
-## 只改颜色与强度，不碰任何几何或玩法参数，所以换地形不会影响判定## 具体开哪些后处理仍_apply_quality 的档位决
+## 把当前地形的色调写进天空、太阳、雾与地面材质。
+## 只改颜色与强度，不碰任何几何或玩法参数，所以换地形不会影响判定；
+## 具体开哪些后处理仍由 _apply_quality 的档位决定。
 func _apply_terrain_env() -> void:
 	var t: Dictionary = TERRAINS[terrain]
 	var sky_lum: float = (
@@ -5043,26 +5066,26 @@ func _apply_terrain_env() -> void:
 		_sky_mat.set_shader_parameter("sky_horizon_color", t["sky_hor"])
 		_sky_mat.set_shader_parameter("ground_bottom_color", t["gnd_bot"])
 		_sky_mat.set_shader_parameter("ground_horizon_color", t["gnd_hor"])
-		# 夜空才有星。阈值取 0.14：白天图最高的地平亮度都在 0.4 以上
-		# 夜战图的天空亮度只有 0.1 左右，这条线不会误伤黄昏
+		# 夜空才有星。阈值取 0.14：白天图最高的地平亮度都在 0.4 以上，
+		# 夜战图的天空亮度只有 0.1 左右，这条线不会误伤黄昏图。
 		_sky_mat.set_shader_parameter("star_amount", clampf((0.14 - sky_lum) * 9.0, 0.0, 1.0))
 		_sky_mat.set_shader_parameter("cloud_amount", _cloud_cover())
-		# 夜里的主光是月亮：盘面更大、更暗；白天是硬而小的太阳盘
+		# 夜里的主光是月亮：盘面更大、更暗；白天是硬而小的太阳盘。
 		var night := sky_lum < 0.14
 		_sky_mat.set_shader_parameter("sun_size", 0.030 if night else 0.014)
 		_sky_mat.set_shader_parameter("sun_disk_energy", 0.85 if night else 1.5)
 	if _env != null:
-		# 环境光整体收 14%：原0.88~1.30 的天空光把暗部抬到与受光面接近，
-		# 墙根、车底与炮塔侧面全被压平成同一档亮度，画面因此没有体积
-		# 压缩之后仍留足量天空成分（敌车可读性由涂装RIM/EMISSION 兜底
-		# 验收tools/vis_probe.gd enemyLum
+		# 环境光整体收 14%：原来 0.88~1.30 的天空光把暗部抬到与受光面接近，
+		# 墙根、车底与炮塔侧面全被压平成同一档亮度，画面因此没有体积。
+		# 压缩之后仍留足量天空成分（敌车可读性由涂装的 RIM/EMISSION 兜底，
+		# 验收见 tools/vis_probe.gd 的 enemyLum）。
 		_env.ambient_light_energy = float(t["ambient"]) * 0.80
 		# 天空当环境光源时，ambient_light_energy 乘的是天空颜色而不是光量，
-		# 所以夜图这种天空接近黑的地形，系数填多少都等于没填
-		# 这里按天空亮度缺多少就掺多少显式环境色，给环境光一个与色调无关的底
+		# 所以夜图这种天空接近黑的地形，系数填多少都等于没填。
+		# 这里按天空亮度缺多少就掺多少显式环境色，给环境光一个与色调无关的底。
 		var fill_share := clampf(1.0 - sky_lum / AMBIENT_SKY_REF, 0.0, AMBIENT_FILL_MAX)
 		_env.ambient_light_sky_contribution = 1.0 - fill_share
-		# 补的天上散下来的，所以取补光色往白里提一点，而不是直接用白光
+		# 补的是"天上散下来的光"，所以取补光色往白里提一点，而不是直接用白光
 		_env.ambient_light_color = (t["fill"] as Color).lerp(Color(1, 1, 1), 0.35)
 		_env.fog_light_color = t["fog"]
 		_env.fog_density = t["fog_density"]
@@ -5073,16 +5096,16 @@ func _apply_terrain_env() -> void:
 	if _sun != null:
 		_sun.light_color = t["sun"]
 		_sun.light_energy = t["sun_energy"]
-		# 太阳高度角封44°。正午顶光只会照亮墙顶与车顶，把立面压成暗块
-		# 整张图因此失去体积；压到 44° 以下，墙的立面、车身侧面才吃得到光
+		# 太阳高度角封顶 44°。正午顶光只会照亮墙顶与车顶，把立面压成暗块，
+		# 整张图因此失去体积；压到 44° 以下，墙的立面、车身侧面才吃得到光。
 		var sun_rot: Vector3 = t["sun_rot"]
 		sun_rot.x = maxf(sun_rot.x, -44.0)
 		_sun.rotation_degrees = sun_rot
 	if _fill != null:
 		_fill.light_color = t["fill"]
-		# 补光强度与阳*实际光量**反向（强× 颜色亮度，不是强度本身）
+		# 补光强度与阳光**实际光量**反向（强度 × 颜色亮度，不是强度本身）：
 		# 偏暖偏冷的太阳颜色亮度能差三成，只看 sun_energy 会把橙色低阳的图
-		# 误判阳光很足"，于是该补的光没补上，暗图上的坦克只剩一团黑
+		# 误判成"阳光很足"，于是该补的光没补上，暗图上的坦克只剩一团黑影。
 		var sun_power := float(t["sun_energy"]) * float((t["sun"] as Color).get_luminance())
 		_fill.light_energy = lerpf(0.62, 0.30, clampf(sun_power / 1.3, 0.0, 1.0))
 	if _ground_mi != null:
@@ -5100,7 +5123,7 @@ func _apply_terrain_env() -> void:
 		_ridge_mat_far.albedo_color = fog.lerp(sky, 0.40).darkened(0.22)
 
 
-## 云量按地形给：沙暴与雪原最厚，夜战最薄（要留出星空）
+## 云量按地形给：沙暴与雪原最厚，夜战最薄（要留出星空）。
 func _cloud_cover() -> float:
 	match terrain_name():
 		"沙漠风暴":
@@ -5119,10 +5142,10 @@ func _cloud_cover() -> float:
 			return 0.34
 
 
-## 每张地形一套分级。以前十二张图共1.08 / 1.06 一组值，
-## 于是"夜战"沙漠"只是换了天空颜色，整体反差与饱和度完全一
-## 这里只调三个最稳的旋钮：饱和度、对比度、亮
-## 夜战降饱和提对比（冷、硬），丛林提饱和（湿绿），雪原降饱和（避免蓝得发假
+## 每张地形一套分级。以前十二张图共用 1.08 / 1.06 一组值，
+## 于是"夜战"和"沙漠"只是换了天空颜色，整体反差与饱和度完全一样。
+## 这里只调三个最稳的旋钮：饱和度、对比度、亮度。
+## 夜战降饱和提对比（冷、硬），丛林提饱和（湿绿），雪原降饱和（避免蓝得发假）。
 func _apply_grading() -> void:
 	if _env == null:
 		return
@@ -5157,11 +5180,11 @@ func _apply_grading() -> void:
 	_env.adjustment_brightness = bri
 
 
-## 曝光 = 玩家的亮度设× 该地形的曝光补偿##
+## 曝光 = 玩家的亮度设置 × 该地形的曝光补偿。
 ## 补偿是必要的：ACES 曲线在低光端压得很狠，夜战与熔岩这类图把太阳和地面色
-## 一起压暗之后，画面落在曲线最平的那一段，再怎么调环境光也只是把黑抬成深
-## 曝光补偿作用在色调映射之前，等于"给这张图换一档快，整体提亮而不改相对对比，
-## 所以暗图仍然比亮图暗，只是不再暗到看不见车
+## 一起压暗之后，画面落在曲线最平的那一段，再怎么调环境光也只是把黑抬成深灰。
+## 曝光补偿作用在色调映射之前，等于"给这张图换一档曝光"，整体提亮而不改相对对比，
+## 所以暗图仍然比亮图暗，只是不再暗到看不见车。
 func _apply_exposure() -> void:
 	if _env == null:
 		return
@@ -5169,7 +5192,7 @@ func _apply_exposure() -> void:
 	_env.tonemap_exposure = Settings.brightness * float(t.get("exposure", 1.0))
 
 
-## 画质档位：低档只留雾与阴影，中档SSAO + 体积雾，高档再开 SSIL SDFGI
+## 画质档位：低档只留雾与阴影，中档加 SSAO + 体积雾，高档再开 SSIL 与 SDFGI。
 func _apply_quality(level: int) -> void:
 	if _env == null:
 		return
@@ -5178,22 +5201,17 @@ func _apply_quality(level: int) -> void:
 
 	_env.ssao_enabled = mid
 	_env.ssil_enabled = high
-	# SDFGI
-	# 96 m 见方的平坦战场上只会帮倒忙：它的级联是规则的正方形格子
-	# 铺在整片地面上就是一张随镜头移动的棋盘，近处尤其明显（实
-	# tools/shots/vis 的港
-	# 夜战图，地面被切
-	# 1 m 左右的方块）
-	# 这张图的 GI 需求本来就低——天
-	# + 一盏平行光 + 雾，关掉之后
-	# 墙根与车底的接触阴影
-	# SSAO 负责，画面反而更干净，也省下 1~2 ms
+	# SDFGI 在 96 m 见方的平坦战场上只会帮倒忙：它的级联是规则的正方形格子，
+	# 铺在整片地面上就是一张随镜头移动的棋盘，近处尤其明显（实测
+	# tools/shots/vis 的港区 / 夜战图，地面被切成 1 m 左右的方块）。
+	# 这张图的 GI 需求本来就低——天空 + 一盏平行光 + 雾，关掉之后
+	# 墙根与车底的接触阴影由 SSAO 负责，画面反而更干净，也省下 1~2 ms。
 	_env.sdfgi_enabled = false
 	_env.fog_enabled = true
 	_env.volumetric_fog_enabled = mid
 	_env.glow_enabled = mid
 	_env.adjustment_enabled = mid
-	# 曝光不归画质管：它是可读性的总开关，低画质下同样要生
+	# 曝光不归画质管：它是可读性的总开关，低画质下同样要生效
 	_apply_exposure()
 
 	if _sun != null:
