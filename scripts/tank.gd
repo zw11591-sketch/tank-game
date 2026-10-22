@@ -77,7 +77,35 @@ var game: Node
 var arena: Arena
 
 var alive := true
+## 最后打中这辆车的射手。用于把"击毁"记到真正开火的人头上：
+## 合作模式下房主会替客户端结算伤害，不能把队友的战绩算进房主统计。
+## 不写 `: Tank`：在类体内引用自身类型会让解析器陷入循环依赖。
+var last_shooter = null
 var is_player := false
+## 本机玩家：只有本地玩家读输入、挂相机、写个人统计。
+## 与 is_player 分开是联机的关键：房主那份"队友的车"仍然是 is_player=true
+## （AI 要把它当目标、伤害要算在它身上），但它不是 is_local。
+var is_local := false
+## 客户端上的远端对象：不跑输入/AI/物理推进，只按快照插值。
+var is_remote := false
+var peer_id := 0
+var net_id := 0
+## 合作模式目前只有 0/1 两队；留这个字段是为了以后加 PvP 时友伤与雷达不用重写。
+var team := 0
+
+## ---- 网络插值 ----
+## 快照 25Hz，直接赋值会让远端车一跳一跳。这里保留上一帧与目标位姿，
+## 在物理帧里用约 100ms 追上去；本地玩家不经过这条路。
+const NET_INTERP := 0.10
+var _net_from_pos := Vector3.ZERO
+var _net_to_pos := Vector3.ZERO
+var _net_from_yaw := 0.0
+var _net_to_yaw := 0.0
+var _net_from_turret := 0.0
+var _net_to_turret := 0.0
+var _net_to_pitch := 0.0
+var _net_t := 1.0
+var _net_ready := false
 var display_name := "坦克"
 
 # --- 机动 ---
@@ -781,7 +809,85 @@ func _physics_process(delta: float) -> void:
 		if shield_t > 0.0:
 			_shield_mesh.scale = Vector3.ONE * (1.0 + sin(Time.get_ticks_msec() * 0.006) * 0.04)
 
+	if is_remote:
+		_apply_net_interp(delta)
+		# 远端对象的 tick() 在 Player / Enemy 里会直接返回；这里保留调用是为了
+		# 以后加"远端换弹动画"之类只读状态时不用再改基类。
+		tick(delta)
+		return
+
 	tick(delta)
+
+
+## 远端对象按快照插值。位置与车体朝向用 lerp，炮塔与俯仰直接跟目标——
+## 炮塔本来就该"指哪打哪"，多一层插值只会让远端队友的炮口看起来发黏。
+func _apply_net_interp(delta: float) -> void:
+	if not _net_ready:
+		return
+	_net_t = minf(1.0, _net_t + delta / NET_INTERP)
+	var k := _net_t
+	global_position = _net_from_pos.lerp(_net_to_pos, k)
+	rotation.y = lerp_angle(_net_from_yaw, _net_to_yaw, k)
+	if turret != null:
+		turret.rotation.y = lerp_angle(_net_from_turret, _net_to_turret, k)
+	if barrel != null:
+		barrel.rotation.x = _net_to_pitch
+	_animate_tracks(delta)
+	_animate_suspension(delta)
+
+
+## 应用一条网络状态。只对 is_remote 生效；本地玩家只同步 hp/alive，
+## 位置永远由本地输入决定。
+func apply_net_state(pos: Vector3, yaw: float, turret_world_yaw: float, pitch: float,
+		speed: float, net_hp: int, net_alive: bool = true) -> void:
+	# 本地玩家的位置永远由本地输入决定，网络只回写房主权威的 hp。
+	if is_local:
+		hp = net_hp
+		return
+	if not net_alive:
+		net_die()
+		return
+	if not _net_ready:
+		_net_ready = true
+		global_position = pos
+		rotation.y = yaw
+		_net_from_pos = pos
+		_net_to_pos = pos
+		_net_from_yaw = yaw
+		_net_to_yaw = yaw
+		if turret != null:
+			turret.rotation.y = wrapf(turret_world_yaw - yaw, -PI, PI)
+		if barrel != null:
+			barrel.rotation.x = pitch
+		_speed = speed
+	else:
+		_net_from_pos = global_position
+		_net_to_pos = pos
+		_net_from_yaw = rotation.y
+		_net_to_yaw = yaw
+		if turret != null:
+			_net_from_turret = turret.rotation.y
+			_net_to_turret = wrapf(turret_world_yaw - yaw, -PI, PI)
+		_net_to_pitch = pitch
+		_net_t = 0.0
+		_speed = speed
+	hp = net_hp
+
+
+## 客户端按房主死亡事件收尾：只播表现，不结算分数、不扣命。
+## 房主那边已经走过 on_tank_destroyed()，两条路径不会互相污染。
+func net_die() -> void:
+	if not alive:
+		return
+	alive = false
+	var fx_root = game.get("fx_root") if game != null else null
+	if fx_root != null:
+		Fx.explosion(fx_root, global_position + Vector3(0, 1.2, 0), 1.6)
+	if arena != null:
+		arena.add_scorch(global_position, 1.3)
+	Audio.play_3d("boom", global_position)
+	_spawn_wreck()
+	queue_free()
 
 
 func tick(_delta: float) -> void:
@@ -1979,7 +2085,7 @@ func fire() -> bool:
 		return false
 	reload_t = reload_time
 	shot_count += 1
-	if is_player:
+	if is_local:
 		# 命中率的分母。放在这里而不是 spawn_shell：多弹装填一次击发会生成三发炮弹，
 		# 按炮弹数统计会让命中率莫名其妙地除以三。
 		Stats.add_shot()
@@ -2003,24 +2109,35 @@ func fire() -> bool:
 	# 正好落在准星上的低抛弹道。于是换弹种不改变瞄准方式——准星压住谁就打中谁。
 	if kind == Shell.Kind.HE:
 		dir = he_dir(origin, dir)
-	game.spawn_shell(self, origin, dir, kind)
-	# 多弹装填：左右各加一发小散布，正面弹幕厚一倍但不改单发伤害
-	if multi_t > 0.0:
-		for s in [-1.0, 1.0]:
-			game.spawn_shell(self, origin, dir.rotated(Vector3.UP, deg_to_rad(2.4) * s), kind)
+	# 联机时这里只"提交击发"：客户端把起点/方向交给房主，房主生成炮弹并广播；
+	# 单机与房主则直接生成。多弹装填的散射也放在 Net 里统一处理，避免客户端
+	# 连发三次都被房主的装填冷却挡掉。
+	game.submit_shot(self, origin, dir, kind)
+	play_fire_fx(dir, kind)
+	return true
+
+
+## 开火表现：炮口焰、分口径炮声。房主替远端玩家开火时也调用它，
+## 于是队友的炮在房主与其他人那里同样有火光和声音。
+##
+## 传入实际打出的弹种：房主那份"队友的车"只知道自己的 shell_kind 默认值，
+## 用它选音效会让客户端切到 HE 之后，别人听到的还是 AP 的清脆炮声。
+func play_fire_fx(dir: Vector3, fired_kind := -1) -> void:
+	if game == null:
+		return
 	Fx.muzzle_flash(game.fx_root, muzzle_pos(), dir)
 	# 分口径炮声：小 / 中 / 大三档，HE 另有一档更闷的。
 	# 侦察车和歼击车原来共用同一段波形，听感上打不出区别——
 	# 而"这一发有多重"恰恰应该先从耳朵里知道。
+	var k: int = fired_kind if fired_kind >= 0 else shell_kind
 	var sfx := "shoot_m"
-	if kind == Shell.Kind.HE:
+	if k == Shell.Kind.HE:
 		sfx = "shoot_he"
 	elif damage >= 150:
 		sfx = "shoot_l"
 	elif damage < 80:
 		sfx = "shoot_s"
 	Audio.play_3d(sfx, muzzle_pos())
-	return true
 
 
 ## 由炮弹在"确实碰到敌车"时调用（跳弹、护盾也算碰到）。
@@ -2032,7 +2149,10 @@ func claim_hit(id: int) -> void:
 	if id != _shot_id or _hit_claimed:
 		return
 	_hit_claimed = true
-	Stats.add_hit()
+	# 只有本机玩家的命中才写进本机统计。房主那份"队友的车"也会命中，
+	# 但那是队友的战绩，不能算到房主头上。
+	if is_local:
+		Stats.add_hit()
 
 
 func toggle_shell() -> void:
@@ -2086,8 +2206,8 @@ func take_hit(amount: int, from_pos: Vector3, kind: int, out_dmg: Array = [],
 	hit_count += 1
 	if shield_t > 0.0:
 		Audio.play_3d("steel", global_position)
-		if is_player and game.has_method("on_player_blocked"):
-			game.on_player_blocked("护盾", amount)
+		if is_local and game.has_method("on_player_blocked"):
+			game.on_player_blocked(self, "护盾", amount)
 		return "shield"
 
 	var ang := impact_angle(from_pos)
@@ -2104,8 +2224,8 @@ func take_hit(amount: int, from_pos: Vector3, kind: int, out_dmg: Array = [],
 			# 玩家自己跳掉了一发，必须有反馈：这是"斜摆车身有用"唯一的学习途径。
 			# 原来这里是直接 return，玩家既看不到方向指示也听不到提示，
 			# 只会以为对方打偏了。
-			if is_player and game.has_method("on_player_blocked"):
-				game.on_player_blocked("跳弹", int(round(amount * armor_front)))
+			if is_local and game.has_method("on_player_blocked"):
+				game.on_player_blocked(self, "跳弹", int(round(amount * armor_front)))
 			return "ricochet"
 	elif zone_i == 2:
 		mult = armor_rear
@@ -2120,8 +2240,10 @@ func take_hit(amount: int, from_pos: Vector3, kind: int, out_dmg: Array = [],
 		out_dmg[0] = dmg
 	if out_dmg.size() > 1:
 		out_dmg[1] = zone
-	if is_player and game.has_method("on_player_hit"):
-		game.on_player_hit(from_pos, dmg)
+	if is_local and game.has_method("on_player_hit"):
+		game.on_player_hit(self, from_pos, dmg)
+	elif game.has_method("net_note_player_hit"):
+		game.net_note_player_hit(self, from_pos, dmg)
 
 	var spark_at := at
 	if spark_at == Vector3.INF:
@@ -2146,4 +2268,11 @@ func destroy(_by_shell: bool) -> void:
 	Audio.play_3d("boom", global_position)
 	game.on_tank_destroyed(self)
 	_spawn_wreck()
+	queue_free()
+
+
+## 联机：远端对象在房主那边已经结算过，这里只负责把"这个 net_id 已经不存在"
+## 从注册表里摘掉，免得快照每帧都在找一辆已经释放的车。
+func free_for_net() -> void:
+	alive = false
 	queue_free()

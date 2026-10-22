@@ -26,6 +26,9 @@ var _base_bar: Bar
 var _buff_l: Label
 var _lives_l: Label
 var _feed_l: Label
+## 合作模式的队友状态：名字、血量、剩余命数。阵亡的队友仍在名册里，
+## 所以这里按名册画，而不是按场上的车——否则"阵亡"两个字永远不出现。
+var _team_l: Label
 
 ## 战斗结果提示（击穿 / 跳弹 / 击毁 / 格挡）。画在准星下方，
 ## 因为玩家的视线就在准星附近：放在屏幕角落等于不提示。
@@ -53,6 +56,9 @@ func _ready() -> void:
 	_stage_l = _label(Vector2(20, 44), 19, Color(0.62, 0.78, 1.0), HORIZONTAL_ALIGNMENT_LEFT, 520)
 	_combo_l = _label(Vector2(20, 70), 21, Color(1.0, 0.72, 0.25), HORIZONTAL_ALIGNMENT_LEFT, 320)
 	_enemy_l = _label(Vector2(-340, 14), 21, Color(1.0, 0.62, 0.55), HORIZONTAL_ALIGNMENT_RIGHT, 320)
+	# 队友状态挂在左上角分数/关卡下方，最多三行，不会撞到中上方的隐蔽指示灯。
+	_team_l = _label(Vector2(20, 104), 16, Color(0.55, 1.0, 0.62), HORIZONTAL_ALIGNMENT_LEFT, 460)
+	_team_l.visible = false
 
 	# 底部状态区
 	_hp_bar = Bar.new()
@@ -254,7 +260,22 @@ func _process(_delta: float) -> void:
 	_hint_l.size = Vector2(900, 120)
 	_lives_l.position = Vector2(20, vp.y - 204)
 	_lives_l.size = Vector2(300, 24)
-	_lives_l.text = "剩余战车 ×%d" % maxi(game.lives, 0)
+	if Net.is_multiplayer():
+		# 合作模式：自己的命数与队友存活数一起显示。单机的 game.lives
+		# 是"本机还剩几条"，多人下每条命归属各自的 peer。
+		var mates := 0
+		var mates_alive := 0
+		for t in game.players:
+			if t != game.player and is_instance_valid(t):
+				mates += 1
+				if t.alive:
+					mates_alive += 1
+		_lives_l.text = "战车 ×%d   队友 %d/%d" % [game.my_lives(), mates_alive, mates]
+		_team_l.text = _team_text()
+		_team_l.visible = not _team_l.text.is_empty()
+	else:
+		_lives_l.text = "剩余战车 ×%d" % maxi(game.lives, 0)
+		_team_l.visible = false
 	_feed_l.position = Vector2(vp.x - 420, 46)
 	_feed_l.size = Vector2(400, 120)
 	_feed_l.text = _feed_text()
@@ -320,6 +341,27 @@ func _feed_text() -> String:
 	var lines: Array = []
 	for f in _feed:
 		lines.append(String(f["text"]))
+	return "\n".join(lines)
+
+
+## 合作模式的队友状态。名册是权威：队友阵亡后他的车会从场上移除，
+## 但名册里仍然有这一行（带命数），所以"阵亡 · 命 ×2"能被画出来。
+## 名字与命数都取自房主同步的 Net.players，血量取自快照回写到车上的值。
+func _team_text() -> String:
+	var lines: Array = []
+	for row in Net.get_players_array():
+		var pid := int(row.get("pid", 0))
+		if pid == Net.local_pid():
+			continue
+		var nm := String(row.get("name", "队友"))
+		if nm.is_empty():
+			nm = "队友"
+		var lives := int(row.get("lives", 0))
+		var t = game.player_for_pid(pid) if game.has_method("player_for_pid") else null
+		if t != null and is_instance_valid(t) and t.alive:
+			lines.append("%s   %d/%d   命 ×%d" % [nm, int(t.hp), int(t.max_hp), lives])
+		else:
+			lines.append("%s   阵亡   命 ×%d" % [nm, lives])
 	return "\n".join(lines)
 
 
@@ -727,6 +769,18 @@ class Radar extends Control:
 		draw_colored_polygon(PackedVector2Array([
 			c + Vector2(0, -7), c + Vector2(-5, 5), c + Vector2(5, 5),
 		]), Color(0.5, 1.0, 0.55))
+		# 队友：绿色实心点 + 炮口朝向。合作模式下"队友在哪"是比敌人
+		# 更需要一眼确认的信息，否则四辆车很容易在同一格走廊里对顶。
+		for t in g.players:
+			if not is_instance_valid(t) or not t.alive or t == p:
+				continue
+			var tv := _map(t.global_position, origin, yaw, r)
+			if tv == Vector2.INF:
+				continue
+			var tc := Color(0.45, 1.0, 0.60)
+			draw_circle(c + tv, 3.2, tc)
+			var ty: float = t.rotation.y + t.turret.rotation.y - yaw
+			draw_line(c + tv, c + tv + Vector2(-sin(ty), -cos(ty)) * 7.0, tc, 1.5)
 
 	## 世界坐标 -> 雷达局部坐标；超出量程返回 Vector2.INF
 	func _map(w: Vector3, origin: Vector3, yaw: float, r: float) -> Vector2:
@@ -851,6 +905,26 @@ class NamePlates extends Control:
 				draw_string(ThemeDB.fallback_font, sp + Vector2(-60, -h - 6.0),
 						"指挥车", HORIZONTAL_ALIGNMENT_CENTER, 120, 15,
 						Color(1.0, 0.6, 0.2, base_a))
+
+		# 队友名牌：绿色，不画血条——队友的血量已经在 HUD 左下的小字里，
+		# 战场上只需要"那是谁、在哪个方向"。本地玩家自己不画。
+		for t in g.players:
+			if not is_instance_valid(t) or not t.alive or t == p:
+				continue
+			var world: Vector3 = t.global_position + Vector3(0, 2.8, 0)
+			if cam.is_position_behind(world):
+				continue
+			var sp: Vector2 = cam.unproject_position(world)
+			if sp.x < -80.0 or sp.y < -40.0 or sp.x > size.x + 80.0 or sp.y > size.y + 40.0:
+				continue
+			var nm := String(t.get("display_name"))
+			if nm.is_empty():
+				nm = "队友"
+			var a: float = clampf(1.2 - eye.distance_to(t.global_position) / (Radar.RANGE + 6.0),
+					0.35, 0.95)
+			draw_string(ThemeDB.fallback_font, sp + Vector2(-60, 0),
+					nm, HORIZONTAL_ALIGNMENT_CENTER, 120, 14,
+					Color(0.55, 1.0, 0.65, a))
 
 
 ## 受击暗角：被击中时屏幕边缘压红，血量低于 25% 时持续搏动。

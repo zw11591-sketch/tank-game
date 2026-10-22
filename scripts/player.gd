@@ -198,7 +198,7 @@ var _engine: AudioStreamPlayer3D
 ##
 ## 只锁存按下、不锁存松开：排上的那一发不会因为松手被取消（点击就该打出去）。
 func _unhandled_input(event: InputEvent) -> void:
-	if not alive:
+	if not alive or not is_local:
 		return
 	if event.is_action_pressed("fire"):
 		_fire_latch = true
@@ -301,7 +301,9 @@ func apply_difficulty(diff: int) -> void:
 
 
 func tick(delta: float) -> void:
-	if not alive or rig == null:
+	# 远端队友的车在房主 / 客户端两侧都只是快照复制品：不读输入、不推进物理。
+	# 它们的位置与朝向由 Tank._apply_net_interp() 负责。
+	if not is_local or not alive or rig == null:
 		return
 
 	boost_cd = maxf(0.0, boost_cd - delta)
@@ -802,7 +804,12 @@ func _drop_smoke() -> void:
 	smoke_t = SMOKE_TIME
 	smoke_cd = smoke_cd_max
 	Audio.play("smoke")
-	game.deploy_smoke(global_position, SMOKE_TIME)
+	# 本地立刻生成一团，手感不依赖网络往返；联机时房主还需要知道，
+	# 因为敌人的视线判定在房主那边（Net.request_smoke 会在房主侧再广播给其他人）。
+	var owner_id := Net.local_pid() if Net.is_client() else 0
+	game.deploy_smoke(global_position, SMOKE_TIME, owner_id)
+	if Net.is_client():
+		Net.request_smoke(global_position, SMOKE_TIME)
 
 
 func is_smoked() -> bool:

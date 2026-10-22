@@ -257,6 +257,9 @@ func _update_engine_pitch() -> void:
 # ---------------- 主循环 ----------------
 
 func tick(delta: float) -> void:
+	# 客户端上的敌车是快照复制品，AI 只在房主那边跑。
+	if is_remote:
+		return
 	if not alive:
 		sees_player = false
 		return
@@ -311,6 +314,10 @@ func tick(delta: float) -> void:
 
 
 func _pick_target() -> Tank:
+	# 合作模式下有多名真人。敌人打最近的那辆，而不是永远盯着"房主 / 客户端自己"。
+	# 目标选择放在 game 里，是因为这里不应该知道谁是本机玩家。
+	if game != null and game.has_method("nearest_player"):
+		return game.nearest_player(global_position)
 	var p = game.player
 	if p != null and is_instance_valid(p) and p.alive:
 		return p

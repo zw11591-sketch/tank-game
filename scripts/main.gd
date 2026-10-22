@@ -45,6 +45,9 @@ var rig: CameraRig
 var hud: HUD
 
 var player: Player = null
+## 合作模式：场上全部真人车（房主侧包含所有客户端，客户端侧包含本地与远端队友）。
+## `player` 始终是本机那名玩家的别名，HUD / 相机 / 输入都继续读它。
+var players: Array = []
 var enemies: Array = []
 var powerups: Array = []
 var damage_marks: Array = []
@@ -126,6 +129,28 @@ var _sel_terrain := -1
 ## 暂停菜单里的设置项游标
 var _opt_row := 0
 
+## ---- 联机 ----
+## 本关地图种子。单机沿用 Arena 的固定种子；联机时由房主下发，
+## 客户端用同一个种子重建同一张图，于是不必同步几何。
+var _stage_seed := 0
+var _lobby_layer: CanvasLayer
+var _lobby: NetLobby
+## 客户端从快照读到的"剩余敌军"。客户端不跑出怪队列，HUD 只能信房主。
+var net_remaining := -1
+## 客户端上最近一次应用的基地加固状态，用来避免每帧重复重建围墙。
+var net_fortify := false
+## 客户端本发炮弹是否已经记过命中（uid -> true）。一发多弹 / HE 溅射可能
+## 收到多条反馈，命中率只该加一次。
+var _net_hit_claimed: Dictionary = {}
+## 房主侧：等待重生的玩家 [{pid, t}]。
+var _net_respawn: Array = []
+## 房主侧：每个客户端最近一次上报的位置与时刻，用来做位移校验。
+var _client_last: Dictionary = {}
+## 位移校验累计拉回次数。联机排查时看一眼就知道"是网络抖还是有人在瞬移"。
+var _net_pullbacks := 0
+## 收到的客户端状态包数量。联机探针用它区分"客户端没发"与"房主没应用"。
+var _net_client_updates := 0
+
 const DIFF_NAMES := ["简单", "普通", "困难"]
 const SELECT_ROWS := 4
 
@@ -179,7 +204,18 @@ func _ready() -> void:
 	add_child(hud)
 
 	_build_menu()
+	# 联机：注册主协调器、监听房主事件、建好局域网大厅。大厅本身只是一个
+	# 覆盖层，单机玩家永远不会看到它。
+	Net.setup_game(self)
+	Net.match_started.connect(_on_net_match_started)
+	Net.match_ended.connect(_on_net_match_ended)
+	Net.session_ended.connect(_on_net_session_ended)
+	arena.cell_destroyed.connect(_on_arena_cell_destroyed)
+	_build_lobby()
 	_enter_title()
+	# 启动参数最后处理：--host / --join 会在标题建好之后再进大厅，
+	# 否则随后的 _enter_title() 会把刚建好的房间页关掉。
+	_parse_cmdline()
 
 
 # ---------------- 输入 ----------------
@@ -203,8 +239,14 @@ func _unhandled_input(event: InputEvent) -> void:
 
 	match state:
 		"title":
-			if event.is_action_pressed("ui_accept"):
+			if event is InputEventKey and event.pressed and not event.echo \
+					and (event as InputEventKey).keycode == KEY_L:
+				_enter_lobby()
+			elif event.is_action_pressed("ui_accept"):
 				_enter_select()
+		"lobby":
+			if event.is_action_pressed("ui_cancel"):
+				_leave_lobby_to_title()
 		"select":
 			if event.is_action_pressed("ui_up"):
 				_sel_row = posmod(_sel_row - 1, SELECT_ROWS)
@@ -227,7 +269,7 @@ func _unhandled_input(event: InputEvent) -> void:
 			if event.is_action_pressed("pause") or event.is_action_pressed("ui_accept"):
 				_set_pause(false)
 			elif event.is_action_pressed("back_to_title"):
-				_enter_title()
+				_leave_lobby_to_title()
 			elif event.is_action_pressed("ui_up"):
 				_move_option(-1)
 			elif event.is_action_pressed("ui_down"):
@@ -238,9 +280,12 @@ func _unhandled_input(event: InputEvent) -> void:
 				_adjust_option(1)
 		"over", "win":
 			if event.is_action_pressed("restart"):
-				_confirm_start()
+				# 联机时不提供"再来一局"：那会在还连着房间的情况下起一局单机，
+				# 名册、命数与种子都不同步。回标题即退出房间，重开由房主重新建房。
+				if not Net.is_multiplayer():
+					_confirm_start()
 			elif event.is_action_pressed("ui_cancel") or event.is_action_pressed("ui_accept"):
-				_enter_title()
+				_leave_lobby_to_title()
 
 
 ## 鼠标捕获只跟状态挂钩：战斗相关状态一律捕获，菜单与结算一律放开。
@@ -254,11 +299,14 @@ func _refresh_mouse_mode() -> void:
 
 func _set_pause(on: bool) -> void:
 	if on:
+		if state == "pause":
+			return
 		_state_before_pause = state
 		state = "pause"
-		# 暂停必须真的把战场停住：炮弹还在飞、冷却还在走、连击窗口还在流逝的
-		# 暂停只是"看不见"，不是"没发生"。
-		get_tree().paused = true
+		# 联机时暂停是本地覆盖层：房主那边还在跑 AI 与炮弹，客户端也不能
+		# 把整棵树停掉（停了就收不到快照了）。单机才真的冻结战场。
+		if not Net.is_multiplayer():
+			get_tree().paused = true
 		_refresh_mouse_mode()
 		_show_menu("", _pause_text())
 		_bg.modulate = Color(0.35, 0.35, 0.4, 0.92)
@@ -284,6 +332,10 @@ func _adjust_option(d: int) -> void:
 
 func _pause_text() -> String:
 	var lines: Array = ["— 暂 停 —", ""]
+	# 联机时这里只是本地覆盖层：战场仍在继续，说清楚免得玩家以为队友也停了。
+	if Net.is_multiplayer():
+		lines.append("联机中：仅自己打开菜单，战场仍在继续")
+		lines.append("")
 	var rows: Array = Settings.option_rows()
 	for i in rows.size():
 		lines.append("%s %-12s %s" % [
@@ -349,25 +401,37 @@ func _process(delta: float) -> void:
 
 	match state:
 		"ready":
-			state_timer -= delta
-			if state_timer <= 0.0:
-				state = "play"
-				_refresh_mouse_mode()
-				_banner("出击！", 1.2)
+			# 客户端的倒计时与状态切换由房主快照驱动，本地再减一次会走得更快。
+			if not Net.is_client():
+				state_timer -= delta
+				if state_timer <= 0.0:
+					state = "play"
+					_refresh_mouse_mode()
+					_banner("出击！", 1.2)
 		"play":
 			_update_play(delta)
 		"clear":
-			state_timer -= delta
-			if state_timer <= 0.0:
-				if stage >= MAX_STAGE:
-					_win()
-				else:
-					stage += 1
-					_start_stage()
+			if not Net.is_client():
+				state_timer -= delta
+				if state_timer <= 0.0:
+					if stage >= MAX_STAGE:
+						_win()
+					else:
+						stage += 1
+						_start_stage()
 
 
 func _update_play(delta: float) -> void:
 	_cleanup()
+
+	_engine_t -= delta
+	if _engine_t <= 0.0:
+		_engine_t = 0.4
+		_update_enemy_engines()
+
+	# 客户端只做表现：出怪、掉落、计分、关卡推进全部由房主负责。
+	if Net.is_client():
+		return
 
 	if player == null and lives > 0 and _respawn_t > 0.0:
 		_respawn_t -= delta
@@ -392,10 +456,15 @@ func _update_play(delta: float) -> void:
 		else:
 			_spawn_t = 0.5
 
-	_engine_t -= delta
-	if _engine_t <= 0.0:
-		_engine_t = 0.4
-		_update_enemy_engines()
+	# 房主侧：队友的重生计时。每个 peer 的命数独立，不能共用单机的 _respawn_t。
+	var still: Array = []
+	for item in _net_respawn:
+		item["t"] = float(item["t"]) - delta
+		if float(item["t"]) <= 0.0:
+			_respawn_net_player(int(item["pid"]))
+		else:
+			still.append(item)
+	_net_respawn = still
 
 	if enemies_remaining() == 0 and not _stage_cleared:
 		_stage_cleared = true
@@ -427,6 +496,10 @@ func _physics_process(delta: float) -> void:
 	if state != "play" and state != "ready" and state != "clear":
 		_contact.clear()
 		_motion.clear()
+		return
+	# 互推只由房主/单机做。客户端上远端车由快照插值，本地车由玩家自己开；
+	# 在这一层再推一次会和房主解算的方向打架，表现为两台车被看不见的手拽回去。
+	if Net.is_client():
 		return
 	var list := all_tanks()
 	var live: Dictionary = {}
@@ -559,6 +632,15 @@ func _cleanup() -> void:
 		if is_instance_valid(p):
 			kp.append(p)
 	powerups = kp
+	# 车会被击毁后 queue_free，数组里必须清掉失效引用，
+	# 否则 all_tanks() / human_rids() 每帧都要过滤一遍死对象。
+	var kt: Array = []
+	for t in players:
+		if is_instance_valid(t) and t.alive:
+			kt.append(t)
+	players = kt
+	if player != null and not is_instance_valid(player):
+		player = null
 
 
 # ---------------- 界面流转 ----------------
@@ -568,8 +650,72 @@ func _enter_title() -> void:
 	get_tree().paused = false
 	_refresh_mouse_mode()
 	hud.visible = false
+	if _lobby != null:
+		_lobby.close()
 	_clear_battle()
-	_show_menu("坦 克 大 战 3D", "TANK BATTLE 3D\n\n按 Enter 开始\n\n%s" % _controls_text())
+	_show_menu("坦 克 大 战 3D", "TANK BATTLE 3D\n\n按 Enter 单人出击\n按 L 局域网联机\n\n%s" % _controls_text())
+
+
+## 公开给大厅 / 菜单调用：先离开联机会话，再回标题。
+func enter_title() -> void:
+	_leave_lobby_to_title()
+
+
+func _leave_lobby_to_title() -> void:
+	if Net.is_multiplayer():
+		Net.leave()
+	if _lobby != null:
+		_lobby.close()
+	_enter_title()
+
+
+func _enter_lobby() -> void:
+	state = "lobby"
+	get_tree().paused = false
+	_refresh_mouse_mode()
+	hud.visible = false
+	_hide_menu()
+	if _lobby != null:
+		_lobby.open()
+
+
+func _build_lobby() -> void:
+	_lobby_layer = CanvasLayer.new()
+	_lobby_layer.layer = 9
+	add_child(_lobby_layer)
+	_lobby = NetLobby.new()
+	_lobby.game = self
+	_lobby_layer.add_child(_lobby)
+
+
+## 启动参数：用两个进程（或两台机器）快速验证联机，不必先点进大厅。
+##   --host                 建房并进入大厅房间页
+##   --join=192.168.1.23    直接连房主
+##   --name=车长            覆盖显示名
+##   --port=45888           覆盖 ENet 端口
+##   --discovery-port=45887 覆盖房间发现端口（同机双开时必须改一个）
+func _parse_cmdline() -> void:
+	var want_host := false
+	var join_ip := ""
+	for arg in OS.get_cmdline_user_args():
+		var a := String(arg)
+		if a == "--host":
+			want_host = true
+		elif a.begins_with("--join="):
+			join_ip = a.trim_prefix("--join=")
+		elif a.begins_with("--name="):
+			Settings.player_name = a.trim_prefix("--name=")
+		elif a.begins_with("--port="):
+			Settings.net_port = clampi(int(a.trim_prefix("--port=")), 1024, 65535)
+		elif a.begins_with("--discovery-port="):
+			Settings.discovery_port = clampi(int(a.trim_prefix("--discovery-port=")), 1024, 65535)
+	if not want_host and join_ip.is_empty():
+		return
+	_enter_lobby()
+	if want_host:
+		_lobby.host_from_cmdline()
+	elif not join_ip.is_empty():
+		_lobby.join_from_cmdline(join_ip)
 
 
 func _enter_select() -> void:
@@ -673,27 +819,65 @@ func _confirm_start() -> void:
 func _start_stage() -> void:
 	# 选了具体地形就固定用它；选"随机"则从本局的随机起点开始按关号轮换，
 	# 于是同一局不会重复战场，不同局之间又能走遍全部地形
-	terrain = _sel_terrain if _sel_terrain >= 0 else (_terrain_offset + stage - 1) % Arena.TERRAINS.size()
-	arena.generate(stage, terrain)
+	if Net.is_multiplayer():
+		# 联机时地形与种子由房主在大厅里定，并在 start_match 时写进 match_info；
+		# 单机仍然走下面的随机轮换。
+		terrain = int(Net.match_info.get("terrain", 0))
+		_stage_seed = int(Net.match_info.get("seed", Net.room_seed)) + stage * 7919
+	else:
+		terrain = _sel_terrain if _sel_terrain >= 0 else (_terrain_offset + stage - 1) % Arena.TERRAINS.size()
+		_stage_seed = 0
+	arena.generate(stage, terrain, _stage_seed)
 	# 混响跟着地形走：砖石回廊有尾音、雪原几乎没有。
 	# 于是玩家闭着眼听一发炮也能判断出自己在哪张图上。
 	Audio.set_space(String(Arena.TERRAINS[terrain]["layout"]))
 	_clear_battle()
 	_build_spawn_queue()
 	_stage_cleared = false
-	max_active = mini(2 + int(stage / 2.0), 6)
+	max_active = _net_max_active()
 	_stage_damage_bonus = 0.0
 	_fortify_t = 0.0
 	_spawn_t = 2.0
 	_respawn_t = 0.0
 	_field_t = randf_range(FIELD_DROP_MIN, FIELD_DROP_MAX) * 0.45
 	combo_mult = 1.0
-	_spawn_player()
+	_spawn_players_for_stage()
+	net_fortify = false
 	state = "ready"
 	state_timer = 2.6
 	_refresh_mouse_mode()
 	_banner("第 %d 关  ·  %s  ·  %s" % [stage, terrain_name(), DIFF_NAMES[difficulty]], 2.6)
 	Audio.play("spawn")
+	# 房主把"下一关从哪里开始"发给客户端。客户端不跑 _start_stage，
+	# 收到这条后自己按同一个种子重建同一张地图并落车。
+	if Net.is_host():
+		Net.broadcast_stage_start(stage, terrain, _stage_seed, difficulty)
+
+
+## 同屏敌人上限按人数放宽，但只放宽"同时在场"的数量，不把波次总量翻倍——
+## 四人局要的是更多同时压上来的目标，而不是把一关拖成两倍时长。
+func _net_max_active() -> int:
+	var base: int = mini(2 + int(stage / 2.0), 6)
+	if not Net.is_multiplayer():
+		return base
+	var n: int = maxi(1, Net.players.size())
+	return mini(base + (n - 1), 8)
+
+
+## 合作模式的人数难度：每多一名玩家，敌车血量 +30%。
+##
+## 只加"同时在场"的数量（见 _net_max_active）会让四人局变成四把快刀切豆腐；
+## 血量成长则让每辆车仍然需要被认真对待。两端都用同一份名册算，结果一致；
+## 客户端的敌车是复制品，真正结算伤害的只有房主那份。
+func _scale_enemy_for_coop(e: Enemy) -> void:
+	if not Net.is_multiplayer() or e == null:
+		return
+	var n: int = maxi(1, Net.players.size())
+	if n <= 1:
+		return
+	var m := 1.0 + 0.3 * (n - 1)
+	e.max_hp = int(round(e.max_hp * m))
+	e.hp = e.max_hp
 
 
 func _build_spawn_queue() -> void:
@@ -724,12 +908,21 @@ func _spawn_enemy(t: int) -> bool:
 			continue
 		var e := Enemy.new()
 		e.configure(t, stage, difficulty)
+		_scale_enemy_for_coop(e)
 		e.setup(self, arena, pos)
 		add_child(e)
 		# 主节点是 ALWAYS（为了在暂停里还能读 Esc），所以动态生成的战场单位
 		# 必须显式标成 PAUSABLE，否则它们会跟着主节点一起继续跑。
 		e.process_mode = Node.PROCESS_MODE_PAUSABLE
+		e.net_id = Net.alloc_enemy_id()
+		e.team = 1
+		Net.register_tank(e, e.net_id)
 		enemies.append(e)
+		if Net.is_host():
+			Net.broadcast_enemy_spawn({
+				"id": e.net_id, "type": t, "pos": pos, "hp": e.hp,
+				"stage": stage, "diff": difficulty,
+			})
 		Fx.smoke_puff(fx_root, pos + Vector3(0, 0.45, 0), 0.8)
 		Audio.play_3d("spawn", pos)
 		if t == 4:
@@ -739,27 +932,80 @@ func _spawn_enemy(t: int) -> bool:
 	return false
 
 
-func _spawn_player() -> void:
-	var pos := arena.player_spawn()
+func _spawn_player(at := Vector3.INF, want_tank := "", pid := 0, local := true) -> Player:
+	var pos := at
+	if pos == Vector3.INF:
+		pos = arena.player_spawn()
 	# 重生点如果压着一具还没塌的残骸，先让它塌掉。新车会直接生成在静态碰撞体里，
 	# 而 Tank._settle() 只按网格解交、看不见 LAYER_BLOCKER 上的残骸。
 	arena.collapse_wreck_near(pos, Arena.CELL * 1.2)
-	player = Player.new()
+	var p := Player.new()
 	# 车型必须在 add_child() 之前写入：Player._ready() 按它装配碰撞体尺寸与全部属性
-	player.tank_id = Settings.selected_tank if TankRoster.has(Settings.selected_tank) \
-			else TankRoster.DEFAULT_ID
-	player.rig = rig
-	player.setup(self, arena, pos)
-	add_child(player)
-	player.process_mode = Node.PROCESS_MODE_PAUSABLE
+	p.tank_id = want_tank if TankRoster.has(want_tank) else (
+			Settings.selected_tank if TankRoster.has(Settings.selected_tank) \
+			else TankRoster.DEFAULT_ID)
+	p.peer_id = pid if pid > 0 else (1 if Net.is_offline() else Net.local_pid())
+	p.net_id = p.peer_id
+	p.is_local = local
+	p.is_remote = (not local) and Net.is_multiplayer()
+	var row: Dictionary = Net.players.get(p.peer_id, {}) if Net.is_multiplayer() else {}
+	p.rig = rig if local else null
+	p.setup(self, arena, pos)
+	add_child(p)
+	# 必须在 _ready() 之后再写显示名：Player._ready() 会把它重置成"指挥官"，
+	# 联机名册里的昵称会被这一步吞掉。
+	p.display_name = String(row.get("name", "指挥官"))
+	p.process_mode = Node.PROCESS_MODE_PAUSABLE
 	# 必须在 _ready() 之后，否则基础属性会覆盖难度调整
-	player.apply_difficulty(difficulty)
-	player.damage_mult = 1.0 + _stage_damage_bonus
-	player.shield_t = 3.0
-	rig.reset_to(player)
-	# 玩家出生不再放烟：出生点就在相机正前方 2 米，一团 1.2 米半径的烟
-	# 会直接糊住半个屏幕，开局三秒什么都看不清。护盾特效已经足够提示"车已就位"。
-	Audio.play("spawn")
+	p.apply_difficulty(difficulty)
+	p.damage_mult = 1.0 + _stage_damage_bonus
+	p.shield_t = 3.0
+	players.append(p)
+	Net.register_tank(p, p.net_id)
+	if local:
+		player = p
+		rig.reset_to(p)
+		Audio.play("spawn")
+	return p
+
+
+## 按房主下发的名册把每一名玩家的车摆出来。房主与客户端都调它：
+## 出生点由 Arena.player_spawn_index(i) 按同一个种子算出，不需要同步坐标。
+func _spawn_players_for_stage() -> void:
+	if Net.is_offline():
+		_spawn_player()
+		return
+	var roster: Array = Net.match_info.get("players", [])
+	for entry in roster:
+		var e: Dictionary = entry
+		var pid := int(e.get("pid", 0))
+		var row: Dictionary = Net.players.get(pid, {})
+		# 命数耗尽的玩家这一关不再落车；房主侧的重生事件会在下一关开局时重置。
+		if not row.is_empty() and int(row.get("lives", 3)) <= 0:
+			continue
+		var pos := arena.player_spawn_index(int(e.get("spawn", 0)))
+		var local := pid == Net.local_pid()
+		_spawn_player(pos, String(e.get("tank_id", "")), pid, local)
+	if player == null:
+		_spectate()
+
+
+## 命尽或重生等待中：把镜头交给一名还活着的队友。没有队友就保持自由镜头。
+func _spectate() -> void:
+	var best: Tank = null
+	var best_d := 1.0e9
+	var from: Vector3 = rig.global_position if rig != null else Vector3.ZERO
+	for t in players:
+		if t == player or not is_instance_valid(t) or not t.alive:
+			continue
+		var d := from.distance_squared_to(t.global_position)
+		if d < best_d:
+			best_d = d
+			best = t
+	if best != null:
+		rig.target = best
+	else:
+		rig.target = null
 
 
 func _area_clear(pos: Vector3, r: float) -> bool:
@@ -781,9 +1027,17 @@ func _clear_battle() -> void:
 	for c in get_children():
 		if c is Shell:
 			c.queue_free()
+	for t in players:
+		if is_instance_valid(t):
+			t.queue_free()
+	players.clear()
+	Net.clear_tanks()
 	if player != null and is_instance_valid(player):
 		player.queue_free()
 	player = null
+	_net_respawn.clear()
+	_net_hit_claimed.clear()
+	_client_last.clear()
 	damage_marks.clear()
 	smoke_clouds.clear()
 
@@ -797,35 +1051,98 @@ func _count_active() -> int:
 
 
 func enemies_remaining() -> int:
+	# 客户端没有出怪队列，只能读房主快照里的数字。
+	if Net.is_client() and net_remaining >= 0:
+		return net_remaining
 	return _count_active() + spawn_queue.size()
 
 
 func all_tanks() -> Array:
 	var out: Array = []
-	if player != null and is_instance_valid(player) and player.alive:
-		out.append(player)
+	for p in players:
+		if is_instance_valid(p) and p.alive:
+			out.append(p)
 	for e in enemies:
 		if is_instance_valid(e) and e.alive:
 			out.append(e)
 	return out
 
 
+## 离 pos 最近的存活真人。敌人 AI 用它选择目标。
+func nearest_player(pos: Vector3) -> Tank:
+	var best: Tank = null
+	var best_d := 1.0e18
+	for p in players:
+		if not is_instance_valid(p) or not p.alive:
+			continue
+		var d := pos.distance_squared_to(p.global_position)
+		if d < best_d:
+			best_d = d
+			best = p
+	return best
+
+
+## 玩家车体的 RID 列表。炮弹用它排除友伤：合作模式里队友不打队友，
+## 于是"准星扫过队友"不会莫名其妙地跳一个"跳弹"。
+func human_rids() -> Array:
+	var out: Array = []
+	for p in players:
+		if is_instance_valid(p) and p.alive:
+			out.append(p.get_rid())
+	return out
+
+
+## 某名 peer 的车。房主替客户端结算与重生时用。
+func player_for_pid(pid: int) -> Player:
+	for p in players:
+		if is_instance_valid(p) and int(p.peer_id) == pid:
+			return p
+	return null
+
+
 # ---------------- 供其它脚本调用的接口 ----------------
 
-func spawn_shell(from: Tank, origin: Vector3, dir: Vector3, kind: int) -> void:
+func spawn_shell(from: Tank, origin: Vector3, dir: Vector3, kind: int, uid := 0,
+		visual := false) -> void:
 	var s := Shell.new()
-	s.launch(self, arena, from, origin, dir, kind)
+	s.launch(self, arena, from, origin, dir, kind, uid)
+	s.visual_only = visual
 	add_child(s)
 	s.process_mode = Node.PROCESS_MODE_PAUSABLE
 
 
+## Tank.fire() 的联机入口。Net 内部按角色分流：客户端上报意图，房主生成并广播。
+func submit_shot(from: Tank, origin: Vector3, dir: Vector3, kind: int) -> void:
+	if from == null:
+		return
+	Net.submit_shot(from, origin, dir, kind)
+
+
+## 客户端收到房主的开火事件：生成纯表现炮弹。
+## 远端射手还要补一次炮口焰与炮声——射出端只在它自己的机器上播过，
+## 不然队友的炮在别人眼里就是"没有火光、没有声音"的幽灵炮弹。
+func spawn_visual_shell(net_id: int, origin: Vector3, dir: Vector3, kind: int, uid: int) -> void:
+	var shooter := Net.get_tank(net_id)
+	spawn_shell(shooter, origin, dir, kind, uid, true)
+	if shooter != null and not shooter.is_local:
+		shooter.play_fire_fx(dir, kind)
+
+
 func on_tank_destroyed(t: Tank) -> void:
+	# 死亡由房主广播；客户端只按事件播表现，不会走到这条结算路径。
+	if Net.is_host():
+		Net.broadcast_death(t.net_id, t.global_position, t.rotation.y, 0)
+	Net.unregister_tank(t.net_id)
 	if t.is_player:
-		_on_player_death()
+		_on_player_death(t)
 		return
 
 	_kills += 1
-	Stats.add_kill()
+	# 合作模式下房主会替客户端结算伤害：只有本机玩家打掉的敌人进本机战绩，
+	# 否则房主的"击毁"会被队友的战果灌水。客户端由 net_apply_feedback 记账。
+	if not Net.is_multiplayer() or (t.last_shooter != null \
+			and is_instance_valid(t.last_shooter) and t.last_shooter.is_local):
+		Stats.add_kill()
 	_combo_t = COMBO_WINDOW
 	combo_mult = minf(COMBO_MAX, combo_mult + 0.5)
 	Stats.note_combo(combo_mult)
@@ -845,7 +1162,11 @@ func on_base_destroyed() -> void:
 	_game_over()
 
 
-func on_player_hit(from_pos: Vector3, dmg: int) -> void:
+func on_player_hit(t: Tank, from_pos: Vector3, dmg: int) -> void:
+	# 房主替队友模拟时也会走到这里。受击暗角、震屏属于"本机玩家"的表现，
+	# 队友挨打不该在房主屏幕上抖一下。
+	if t != null and t != player:
+		return
 	damage_marks.append({"pos": from_pos, "t": 1.4})
 	rig.add_trauma(clampf(dmg / 160.0, 0.15, 0.6))
 	hit_vignette = minf(1.0, hit_vignette + clampf(dmg / 200.0, 0.25, 0.8))
@@ -857,7 +1178,9 @@ func on_player_hit(from_pos: Vector3, dmg: int) -> void:
 ## 但也必须给反馈：斜摆车身之所以值得练，唯一的原因就是玩家能看见它起作用。
 ## 原来 take_hit() 在这两种情况下直接 return，没有方向环、没有震屏、没有提示——
 ## 玩家只会以为"对方打偏了"。
-func on_player_blocked(what: String, blocked := 0) -> void:
+func on_player_blocked(t: Tank, what: String, blocked := 0) -> void:
+	if t != null and t != player:
+		return
 	var p = player
 	if p == null or not is_instance_valid(p):
 		return
@@ -924,11 +1247,42 @@ static func _enemy_type_name(t: int) -> String:
 		_: return "中型坦克"
 
 
-func deploy_smoke(pos: Vector3, dur: float) -> void:
+## Shell 的命中结果统一从这里分流：本机玩家的甩给自己，远端玩家的发回射手。
+func net_shell_feedback(shooter: Tank, uid: int, text: String, pos: Vector3,
+		result: String, amount: int, etype: int) -> void:
+	if shooter == null or not is_instance_valid(shooter):
+		return
+	if shooter.is_local:
+		on_shell_feedback(text, pos, true, result, amount, etype)
+	elif Net.is_host():
+		Net.send_shell_feedback(int(shooter.peer_id), uid, text, pos, result, amount, etype)
+
+
+## 客户端收到"我这一发的结果"。命中率按击发去重：一发多弹或 HE 溅射
+## 会来好几条反馈，但只能算一次命中。
+func net_apply_feedback(uid: int, text: String, pos: Vector3, result: String,
+		amount: int, etype: int) -> void:
+	if not _net_hit_claimed.has(uid):
+		_net_hit_claimed[uid] = true
+		Stats.add_hit()
+	# 击毁次数按"这条结果属于哪一发"记：一发多杀会来多条 kill，都是真实击毁。
+	if result == "kill":
+		Stats.add_kill()
+	on_shell_feedback(text, pos, true, result, amount, etype)
+
+
+func deploy_smoke(pos: Vector3, dur: float, owner := 0) -> void:
 	Fx.smoke_screen(fx_root, pos, dur)
 	smoke_clouds.append({"pos": pos, "r": SMOKE_RADIUS, "t": dur})
 	if smoke_clouds.size() > SMOKE_CLOUDS_MAX:
 		smoke_clouds.pop_front()
+	if Net.is_host():
+		Net.broadcast_smoke(pos, dur, owner)
+
+
+## 客户端收到别人的烟幕。自己那团已经在本地放过了（owner 过滤在 Net 里）。
+func net_add_smoke(pos: Vector3, dur: float) -> void:
+	deploy_smoke(pos, dur, 0)
 
 
 ## 这个点是否落在任意一团有效烟幕里（只看水平距离）。
@@ -944,34 +1298,74 @@ func smoke_at(pos: Vector3) -> bool:
 	return false
 
 
-func apply_powerup(ptype: int) -> void:
+## 房主 / 单机：某名玩家捡到了一只补给箱。
+func pickup_powerup(pu, t) -> void:
+	if Net.is_client():
+		return
+	if not is_instance_valid(pu) or t == null or not is_instance_valid(t) or not t.alive:
+		return
+	var uid: int = int(pu.uid)
+	var ptype: int = int(pu.ptype)
+	powerups.erase(pu)
+	pu.queue_free()
+	if Net.is_host():
+		Net.broadcast_powerup_taken(uid, int(t.peer_id), ptype)
+	score += 300
+	apply_powerup_to(t, ptype)
+
+
+## 客户端收到"某人拿到了补给"。
+func net_take_powerup(uid: int, pid: int, ptype: int) -> void:
+	for pu in powerups:
+		if is_instance_valid(pu) and int(pu.uid) == uid:
+			powerups.erase(pu)
+			pu.queue_free()
+			break
+	var owner := player_for_pid(pid)
+	if owner != null:
+		apply_powerup_to(owner, ptype)
+	if ptype == PowerUp.Type.AIRSTRIKE:
+		# 伤害是房主算的，客户端只补爆炸表现，否则屏幕上看不到支援落地。
+		rig.add_trauma(0.9)
+		for e in enemies:
+			if is_instance_valid(e) and e.alive:
+				Fx.explosion(fx_root, e.global_position + Vector3(0, 1.0, 0), 2.2)
+	elif ptype == PowerUp.Type.FORTIFY:
+		arena.set_fortify(true)
+		net_fortify = true
+
+
+func apply_powerup_to(t: Tank, ptype: int) -> void:
+	if t == null or not is_instance_valid(t):
+		return
 	var d := PowerUp.info(ptype)
 	Audio.play("pickup")
-	score += 300
-	if player == null or not is_instance_valid(player) or not player.alive:
+	if not t.alive:
 		return
 
 	match ptype:
 		PowerUp.Type.REPAIR:
-			player.hp = mini(player.max_hp, player.hp + int(player.max_hp * 0.45))
+			t.hp = mini(t.max_hp, t.hp + int(t.max_hp * 0.45))
 		PowerUp.Type.ARMOR:
-			player.armor_buff_t = 20.0
+			t.armor_buff_t = 20.0
 		PowerUp.Type.RAPID:
-			player.rapid_buff_t = 20.0
+			t.rapid_buff_t = 20.0
 		PowerUp.Type.SHIELD:
-			player.shield_t = 8.0
+			t.shield_t = 8.0
 		PowerUp.Type.AIRSTRIKE:
-			_airstrike()
+			# 伤害只由房主结算；客户端在 net_take_powerup 里只补爆炸表现。
+			if not Net.is_client():
+				_airstrike()
 		PowerUp.Type.FORTIFY:
 			arena.set_fortify(true)
 			_fortify_t = 25.0
 		PowerUp.Type.FIREPOWER:
 			_stage_damage_bonus += 0.25
-			player.damage_mult = 1.0 + _stage_damage_bonus
+			t.damage_mult = 1.0 + _stage_damage_bonus
 		PowerUp.Type.MULTISHOT:
-			player.multi_t = 22.0
+			t.multi_t = 22.0
 		PowerUp.Type.OVERDRIVE:
-			player.overdrive_t = 20.0
+			t.overdrive_t = 20.0
 	_banner("%s — %s" % [d["name"], d["desc"]], 2.0)
 	Audio.play("power")
 
@@ -983,6 +1377,8 @@ func _airstrike() -> void:
 		if not is_instance_valid(e) or not e.alive:
 			continue
 		Fx.explosion(fx_root, e.global_position + Vector3(0, 1.0, 0), 2.2)
+		# 空袭没有炮弹上下文，击毁归属直接写成本机玩家（客户端不吃这条分支）。
+		e.last_shooter = player
 		e.take_hit(int(e.max_hp * 0.7) + 60, e.global_position + Vector3(0, 30, 0), Shell.Kind.HE)
 
 
@@ -1021,11 +1417,413 @@ func _spawn_powerup(pos: Vector3, ptype: int, from_field: bool) -> PowerUp:
 	p.game = self
 	p.ptype = ptype
 	p.from_field = from_field
+	p.uid = Net.alloc_powerup_id()
 	p.position = pos
 	add_child(p)
 	p.process_mode = Node.PROCESS_MODE_PAUSABLE
 	powerups.append(p)
+	if Net.is_host():
+		Net.broadcast_powerup_spawn({
+			"uid": p.uid, "pos": pos, "ptype": ptype, "from_field": from_field,
+		})
 	return p
+
+
+## 客户端收到房主空投 / 掉落：只建一只纯表现的箱子，等待拾取或超时事件。
+func net_spawn_powerup(data: Dictionary) -> void:
+	var uid := int(data.get("uid", 0))
+	for pu in powerups:
+		if is_instance_valid(pu) and int(pu.uid) == uid:
+			return
+	var p := PowerUp.new()
+	p.game = self
+	p.ptype = int(data.get("ptype", PowerUp.Type.REPAIR))
+	p.from_field = bool(data.get("from_field", false))
+	p.uid = uid
+	p.visual_only = true
+	p.position = data.get("pos", Vector3.ZERO)
+	add_child(p)
+	p.process_mode = Node.PROCESS_MODE_PAUSABLE
+	powerups.append(p)
+
+
+## 本机玩家还剩几辆战车。单机看 lives，联机看房主名册里的那一行。
+## HUD 与结算页都读它，免得"队友的命数"被算到自己头上。
+func my_lives() -> int:
+	if Net.is_multiplayer():
+		var row: Dictionary = Net.players.get(Net.local_pid(), {})
+		return maxi(0, int(row.get("lives", 0)))
+	return lives
+
+
+# ---------------- 联机世界同步 ----------------
+#
+# 房主每 25 Hz 发一份快照，客户端只做两件事：把快照插值到远端车身上、
+# 把房主的状态机投影到本地 HUD；客户端自己的车由本地输入推进，每 30 Hz
+# 上报一次位置。战斗结算（伤害、死亡、拆墙、补给、基地）全部由房主决定。
+
+## 房主：开场。stage / terrain / 名册都来自 Net.start_match，客户端随后
+## 会收到单独的 net_stage_start，所以这里只有房主真正生成战场。
+func net_begin_match(info: Dictionary) -> void:
+	stage = int(info.get("stage", 1))
+	terrain = int(info.get("terrain", 0))
+	difficulty = int(info.get("difficulty", 1))
+	score = 0
+	lives = MAX_LIVES
+	combo_mult = 1.0
+	_kills = 0
+	_stage_cleared = false
+	get_tree().paused = false
+	if _lobby != null:
+		_lobby.close()
+	_hide_menu()
+	hud.visible = true
+	if Net.is_host():
+		Stats.begin_run()
+		_start_stage()
+
+
+## 客户端：按房主下发的关卡、地形与种子重建同一张地图。这里刻意不跑
+## `_start_stage()`：出怪队列、计分、关卡推进都只属于房主。
+func net_begin_stage(info: Dictionary) -> void:
+	if not Net.is_client():
+		return
+	stage = int(info.get("stage", stage))
+	terrain = int(info.get("terrain", terrain))
+	difficulty = int(info.get("difficulty", difficulty))
+	_stage_seed = int(info.get("seed", 0))
+	arena.generate(stage, terrain, _stage_seed)
+	Audio.set_space(String(Arena.TERRAINS[clampi(terrain, 0, Arena.TERRAINS.size() - 1)]["layout"]))
+	_clear_battle()
+	_stage_cleared = false
+	max_active = _net_max_active()
+	net_remaining = -1
+	_fortify_t = 0.0
+	_net_respawn.clear()
+	_spawn_players_for_stage()
+	state = "ready"
+	state_timer = 2.6
+	_hide_menu()
+	hud.visible = true
+	_refresh_mouse_mode()
+	_banner("第 %d 关  ·  %s  ·  %s" % [stage, terrain_name(), DIFF_NAMES[difficulty]], 2.6)
+	Audio.play("spawn")
+
+
+func _net_tank_row(t: Tank) -> Dictionary:
+	var turret_yaw := t.rotation.y
+	if t.turret != null:
+		turret_yaw += t.turret.rotation.y
+	var pitch := 0.0
+	if t.barrel != null:
+		pitch = t.barrel.rotation.x
+	return {
+		"id": int(t.net_id),
+		"pos": t.global_position,
+		"yaw": t.rotation.y,
+		"turret": turret_yaw,
+		"pitch": pitch,
+		"spd": t.speed(),
+		"hp": t.hp,
+	}
+
+
+## 房主：打包这一帧的世界状态。敌人带一个 AI 状态位，客户端只用来
+## 决定"该不该继续听发动机声"这类表现，不参与行为。
+func net_collect_snapshot() -> Dictionary:
+	if not Net.is_host():
+		return {}
+	var ps: Array = []
+	for t in players:
+		if is_instance_valid(t) and t.alive:
+			ps.append(_net_tank_row(t))
+	var es: Array = []
+	for e in enemies:
+		if not is_instance_valid(e) or not e.alive:
+			continue
+		var row := _net_tank_row(e)
+		row["st"] = int(e.state)
+		es.append(row)
+	return {
+		"p": ps,
+		"e": es,
+		"base": arena.base_hp,
+		"fort": arena.is_fortified(),
+		"state": state,
+		"timer": state_timer,
+		"score": score,
+		"left": _count_active() + spawn_queue.size(),
+	}
+
+
+func _net_apply_row(t: Tank, row: Dictionary) -> void:
+	t.apply_net_state(
+		row.get("pos", t.global_position),
+		float(row.get("yaw", t.rotation.y)),
+		float(row.get("turret", t.rotation.y)),
+		float(row.get("pitch", 0.0)),
+		float(row.get("spd", 0.0)),
+		int(row.get("hp", t.hp)),
+		true)
+
+
+## 客户端：把房主快照落到远端车、基地血条、加固状态与 HUD 数字上。
+## 本地车只回写 hp——位置永远以本地输入为准。
+func net_apply_snapshot(data: Dictionary) -> void:
+	if not Net.is_client():
+		return
+	if state == "title" or state == "lobby":
+		return
+	for row in data.get("p", []):
+		var t := Net.get_tank(int((row as Dictionary).get("id", 0)))
+		if t != null:
+			_net_apply_row(t, row)
+	for row in data.get("e", []):
+		var e := Net.get_tank(int((row as Dictionary).get("id", 0)))
+		if e != null:
+			_net_apply_row(e, row)
+	if arena != null:
+		arena.set_base_hp_net(int(data.get("base", arena.base_hp)))
+		var fort := bool(data.get("fort", false))
+		if arena.is_fortified() != fort:
+			arena.set_fortify(fort)
+			net_fortify = fort
+	net_remaining = int(data.get("left", net_remaining))
+	score = int(data.get("score", score))
+	# 倒计时、肃清与结算页由房主的状态机驱动；客户端只跟随，不自行推进。
+	#
+	# 但本地暂停是一个纯覆盖层：房主还在跑，客户端也不能被快照从 "pause"
+	# 拽回 "play"，否则按 Esc 打开的菜单会在下一帧被状态机关掉，
+	# 再按 Esc 又打开——看起来就是暂停键失灵。
+	if state == "pause":
+		return
+	var st := String(data.get("state", ""))
+	if (st == "ready" or st == "play" or st == "clear") and st != state:
+		state = st
+		state_timer = float(data.get("timer", 0.0))
+		_refresh_mouse_mode()
+
+
+## 客户端：本机玩家的位置与姿态。房主拿它驱动"这个 peer 的车"，
+## 再随快照转发给其他人。
+func net_collect_local_state() -> Dictionary:
+	if not Net.is_client():
+		return {}
+	var p := player
+	if p == null or not is_instance_valid(p) or not p.alive:
+		return {}
+	if p.turret == null or p.barrel == null:
+		return {}
+	return {
+		"pos": p.global_position,
+		"yaw": p.rotation.y,
+		"turret": p.rotation.y + p.turret.rotation.y,
+		"pitch": p.barrel.rotation.x,
+		"spd": p.speed(),
+	}
+
+
+## 房主：接收客户端上报的位置并做位移校验。
+##
+## 客户端权威移动换来了最好的手感，代价是房主不能盲信上报值。这里只拦
+## "物理上不可能"的情况：按车型极速的 2.2 倍加上 2.5 米容差算出一帧内
+## 允许的最大位移，超出就把位置拉回到合法圆上并记账。正常的网络抖动
+## 远小于这个阈值，所以不会出现"跑着跑着被拽回来"的橡皮筋。
+func net_apply_client_state(pid: int, data: Dictionary) -> void:
+	var t := player_for_pid(pid)
+	if t == null or not t.alive:
+		return
+	var pos: Vector3 = data.get("pos", t.global_position)
+	if pos == Vector3.INF or not pos.is_finite():
+		return
+	var now := Time.get_ticks_msec() / 1000.0
+	_net_client_updates += 1
+	var last: Dictionary = _client_last.get(pid, {})
+	if not last.is_empty():
+		var from: Vector3 = last.get("pos", pos)
+		var dt := clampf(now - float(last.get("t", now)), 0.001, 1.0)
+		var max_d: float = t.move_speed * 2.2 * dt + 2.5
+		if pos.distance_to(from) > max_d:
+			pos = from + (pos - from).limit_length(max_d)
+			_net_pullbacks += 1
+	_client_last[pid] = {"pos": pos, "t": now}
+	t.apply_net_state(pos,
+		float(data.get("yaw", t.rotation.y)),
+		float(data.get("turret", t.rotation.y)),
+		float(data.get("pitch", 0.0)),
+		float(data.get("spd", 0.0)),
+		t.hp, true)
+
+
+## 客户端：房主生成了一辆敌车。AI 只在房主那边跑，这里拿到的是复制品。
+func net_spawn_enemy(data: Dictionary) -> void:
+	if not Net.is_client():
+		return
+	var id := int(data.get("id", 0))
+	if id == 0 or Net.get_tank(id) != null:
+		return
+	var e := Enemy.new()
+	e.configure(int(data.get("type", 1)), int(data.get("stage", stage)),
+			int(data.get("diff", difficulty)))
+	_scale_enemy_for_coop(e)
+	e.is_remote = true
+	e.team = 1
+	e.net_id = id
+	e.setup(self, arena, data.get("pos", Vector3.ZERO))
+	add_child(e)
+	e.process_mode = Node.PROCESS_MODE_PAUSABLE
+	Net.register_tank(e, id)
+	e.apply_net_state(e.global_position, e.rotation.y, e.rotation.y, 0.0, 0.0,
+			int(data.get("hp", e.hp)), true)
+	enemies.append(e)
+
+
+## 客户端：房主让某名玩家落车（开局或重生）。本地玩家的车会重新拿到镜头。
+func net_spawn_player(data: Dictionary) -> void:
+	if not Net.is_client():
+		return
+	var pid := int(data.get("pid", 0))
+	if pid <= 0:
+		return
+	var old := player_for_pid(pid)
+	if old != null:
+		players.erase(old)
+		Net.unregister_tank(old.net_id)
+		old.free_for_net()
+	var local := pid == Net.local_pid()
+	var p := _spawn_player(data.get("pos", Vector3.ZERO),
+			String(data.get("tank_id", "")), pid, local)
+	p.hp = int(data.get("hp", p.max_hp))
+	if local:
+		_banner("战车已就绪，重新出击", 1.5)
+
+
+## 客户端：某辆车被击毁。伤害与扣命已经在房主那边结算完了，
+## 这里只播爆炸、留残骸、把本地引用摘干净。
+func net_apply_death(net_id: int, pos: Vector3, yaw: float, _killer_id: int) -> void:
+	if not Net.is_client():
+		return
+	var t := Net.get_tank(net_id)
+	if t == null:
+		return
+	var was_local := t == player
+	if t is Player:
+		players.erase(t)
+	else:
+		enemies.erase(t)
+	Net.unregister_tank(net_id)
+	t.global_position = pos
+	t.rotation.y = yaw
+	if was_local:
+		player = null
+		rig.target = null
+		_banner("战车被击毁，等待重生…", 2.0)
+		_spectate()
+	t.net_die()
+
+
+## 客户端：房主拆掉了一格墙。走 Arena 的同一条 _clear_cell 路径，
+## 于是碎砖、焦痕、寻路封格在两边看起来完全一样。
+func net_apply_cell(cell: Vector2i) -> void:
+	if arena != null:
+		arena.apply_cell_destroyed(cell)
+
+
+## 客户端：本地玩家挨了一发。血量的权威值随快照到达，这里只补方向指示
+## 与暗角，否则客户端被打时会"毫无反馈地掉血"。
+func net_apply_hit(data: Dictionary) -> void:
+	if not Net.is_client():
+		return
+	var t := Net.get_tank(int(data.get("id", 0)))
+	if t == null or t != player:
+		return
+	on_player_hit(t, data.get("from", t.global_position), int(data.get("dmg", 0)))
+
+
+## 房主：远端玩家挨打时把事件发给射手本人（on_player_hit 只在 is_local
+## 时调用，房主屏幕不该替队友抖一下）。
+func net_note_player_hit(t: Tank, from_pos: Vector3, dmg: int) -> void:
+	if Net.is_host() and t != null and t.is_player:
+		Net.broadcast_hit({"id": int(t.net_id), "from": from_pos, "dmg": dmg})
+
+
+## 客户端：房主宣布结算。分数以房主为准，客户端不再累加。
+func net_end_match(won: bool, score_value: int) -> void:
+	if not Net.is_client():
+		return
+	score = score_value
+	Net.match_active = false
+	state = "win" if won else "over"
+	get_tree().paused = false
+	_refresh_mouse_mode()
+	hud.visible = false
+	if _lobby != null:
+		_lobby.close()
+	if score > high_score:
+		high_score = score
+		_save_high_score()
+	_show_menu("全 线 胜 利" if won else "战 败", _result_text(won))
+	Audio.play("victory" if won else "gameover")
+
+
+## 房主：一名玩家退出了房间。他的车从场上撤掉，名册同步给其余人。
+## 光是撤掉房主这份还不够：其他客户端那边也有一辆"他的车"，必须显式通知，
+## 否则那辆车会永远停在原地，被当成存活的队友继续画在雷达上。
+func net_player_left(pid: int) -> void:
+	var t := player_for_pid(pid)
+	if t != null:
+		players.erase(t)
+		Net.unregister_tank(t.net_id)
+		if t == player:
+			player = null
+			_spectate()
+		t.free_for_net()
+	_client_last.erase(pid)
+	Net.broadcast_player_left(pid)
+	Net.push_roster()
+
+
+## 客户端：队友掉线。只收尸，不播爆炸——车是被"撤走"的，不是被击毁的。
+func net_remote_player_left(pid: int) -> void:
+	var t := player_for_pid(pid)
+	if t != null:
+		players.erase(t)
+		Net.unregister_tank(t.net_id)
+		if t == player:
+			player = null
+			rig.target = null
+			_spectate()
+		t.free_for_net()
+	_client_last.erase(pid)
+
+
+func _on_arena_cell_destroyed(cell: Vector2i) -> void:
+	if Net.is_host():
+		Net.broadcast_cell(cell)
+
+
+func _on_net_match_started(_info: Dictionary) -> void:
+	if _lobby != null:
+		_lobby.close()
+	_hide_menu()
+	hud.visible = true
+	get_tree().paused = false
+	_refresh_mouse_mode()
+
+
+func _on_net_match_ended(_won: bool, _score: int) -> void:
+	# 结算页已经在 net_end_match / _game_over / _win 里画好了，
+	# 这里只兜底把 HUD 收起来，避免同一次结算被画两遍。
+	if hud != null:
+		hud.visible = false
+
+
+func _on_net_session_ended(reason: String) -> void:
+	# 大厅里的连接失败由大厅自己显示状态；只有打到一半掉线才回标题。
+	if state == "lobby" or state == "title":
+		return
+	_enter_title()
+	_show_menu("连 接 中 断", "%s\n\n按 Enter 返回" % reason)
 
 
 func _roll_powerup() -> int:
@@ -1062,17 +1860,94 @@ func _roll_field_powerup() -> int:
 
 # ---------------- 胜负 ----------------
 
-func _on_player_death() -> void:
-	player = null
-	rig.target = null
-	lives -= 1
+func _on_player_death(t: Player) -> void:
+	players.erase(t)
+	var was_local := t == player
+	if was_local:
+		player = null
+		rig.target = null
+		# 重生等待的 2.5 秒里先看队友，而不是让镜头悬在原地。
+		_spectate()
 	combo_mult = 1.0
-	rig.add_trauma(1.0)
-	if lives > 0:
-		_respawn_t = 2.5
-		_banner("战车被击毁，剩余 %d 辆" % lives, 2.0)
+	if was_local:
+		rig.add_trauma(1.0)
+
+	# 客户端：命数归房主管，这里只有表现。重生由 net_player_spawn 事件落车。
+	if Net.is_client():
+		if was_local:
+			_banner("战车被击毁，等待重生…", 2.0)
+		return
+
+	var pid := int(t.peer_id)
+	if pid <= 0:
+		pid = 1
+	var remaining := 0
+	if Net.is_multiplayer():
+		var row: Dictionary = Net.players.get(pid, {})
+		remaining = int(row.get("lives", 1)) - 1
+		row["lives"] = remaining
+		row["alive"] = false
+		Net.players[pid] = row
+		Net.push_roster()
+		# 房主本人的重生也走统一队列，于是结算逻辑只有一套。
+		if remaining > 0:
+			_net_respawn.append({"pid": pid, "t": 2.5})
 	else:
-		_game_over()
+		lives -= 1
+		remaining = lives
+		if lives > 0:
+			_respawn_t = 2.5
+
+	if remaining > 0:
+		_banner("战车被击毁，剩余 %d 辆" % remaining, 2.0)
+	else:
+		_banner("最后一辆战车被击毁", 2.0)
+		_check_team_wipe()
+
+
+## 房主侧重生一辆车，并把"哪个 peer、在哪、多少血"广播给所有人。
+## 客户端本地车与远端队友车都从这一条事件落车。
+func _respawn_net_player(pid: int) -> void:
+	var row: Dictionary = Net.players.get(pid, {})
+	if row.is_empty():
+		return
+	var pos := _spawn_pos_for_pid(pid)
+	var local := pid == Net.local_pid()
+	# 重生是一次瞬移：清掉位移校验的基准点，否则客户端从死亡点报回出生点时
+	# 会被房主当成"超速"一帧帧拉回来，在别人眼里就是队友贴着地面滑过去。
+	_client_last.erase(pid)
+	var p := _spawn_player(pos, String(row.get("tank_id", "")), pid, local)
+	row["alive"] = true
+	Net.players[pid] = row
+	Net.broadcast_player_spawn({
+		"pid": pid, "pos": pos, "hp": p.hp, "max_hp": p.max_hp,
+		"tank_id": p.tank_id, "lives": int(row.get("lives", 0)),
+	})
+	Net.push_roster()
+
+
+func _spawn_pos_for_pid(pid: int) -> Vector3:
+	var roster: Array = Net.match_info.get("players", [])
+	for entry in roster:
+		var e: Dictionary = entry
+		if int(e.get("pid", -1)) == pid:
+			return arena.player_spawn_index(int(e.get("spawn", 0)))
+	return arena.player_spawn()
+
+
+## 全员命尽才判负。基地被毁另有自己的入口（on_base_destroyed）。
+func _check_team_wipe() -> void:
+	if Net.is_client() or state == "over" or state == "win":
+		return
+	if Net.is_multiplayer():
+		for pid in Net.players.keys():
+			var row: Dictionary = Net.players[pid]
+			if int(row.get("lives", 0)) > 0:
+				return
+	else:
+		if lives > 0:
+			return
+	_game_over()
 
 
 func _game_over() -> void:
@@ -1080,11 +1955,16 @@ func _game_over() -> void:
 	get_tree().paused = false
 	_refresh_mouse_mode()
 	hud.visible = false
+	if _lobby != null:
+		_lobby.close()
 	var won := false
 	if score > high_score:
 		high_score = score
 		_save_high_score()
 	Stats.end_run(_player_tank_id(), difficulty, score, won)
+	Net.match_active = false
+	if Net.is_host():
+		Net.broadcast_match_end(false, score)
 	_show_menu("战 败", _result_text(won))
 	Audio.play("gameover")
 
@@ -1094,11 +1974,16 @@ func _win() -> void:
 	get_tree().paused = false
 	_refresh_mouse_mode()
 	hud.visible = false
+	if _lobby != null:
+		_lobby.close()
 	score += lives * 3000
 	if score > high_score:
 		high_score = score
 		_save_high_score()
 	Stats.end_run(_player_tank_id(), difficulty, score, true)
+	Net.match_active = false
+	if Net.is_host():
+		Net.broadcast_match_end(true, score)
 	_show_menu("全 线 胜 利", _result_text(true))
 	Audio.play("victory")
 
@@ -1139,7 +2024,10 @@ func _result_text(won: bool) -> String:
 	lines.append("生涯累计   击毁 %d   最高分 %07d   通关 %d 次" % [
 		Stats.kills, Stats.best_score, Stats.wins])
 	lines.append("")
-	lines.append("R 重新出击   Esc 返回标题" if not won else "Enter 返回标题")
+	if Net.is_multiplayer():
+		lines.append("Enter 返回标题（离开房间）")
+	else:
+		lines.append("R 重新出击   Esc 返回标题" if not won else "Enter 返回标题")
 	return "\n".join(lines)
 
 

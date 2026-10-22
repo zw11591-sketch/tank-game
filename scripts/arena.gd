@@ -247,12 +247,17 @@ const TERRAINS := [
 ]
 
 var game: Node
+## 运行时（炮弹、溅射、加固还原）拆掉一格时发出。联机时 main 把它转发给客户端；
+## 客户端收到后调用 apply_cell_destroyed() 重建破坏结果，而不是自己再算一遍伤害。
+signal cell_destroyed(cell: Vector2i)
 var grid: Array = []                  # grid[y][x] -> int
 var brick_hp: Dictionary = {}         # Vector2i -> int
 var base_hp := 300
 var base_max_hp := 300
 ## 当前地形索引（TERRAINS 的下标）
 var terrain := 0
+## 客户端正在按房主事件拆墙时为真，避免 apply_cell_destroyed() 再把事件发回去。
+var _net_applying := false
 
 var astar := AStarGrid2D.new()
 ## 宽体寻路网格：把单格宽通道也当作不可通行。
@@ -436,7 +441,7 @@ func _process(delta: float) -> void:
 	_crush_cd = maxf(0.0, _crush_cd - delta)
 
 
-func generate(stage: int, terrain_id := 0) -> void:
+func generate(stage: int, terrain_id := 0, net_seed := 0) -> void:
 	terrain = clampi(terrain_id, 0, TERRAINS.size() - 1)
 	for n in _blocks.values():
 		n.queue_free()
@@ -462,7 +467,9 @@ func generate(stage: int, terrain_id := 0) -> void:
 			w.queue_free()
 
 	var rng := RandomNumberGenerator.new()
-	rng.seed = 20260910 + stage * 7919 + terrain * 104729
+	# 联机时房主把 seed 一起下发。种子只决定布局，双方用同一份种子生成的
+	# 网格、出生点、路障与碰撞体完全一致，于是不必同步几何。
+	rng.seed = net_seed if net_seed != 0 else 20260910 + stage * 7919 + terrain * 104729
 
 	_new_grid()
 	_border()
@@ -1353,6 +1360,16 @@ func player_spawn() -> Vector3:
 	return cell_center(GRID_W / 2 - 1, 18)
 
 
+## 合作模式的第 i 个出生点。四辆车并排展开在基地前方，彼此隔 3 格（12 m），
+## 既不会一出生就顶在一起，也都还落在"玩家活动区"这条固定挖空的走廊里。
+## 房主与客户端用同一个 i 调它，于是双方不需要同步出生坐标。
+func player_spawn_index(i: int) -> Vector3:
+	const OFFSETS := [Vector2i(0, 0), Vector2i(-3, 0), Vector2i(3, 0), Vector2i(-6, 0),
+			Vector2i(6, 0), Vector2i(0, -2), Vector2i(-3, -2), Vector2i(3, -2)]
+	var o: Vector2i = OFFSETS[posmod(i, OFFSETS.size())]
+	return snap_open(cell_center(GRID_W / 2 - 1 + o.x, 18 + o.y))
+
+
 func base_position() -> Vector3:
 	return (cell_center(BASE_CELLS[0].x, BASE_CELLS[0].y) + cell_center(BASE_CELLS[1].x, BASE_CELLS[1].y)) * 0.5
 
@@ -1636,6 +1653,29 @@ func _clear_cell(c: Vector2i) -> void:
 	_refresh_solid_around(c)
 	_schedule_runs()
 	_schedule_joints()
+	if not _net_applying:
+		cell_destroyed.emit(c)
+
+
+## 客户端按房主事件重建一格破坏。走同一套 _clear_cell，于是碎砖、焦痕、
+## A* 封格与水面/路障的连通性都和房主那边一致；只是不再往回发事件。
+func apply_cell_destroyed(c: Vector2i) -> void:
+	if c.x < 0 or c.y < 0 or c.x >= GRID_W or c.y >= GRID_H:
+		return
+	if cell(c.x, c.y) == EMPTY:
+		return
+	_net_applying = true
+	_clear_cell(c)
+	_net_applying = false
+
+
+## 房主快照里的基地血量。客户端只负责把血条画对，不在这里判定胜负。
+func set_base_hp_net(v: int) -> void:
+	var nv := maxi(0, v)
+	if nv == base_hp:
+		return
+	base_hp = nv
+	_refresh_base_visual()
 
 
 ## 一格砖墙碎裂后的地面残留：2~3 块碎砖 + 一层薄焦痕。
@@ -1704,6 +1744,11 @@ func set_fortify(active: bool) -> void:
 			grid[c.y][c.x] = BRICK
 			brick_hp[c] = BRICK_HP
 			_respawn_block(c)
+
+
+## 快照里同步基地加固状态时用。客户端只读。
+func is_fortified() -> bool:
+	return _fortified
 
 
 func _respawn_block(c: Vector2i) -> void:

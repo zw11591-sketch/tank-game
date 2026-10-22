@@ -36,23 +36,30 @@ var kind := Kind.AP
 var vel := Vector3.ZERO
 var damage := 60
 var from_player := false
+## 纯表现炮弹：客户端上的炮弹只负责飞、命中、冒火花，不结算伤害也不拆墙。
+## 真正的结算发生在房主那边，伤害由快照与事件回传。
+var visual_only := false
 
 var _life := 0.0
 var _dead := false
 ## 发射这次击发的编号（见 Tank.claim_hit）。多弹装填的三发共用同一个编号。
 var _shot_id := -1
+## 联机击发编号（房主与客户端一致的 uid）。命中反馈按它去重。
+var _shot_uid := 0
 var _trail: MeshInstance3D
 ## 已经触发过视觉命中的道具（instance_id -> true）。见 _probe_blockers()。
 var _touched: Dictionary = {}
 
 
-func launch(g: Node, a: Arena, from: Tank, origin: Vector3, dir: Vector3, k: int) -> void:
+func launch(g: Node, a: Arena, from: Tank, origin: Vector3, dir: Vector3, k: int,
+		uid := 0) -> void:
 	game = g
 	arena = a
 	shooter = from
 	kind = k
-	from_player = from.is_player
-	_shot_id = from._shot_id
+	from_player = from != null and from.is_player
+	_shot_id = from._shot_id if from != null else -1
+	_shot_uid = uid
 	position = origin
 
 	var d := dir.normalized()
@@ -179,7 +186,14 @@ func _physics_process(delta: float) -> void:
 func _trace(from: Vector3, to: Vector3) -> bool:
 	var space := get_world_3d().direct_space_state
 	var q := PhysicsRayQueryParameters3D.create(from, to, Tank.LAYER_WORLD | Tank.LAYER_TANK)
-	q.exclude = [shooter.get_rid()] if is_instance_valid(shooter) else []
+	# 友好伤害关闭：玩家打出的炮弹不与任何玩家车体相交。直接把 RID 排除掉，
+	# 比"打中了再退回伤害"更干净——队友之间不会出现火花、跳弹与命中提示。
+	if from_player and game != null and game.has_method("human_rids"):
+		q.exclude = game.human_rids()
+	elif is_instance_valid(shooter):
+		q.exclude = [shooter.get_rid()]
+	else:
+		q.exclude = []
 	q.collide_with_areas = false
 	var hit := space.intersect_ray(q)
 	if hit.is_empty():
@@ -249,29 +263,36 @@ func _probe_blockers(from: Vector3, to: Vector3) -> void:
 
 
 func _hit_tank(t: Tank, point: Vector3) -> void:
+	if visual_only:
+		# 客户端上的炮弹只是表现：命中火花 + 音效，伤害与击毁由房主广播。
+		Fx.hit_spark(game.fx_root, point)
+		Audio.play_3d("steel", point)
+		_die()
+		return
 	# 命中次数按击发记：同一发弹幕打到几辆车、HE 溅到几辆车，都只算一次。
 	# 放在 take_hit 之前，于是跳弹与护盾这些"碰到了但没穿"也计入命中。
-	if from_player and is_instance_valid(shooter) and shooter.is_player:
+	# 只有本机玩家的命中才进本机统计；房主替队友结算时由 Net 把反馈发给射手。
+	if from_player and is_instance_valid(shooter) and shooter.is_local:
 		shooter.claim_hit(_shot_id)
 	var out := [0, ""]
+	# 记下谁打的：击毁结算在 Tank.destroy() 里，那里没有炮弹上下文。
+	if is_instance_valid(shooter):
+		t.last_shooter = shooter
 	var res := t.take_hit(damage, global_position, kind, out, point)
 	if res == "ricochet":
 		# 跳弹：炮弹被弹开报废，不造成任何伤害
 		Fx.ricochet(game.fx_root, point)
-		if game.has_method("on_shell_feedback"):
-			game.on_shell_feedback("跳弹!", point, from_player, "bounce")
+		_feedback("跳弹!", point, "bounce", 0, _etype_of(t))
 		_die()
 		return
 	if res == "shield":
 		Fx.ricochet(game.fx_root, point)
-		if game.has_method("on_shell_feedback"):
-			game.on_shell_feedback("护盾吸收", point, from_player, "block")
+		_feedback("护盾吸收", point, "block", 0, _etype_of(t))
 		_die()
 		return
-	if res != "none" and game.has_method("on_shell_feedback"):
+	if res != "none":
 		var result := "kill" if res == "kill" else "pen"
-		game.on_shell_feedback("%s %d" % [out[1], out[0]], point, from_player,
-				result, int(out[0]), _etype_of(t))
+		_feedback("%s %d" % [out[1], out[0]], point, result, int(out[0]), _etype_of(t))
 	if kind == Kind.HE:
 		# 把直击目标传给 _explode：它会照旧吃溅射伤害，但不再为同一发再飘一个数字。
 		# 原来一颗 HE 直击会同时出"正面 57"和"溅射 41"、响两声命中提示，
@@ -281,7 +302,30 @@ func _hit_tank(t: Tank, point: Vector3) -> void:
 		_die()
 
 
+## 命中反馈统一出口。房主本地玩家直接走 main.on_shell_feedback，
+## 远端玩家的这一发由 main 转成 RPC 发给射手，别人的命中不会显示在房主 HUD 上。
+func _feedback(text: String, point: Vector3, result: String, amount: int, etype: int) -> void:
+	if not from_player or game == null:
+		return
+	if game.has_method("net_shell_feedback"):
+		game.net_shell_feedback(shooter, _shot_uid, text, point, result, amount, etype)
+	elif game.has_method("on_shell_feedback"):
+		game.on_shell_feedback(text, point, true, result, amount, etype)
+
+
 func _hit_world(collider: Object, point: Vector3, normal: Vector3) -> bool:
+	if visual_only:
+		if kind == Kind.HE:
+			Fx.explosion(game.fx_root, point, 2.0)
+			Audio.play_3d("boom", point)
+		elif collider is StaticBody3D and collider.has_meta("cell"):
+			Fx.ricochet(game.fx_root, point)
+			Audio.play_3d("steel", point)
+		else:
+			Fx.dirt_impact(game.fx_root, point, normal, Color(0.42, 0.36, 0.27))
+			Audio.play_3d("dirt", point)
+		_die()
+		return true
 	if kind == Kind.HE:
 		_explode()
 		return true
@@ -316,6 +360,11 @@ func _hit_world(collider: Object, point: Vector3, normal: Vector3) -> bool:
 func _explode(direct: Tank = null) -> void:
 	if _dead:
 		return
+	if visual_only:
+		Fx.explosion(game.fx_root, global_position, 2.0)
+		Audio.play_3d("boom", global_position)
+		_die()
+		return
 	var center := global_position
 	# 溅射半径按射手车型缩放：自行火炮一发能整片铲平砖墙，侦察车只有一小圈
 	var radius := HE_RADIUS
@@ -335,6 +384,9 @@ func _explode(direct: Tank = null) -> void:
 			continue
 		if t == shooter:
 			continue
+		# 友好伤害关闭：玩家炮弹的溅射也不伤队友。
+		if from_player and t.is_player:
+			continue
 		var d: float = t.global_position.distance_to(center)
 		if d > radius:
 			continue
@@ -343,6 +395,8 @@ func _explode(direct: Tank = null) -> void:
 		if dmg <= 0:
 			continue
 		var out := [0, ""]
+		if is_instance_valid(shooter):
+			t.last_shooter = shooter
 		var res: String = t.take_hit(dmg, center, kind, out)
 		if res != "none" and res != "shield" and res != "ricochet":
 			splash_landed = true
@@ -351,12 +405,11 @@ func _explode(direct: Tank = null) -> void:
 			continue
 		if res == "none" or res == "shield" or res == "ricochet":
 			continue
-		if game.has_method("on_shell_feedback"):
-			game.on_shell_feedback("溅射 %d" % out[0], t.global_position, from_player,
-					"kill" if res == "kill" else "pen", int(out[0]), _etype_of(t))
+		_feedback("溅射 %d" % out[0], t.global_position,
+				"kill" if res == "kill" else "pen", int(out[0]), _etype_of(t))
 	# 落地溅射也算命中：HE 打进人堆时没有直击，但伤害确实造成了。
 	# claim_hit 按击发去重，所以直击 + 溅射不会记成两次。
-	if splash_landed and from_player and is_instance_valid(shooter) and shooter.is_player:
+	if splash_landed and from_player and is_instance_valid(shooter) and shooter.is_local:
 		shooter.claim_hit(_shot_id)
 	_die()
 

@@ -14,6 +14,10 @@ var game: Node
 var ptype := Type.REPAIR
 ## 定时空投（true）与击杀掉落（false）。只影响存在时间与落地提示的强度。
 var from_field := false
+## 联机 id：房主分配，客户端按它把"已拾取"事件对回这只箱子。
+var uid := 0
+## 客户端上的补给是纯表现：不能被本机拾取，消失由房主事件驱动。
+var visual_only := false
 
 var _t := 0.0
 var _span := LIFE
@@ -241,7 +245,16 @@ func _process(delta: float) -> void:
 		return
 
 	var p = game.player
-	if p != null and is_instance_valid(p) and p.alive:
-		if p.global_position.distance_to(global_position) < PICK_RANGE:
-			game.apply_powerup(ptype)
-			queue_free()
+	if visual_only or Net.is_client():
+		return
+	# 合作模式：任何一名存活玩家开过都能捡。拾取结算统一走 main.pickup_powerup，
+	# 由房主决定谁拿到了什么，再广播给所有人。
+	var list: Array = game.players if game.get("players") != null else []
+	if list.is_empty() and p != null and is_instance_valid(p):
+		list = [p]
+	for t in list:
+		if not is_instance_valid(t) or not t.alive:
+			continue
+		if t.global_position.distance_to(global_position) < PICK_RANGE:
+			game.pickup_powerup(self, t)
+			return

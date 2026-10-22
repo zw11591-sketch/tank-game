@@ -75,6 +75,17 @@ var drive_relative := true
 ## 空串表示还没选过，选车界面会退回名册的默认车。
 var selected_tank := ""
 
+# ---- 联机 ----
+## 显示给其他玩家的名字。空串时退回系统用户名。
+var player_name := ""
+## ENet 服务端口（UDP）。房主监听这个端口，客户端直接连它。
+var net_port := 45888
+## 局域网房间发现端口（UDP 广播）。同一台机器开两个实例时要改其中一个。
+var discovery_port := 45887
+var net_max_players := 4
+## 手动加入时记住的上一个 IP。
+var last_server := ""
+
 var _headless := false
 
 
@@ -282,6 +293,12 @@ func load_cfg() -> void:
 	drive_relative = cf.get_value("input", "drive_relative", drive_relative)
 	selected_tank = cf.get_value("game", "selected_tank", selected_tank)
 
+	player_name = String(cf.get_value("net", "player_name", player_name))
+	net_port = clampi(int(cf.get_value("net", "port", net_port)), 1024, 65535)
+	discovery_port = clampi(int(cf.get_value("net", "discovery_port", discovery_port)), 1024, 65535)
+	net_max_players = clampi(int(cf.get_value("net", "max_players", net_max_players)), 2, 4)
+	last_server = String(cf.get_value("net", "last_server", last_server))
+
 
 func save_cfg() -> void:
 	var cf := ConfigFile.new()
@@ -303,4 +320,9 @@ func save_cfg() -> void:
 	cf.set_value("input", "invert_y", invert_y)
 	cf.set_value("input", "drive_relative", drive_relative)
 	cf.set_value("game", "selected_tank", selected_tank)
+	cf.set_value("net", "player_name", player_name)
+	cf.set_value("net", "port", net_port)
+	cf.set_value("net", "discovery_port", discovery_port)
+	cf.set_value("net", "max_players", net_max_players)
+	cf.set_value("net", "last_server", last_server)
 	cf.save(CFG_PATH)
