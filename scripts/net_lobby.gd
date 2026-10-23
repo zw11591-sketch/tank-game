@@ -6,8 +6,14 @@ extends Control
 ## 键盘只需要 Esc（由 main.gd 处理）就能回到标题。
 
 const DIFF_NAMES := ["简单", "普通", "困难"]
+## 大厅面板的设计尺寸。宽屏 1080p / 100% 界面缩放下就用这个大小。
+const PANEL_DESIGN := Vector2(980, 640)
+## 面板与屏幕上下的最小留白。界面缩放调大后可见的 UI 空间会变小（200% 时
+## 1280x720 的窗口只剩 960x540），面板必须能缩到这个范围里，否则会顶出屏幕。
+const PANEL_MARGIN := 16.0
 
 var game: Node
+var _panel: PanelContainer
 var _browse: Control
 var _room: Control
 var _rooms_box: VBoxContainer
@@ -26,9 +32,16 @@ var _refresh_btn: Button
 
 
 func _ready() -> void:
-	set_anchors_preset(Control.PRESET_FULL_RECT)
+	# 必须是 set_anchors_and_offsets_preset：set_anchors_preset 只改锚点，
+	# 同时会把偏移改成"维持当前矩形"，而在 _ready 里当前矩形还是 0x0，
+	# 于是偏移变成 (0,0,-宽,-高)，覆盖层永远 0x0。面板按 0x0 的父级居中，
+	# 结果整块面板的左上角落在屏幕原点、右下角落在屏幕中心，
+	# 玩家只看到右下角那一块（就是"点了 L 只有半块黑底 + 手动加入一行"）。
+	set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	mouse_filter = Control.MOUSE_FILTER_STOP
 	_build()
+	_fit_panel()
+	get_viewport().size_changed.connect(_fit_panel)
 	visible = false
 	Net.roster_changed.connect(_refresh_room)
 	Net.notice.connect(_on_notice)
@@ -38,6 +51,10 @@ func _ready() -> void:
 
 func open() -> void:
 	visible = true
+	# 玩家可能刚在暂停菜单里改过界面缩放 / 分辨率，打开前重新量一次可见空间。
+	_fit_panel()
+	# 上一次会话留下的提示（"房间已创建""已离开房间"）在这里已经没有意义。
+	_status.text = ""
 	_show_browse()
 	if not Net.is_multiplayer():
 		Net.discovery.start_listen(Settings.discovery_port)
@@ -56,9 +73,11 @@ func _build() -> void:
 	add_child(bg)
 
 	var panel := PanelContainer.new()
-	panel.set_anchors_preset(Control.PRESET_CENTER)
-	panel.custom_minimum_size = Vector2(980, 640)
-	panel.position = Vector2(-490, -320)
+	_panel = panel
+	# 只给一个很宽松的最小尺寸：真正的尺寸由 _fit_panel() 按可见 UI 空间算，
+	# 内容更高更宽时 PanelContainer 自己会撑开（说明空间真的不够，而不是排版错）。
+	panel.custom_minimum_size = Vector2(320, 240)
+	panel.set_anchors_and_offsets_preset(Control.PRESET_CENTER)
 	var style := StyleBoxFlat.new()
 	style.bg_color = Color(0.06, 0.085, 0.11, 0.96)
 	style.border_color = Color(0.32, 0.58, 0.62, 0.85)
@@ -89,14 +108,39 @@ func _build() -> void:
 
 	_browse = VBoxContainer.new()
 	_browse.add_theme_constant_override("separation", 8)
+	# 让房间列表吃掉面板剩下的高度：面板在小屏幕上被压矮时，
+	# 列表区域自己收缩，而不是把下面的"手动加入"那一行挤出面板。
+	_browse.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	root.add_child(_browse)
 	_build_browse(_browse)
 
 	_room = VBoxContainer.new()
 	_room.add_theme_constant_override("separation", 10)
+	_room.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	_room.visible = false
 	root.add_child(_room)
 	_build_room(_room)
+
+
+## 把面板居中放进当前可见的 UI 空间，并且不超过设计尺寸。
+##
+## 可见空间不是窗口像素：stretch 用 canvas_items + content_scale_factor，
+## 200% 界面缩放下 1280x720 的窗口只有 960x540 的 UI 空间，固定的 980x640
+## 会顶出屏幕。这里每次打开/每次窗口尺寸或界面缩放变化都重新量一次。
+func _fit_panel() -> void:
+	if _panel == null:
+		return
+	var avail := get_viewport_rect().size
+	var w: float = minf(PANEL_DESIGN.x, maxf(avail.x - PANEL_MARGIN * 2.0, 320.0))
+	var h: float = minf(PANEL_DESIGN.y, maxf(avail.y - PANEL_MARGIN * 2.0, 240.0))
+	_panel.anchor_left = 0.5
+	_panel.anchor_top = 0.5
+	_panel.anchor_right = 0.5
+	_panel.anchor_bottom = 0.5
+	_panel.offset_left = -w * 0.5
+	_panel.offset_top = -h * 0.5
+	_panel.offset_right = w * 0.5
+	_panel.offset_bottom = h * 0.5
 
 
 func _build_browse(parent: Control) -> void:
@@ -107,7 +151,7 @@ func _build_browse(parent: Control) -> void:
 	parent.add_child(hint)
 
 	var scroll := ScrollContainer.new()
-	scroll.custom_minimum_size = Vector2(0, 330)
+	scroll.custom_minimum_size = Vector2(0, 170)
 	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	parent.add_child(scroll)
 	_rooms_box = VBoxContainer.new()
@@ -154,7 +198,9 @@ func _build_room(parent: Control) -> void:
 	parent.add_child(_room_info)
 
 	_players_l = Label.new()
-	_players_l.custom_minimum_size = Vector2(0, 190)
+	# 4 人各一行约 24px，160 够用；再高就会把 200% 界面缩放下的面板顶高，
+	# 面板一高就会贴到屏幕下沿。
+	_players_l.custom_minimum_size = Vector2(0, 160)
 	_players_l.add_theme_font_size_override("font_size", 19)
 	_players_l.add_theme_color_override("font_color", Color(0.9, 0.95, 1.0))
 	_players_l.add_theme_color_override("font_outline_color", Color(0, 0, 0))
