@@ -111,6 +111,12 @@ func my_name() -> String:
 	return n
 
 
+## 客户端连的是哪台机器（列表点击或手动输入都记在这里）。房主返回空串。
+## 大厅房间页拿它显示"已连接：x.x.x.x"，出问题时玩家能直接报出这个地址。
+func server_addr() -> String:
+	return _join_ip if role == Role.CLIENT else ""
+
+
 func game_build() -> String:
 	var v: Dictionary = Engine.get_version_info()
 	return "%s/%s/p%d" % [
@@ -315,6 +321,9 @@ func beacon_info() -> Dictionary:
 		"players": players.size(),
 		"max": Settings.net_max_players,
 		"port": Settings.net_port,
+		# 对局中握手会被拒绝，但让大厅在点击之前就显示"对局进行中"，
+		# 比点进去再弹一条错误提示友好。
+		"active": match_active,
 		"build": game_build(),
 	}
 

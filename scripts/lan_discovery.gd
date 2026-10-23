@@ -182,6 +182,8 @@ func _poll_client() -> void:
 			"players": int(d.get("players", 1)),
 			"max": int(d.get("max", 4)),
 			"build": String(d.get("build", "")),
+			# 旧版本信标没有 active 字段，缺省当成"没在打"，不影响兼容。
+			"active": bool(d.get("active", false)),
 			"seen": Time.get_ticks_msec() / 1000.0,
 		}
 		_rooms[ip] = room
