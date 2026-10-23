@@ -109,8 +109,16 @@ const ENGINE_RANGE := 46.0
 
 var _menu: CanvasLayer
 var _bg: TextureRect
+var _scrim: ColorRect
 var _title_l: Label
 var _menu_l: Label
+## 标题页专用：徽标 + 两个主按钮 + 底部分组操作条。它只属于 state == "title"，
+## 暂停 / 结算 / 选车仍走下面那套居中文字菜单。
+var _title_ui: Control
+var _title_col: VBoxContainer
+var _title_bar: PanelContainer
+var _title_drive_l: Label
+var _title_foot: Label
 ## 选车界面专用：左侧选项列 + 右侧 3D 转台与属性卡。
 ## 它们与 _menu_l 互斥显示——选车界面是"看车"的界面，居中一坨文字排不下这些内容。
 var _select_l: Label
@@ -204,6 +212,9 @@ func _ready() -> void:
 	add_child(hud)
 
 	_build_menu()
+	# 标题页 / 车库的坐标都按"当前可见区域"算，窗口缩放与界面缩放改的是同一个量。
+	# 不接这个信号，从 100% 切到 200% 后按钮与操作条仍停在旧尺寸上，右半截会掉出屏幕。
+	get_viewport().size_changed.connect(_relayout_menu)
 	# 联机：注册主协调器、监听房主事件、建好局域网大厅。大厅本身只是一个
 	# 覆盖层，单机玩家永远不会看到它。
 	Net.setup_game(self)
@@ -653,7 +664,9 @@ func _enter_title() -> void:
 	if _lobby != null:
 		_lobby.close()
 	_clear_battle()
-	_show_menu("坦 克 大 战 3D", "TANK BATTLE 3D\n\n按 Enter 单人出击\n按 L 局域网联机\n\n%s" % _controls_text())
+	# 标题页的内容由 _title_ui 自己搭（徽标 / 主按钮 / 底部操作条），
+	# 居中 Label 那一套只留给暂停与结算页，所以这里不再传说明文字。
+	_show_menu("", "")
 
 
 ## 公开给大厅 / 菜单调用：先离开联机会话，再回标题。
@@ -2069,11 +2082,11 @@ func _build_menu() -> void:
 	_bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_menu.add_child(_bg)
 
-	var scrim := ColorRect.new()
-	scrim.set_anchors_preset(Control.PRESET_FULL_RECT)
-	scrim.color = Color(0, 0, 0, 0.45)
-	scrim.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_menu.add_child(scrim)
+	_scrim = ColorRect.new()
+	_scrim.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_scrim.color = Color(0, 0, 0, 0.45)
+	_scrim.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_menu.add_child(_scrim)
 
 	_title_l = Label.new()
 	_title_l.set_anchors_preset(Control.PRESET_FULL_RECT)
@@ -2099,6 +2112,7 @@ func _build_menu() -> void:
 	_menu_l.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_menu.add_child(_menu_l)
 
+	_build_title_ui()
 	_build_garage()
 
 
@@ -2227,6 +2241,294 @@ func _build_garage() -> void:
 	_menu.add_child(_card)
 
 
+# ---------------- 标题页 ----------------
+#
+# 标题页不再是"一坨居中文字"，而是三层信息：
+#   · 左上：英文小标 + 中文主标题 + 一句定位语；
+#   · 左中：两个大按钮（单人 / 局域网），键位提示贴在按钮右侧；
+#   · 底部：按"驾驶 / 瞄准 / 火力 / 战术 / 系统"分组的操作条。
+# 右半屏刻意留空，让背景里的坦克与爆炸成为画面的一部分。
+#
+# 所有位置在 _layout_title() 里按可见区域算：界面缩放 200% 时 UI 空间只剩
+# 960x540，固定坐标会让底部操作条压住按钮。窗口再矮就整体缩小并收起操作条。
+
+func _build_title_ui() -> void:
+	_title_ui = Control.new()
+	_title_ui.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_title_ui.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_title_ui.visible = false
+	_menu.add_child(_title_ui)
+
+	# 左暗右亮的横向渐变代替全屏遮罩：标题与按钮这一侧需要压暗才读得清，
+	# 而右半屏的坦克与落日是这张背景图的主角，不该被一层灰罩子统一压掉。
+	# 渐变在 85% 屏宽处收到全透明，右侧完全没有多余的一层。
+	var grad := Gradient.new()
+	grad.offsets = PackedFloat32Array([0.0, 0.42, 0.86])
+	grad.colors = PackedColorArray([
+		Color(0.008, 0.012, 0.018, 0.92),
+		Color(0.008, 0.012, 0.018, 0.62),
+		Color(0.008, 0.012, 0.018, 0.0),
+	])
+	var grad_tex := GradientTexture2D.new()
+	grad_tex.gradient = grad
+	grad_tex.fill_from = Vector2(0.0, 0.5)
+	grad_tex.fill_to = Vector2(1.0, 0.5)
+	grad_tex.width = 512
+	grad_tex.height = 8
+	var shade := TextureRect.new()
+	shade.texture = grad_tex
+	shade.set_anchors_preset(Control.PRESET_FULL_RECT)
+	shade.anchor_right = 0.85
+	shade.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	shade.stretch_mode = TextureRect.STRETCH_SCALE
+	shade.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_title_ui.add_child(shade)
+
+	_title_col = VBoxContainer.new()
+	_title_col.add_theme_constant_override("separation", 0)
+	_title_col.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_title_ui.add_child(_title_col)
+
+	var eye := _title_label(_title_col, "T A N K   B A T T L E   3 D", 14,
+			Color(0.96, 0.82, 0.45, 0.90))
+	eye.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.85))
+	eye.add_theme_constant_override("outline_size", 4)
+
+	var title := _title_label(_title_col, "坦克大战 3D", 62, Color(1.0, 0.86, 0.32))
+	title.add_theme_color_override("font_outline_color", Color(0.05, 0.03, 0.02, 0.97))
+	title.add_theme_constant_override("outline_size", 12)
+
+	var tag := _title_label(_title_col, "炮塔分离操控 · 可破坏战场 · 局域网合作", 15,
+			Color(0.88, 0.92, 0.97))
+	tag.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.85))
+	tag.add_theme_constant_override("outline_size", 4)
+
+	_title_gap(24.0)
+	# 主操作：单人战役。青色实心 + 金色左条，和次要的联机入口一眼分开。
+	var solo := _title_button(_title_col, "单人出击", "选择战车、关卡与难度",
+			"Enter", true)
+	solo.pressed.connect(func() -> void:
+		Audio.play("switch")
+		_enter_select())
+	_title_gap(12.0)
+	var lan := _title_button(_title_col, "局域网联机", "2–4 人合作守基地", "L", false)
+	lan.pressed.connect(func() -> void:
+		Audio.play("switch")
+		_enter_lobby())
+	_title_gap(14.0)
+	_title_foot = _title_label(_title_col,
+			"Esc 暂停与设置　·　F11 显示模式　·　F3 输入诊断", 12,
+			Color(0.74, 0.80, 0.86))
+	_title_foot.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.8))
+	_title_foot.add_theme_constant_override("outline_size", 3)
+
+	# 底部操作条：五列分组，一列一件事。整块半透明垫在画面下沿，
+	# 不遮挡战场主体，也让"键盘 / 手柄"两套按键能并排写出来。
+	_title_bar = PanelContainer.new()
+	var bs := StyleBoxFlat.new()
+	bs.bg_color = Color(0.02, 0.03, 0.045, 0.80)
+	bs.border_color = Color(0.30, 0.44, 0.50, 0.55)
+	bs.set_border_width_all(1)
+	bs.set_corner_radius_all(6)
+	bs.content_margin_left = 16.0
+	bs.content_margin_right = 16.0
+	bs.content_margin_top = 9.0
+	bs.content_margin_bottom = 9.0
+	_title_bar.add_theme_stylebox_override("panel", bs)
+	_title_ui.add_child(_title_bar)
+
+	var bar_col := VBoxContainer.new()
+	bar_col.add_theme_constant_override("separation", 3)
+	_title_bar.add_child(bar_col)
+
+	var head := HBoxContainer.new()
+	bar_col.add_child(head)
+	var head_l := _title_label(head, "操 作 一 览", 12, Color(0.86, 0.92, 0.96, 0.85))
+	head_l.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_title_label(head, "键鼠 / 手柄", 11, Color(0.62, 0.70, 0.78))
+
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 16)
+	bar_col.add_child(row)
+	for g in InputSetup.control_rows(Settings.drive_relative):
+		var col := VBoxContainer.new()
+		col.add_theme_constant_override("separation", 1)
+		col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		row.add_child(col)
+		_title_label(col, "▍ " + String(g["label"]), 12, Color(0.55, 0.86, 0.92))
+		var txt := _title_label(col, String(g["text"]), 13, Color(0.88, 0.92, 0.96))
+		txt.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		# 驾驶那一条随设置里的操控方案变（镜头相对 / 履带），记住它好热更新。
+		if String(g["label"]) == "驾驶":
+			_title_drive_l = txt
+
+
+func _title_label(parent: Control, text: String, size: int, col: Color) -> Label:
+	var l := Label.new()
+	l.text = text
+	l.add_theme_font_size_override("font_size", size)
+	l.add_theme_color_override("font_color", col)
+	l.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	parent.add_child(l)
+	return l
+
+
+func _title_gap(h: float) -> void:
+	var c := Control.new()
+	c.custom_minimum_size = Vector2(0, h)
+	c.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_title_col.add_child(c)
+
+
+## 标题页的大按钮：整卡可点，左侧一条强调色，右侧是键位胶囊。
+## 用 Button 承载整块而不是普通面板：鼠标划过有反馈、按下有位移，
+## 玩家不需要"对准文字"才敢点。
+func _title_button(parent: Control, title: String, hint: String, key: String,
+		primary: bool) -> Button:
+	var b := Button.new()
+	b.custom_minimum_size = Vector2(0, 66)
+	b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	# 焦点留给 Enter / L 的语义（始终是"单人 / 联机"），不让鼠标点击改变回车行为。
+	b.focus_mode = Control.FOCUS_NONE
+	b.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
+	parent.add_child(b)
+	_title_button_style(b, primary)
+
+	var stripe := ColorRect.new()
+	stripe.color = Color(1.0, 0.86, 0.32, 0.95) if primary \
+			else Color(0.42, 0.52, 0.58, 0.75)
+	stripe.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	stripe.anchor_bottom = 1.0
+	stripe.offset_right = 4.0
+	b.add_child(stripe)
+
+	var pad := MarginContainer.new()
+	pad.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	pad.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	pad.add_theme_constant_override("margin_left", 18)
+	pad.add_theme_constant_override("margin_right", 14)
+	pad.add_theme_constant_override("margin_top", 8)
+	pad.add_theme_constant_override("margin_bottom", 8)
+	b.add_child(pad)
+
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 12)
+	row.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	pad.add_child(row)
+
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 0)
+	col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	col.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	row.add_child(col)
+	_title_label(col, title, 22 if primary else 21,
+			Color(0.98, 1.0, 1.0) if primary else Color(0.90, 0.94, 0.98))
+	_title_label(col, hint, 12,
+			Color(0.74, 0.84, 0.88) if primary else Color(0.60, 0.68, 0.75))
+
+	var cap := _title_keycap(row, key)
+	cap.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	return b
+
+
+func _title_button_style(b: Button, primary: bool) -> void:
+	var bg := Color(0.10, 0.27, 0.31, 0.94) if primary \
+			else Color(0.045, 0.06, 0.075, 0.90)
+	var bd := Color(0.42, 0.82, 0.88, 0.95) if primary \
+			else Color(0.28, 0.38, 0.44, 0.90)
+	var s := StyleBoxFlat.new()
+	s.bg_color = bg
+	s.border_color = bd
+	s.set_border_width_all(1)
+	s.set_corner_radius_all(5)
+	s.content_margin_left = 0.0
+	s.content_margin_right = 0.0
+	s.content_margin_top = 0.0
+	s.content_margin_bottom = 0.0
+	b.add_theme_stylebox_override("normal", s)
+
+	var hover := s.duplicate() as StyleBoxFlat
+	hover.bg_color = bg.lightened(0.09)
+	hover.border_color = bd.lightened(0.24)
+	b.add_theme_stylebox_override("hover", hover)
+
+	var pressed := s.duplicate() as StyleBoxFlat
+	pressed.bg_color = bg.darkened(0.14)
+	b.add_theme_stylebox_override("pressed", pressed)
+	b.add_theme_stylebox_override("focus", s)
+
+
+func _title_keycap(parent: Control, text: String) -> Label:
+	var l := Label.new()
+	l.text = text
+	l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	l.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	l.add_theme_font_size_override("font_size", 12)
+	l.add_theme_color_override("font_color", Color(0.90, 0.95, 1.0))
+	var s := StyleBoxFlat.new()
+	s.bg_color = Color(0.06, 0.09, 0.11, 0.95)
+	s.border_color = Color(0.36, 0.50, 0.56, 0.90)
+	s.set_border_width_all(1)
+	s.set_corner_radius_all(3)
+	s.content_margin_left = 9.0
+	s.content_margin_right = 9.0
+	s.content_margin_top = 2.0
+	s.content_margin_bottom = 2.0
+	l.add_theme_stylebox_override("normal", s)
+	l.custom_minimum_size = Vector2(56, 26)
+	l.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	parent.add_child(l)
+	return l
+
+
+## 标题页排版。左栏从左上角排、底部操作条锚在屏幕下沿；三档尺寸：
+## 720p 上下按原尺寸、更高的大屏放大到 1.5 倍、更矮的小屏整体缩小；
+## 可见高度不足 470 时收起操作条，让页脚补一句。
+## "按钮都在屏幕里"优先于"操作条一直在"。
+func _layout_title() -> void:
+	if _title_ui == null or _title_col == null or _title_bar == null:
+		return
+	var vp := get_viewport().get_visible_rect().size
+	var side := clampf(vp.x * 0.05, 24.0, 96.0)
+	var bottom := clampf(vp.y * 0.05, 16.0, 56.0)
+	var top := clampf(vp.y * 0.07, 18.0, 96.0)
+	var s := 1.0
+	if vp.y > 720.0:
+		# 大屏上 62px 的标题丢进 1920 宽里只剩一个小角，构图会散。按高度
+		# 放大到最多 1.5 倍，让标题、按钮与操作条的相对占比和 720p 那档一致。
+		s = minf(vp.y / 720.0, 1.5)
+	elif vp.y < 540.0:
+		# 更矮就整体缩小：字号与按钮一起缩，优先保证它们都在屏幕里。
+		s = maxf(vp.y / 540.0, 0.72)
+	var col_w := minf(560.0, maxf((vp.x - side * 2.0) / s, 200.0))
+
+	if _title_drive_l != null:
+		_title_drive_l.text = String(InputSetup.control_rows(Settings.drive_relative)[0]["text"])
+
+	# 底部操作条已经把"系统"那组列出来了；只有在矮屏收起操作条时，
+	# 才让页脚出来补一句，免得同一屏里同一句话出现两次。
+	var show_bar := vp.y >= 470.0
+	_title_bar.visible = show_bar
+	if _title_foot != null:
+		_title_foot.visible = not show_bar
+
+	_title_col.scale = Vector2(s, s)
+	_title_col.position = Vector2(side, top)
+	_title_col.size = Vector2(col_w, _title_col.get_combined_minimum_size().y)
+
+	if _title_bar.visible:
+		# 操作条与标题栏用同一个缩放：1080p 下按 1.5 倍画，字不会比标题小一号。
+		# 锚点固定在左上，再按缩放后的宽高反推尺寸，右边缘才会刚好落在边距上。
+		var bar_h := _title_bar.get_combined_minimum_size().y
+		_title_bar.anchor_left = 0.0
+		_title_bar.anchor_right = 0.0
+		_title_bar.anchor_top = 0.0
+		_title_bar.anchor_bottom = 0.0
+		_title_bar.position = Vector2(side, vp.y - bottom - bar_h * s)
+		_title_bar.size = Vector2((vp.x - side * 2.0) / s, bar_h)
+		_title_bar.scale = Vector2(s, s)
+
+
 func _show_menu(title: String, body: String) -> void:
 	_menu.visible = true
 	_bg.modulate = Color(1, 1, 1, 1)
@@ -2237,15 +2539,28 @@ func _show_menu(title: String, body: String) -> void:
 		_bg.texture = load(path)
 	_title_l.text = title
 
+	# 标题页走单独的版式（左栏按钮 + 底部分组操作条）。它与居中文字互斥：
+	# 两套都留着，标题就会被居中那坨 26px 的说明文字压住，页面上同时出现
+	# 两份"按 Enter 出击"。
+	var title_page: bool = state == "title"
+	_title_ui.visible = title_page
+	_title_l.visible = not title_page
+	# 标题页自带左侧渐变，全屏遮罩只留一点压高光；其余界面仍用 0.45，
+	# 让居中文字压在背景图上读得清。
+	if _scrim != null:
+		_scrim.color.a = 0.16 if title_page else 0.45
+
 	# 选车界面走另一套排版：居中那一坨文字排不下转台与属性卡，两者互斥显示
 	var garage: bool = state == "select"
-	_menu_l.visible = not garage
+	_menu_l.visible = not garage and not title_page
 	_select_l.visible = garage
 	_preview_tex.visible = garage
 	_card.visible = garage
 	_preview_vp.render_target_update_mode = (
 		SubViewport.UPDATE_ALWAYS if garage else SubViewport.UPDATE_DISABLED)
-	if garage:
+	if title_page:
+		_layout_title()
+	elif garage:
 		_layout_garage()
 	else:
 		_title_l.add_theme_font_size_override("font_size", GARAGE_TITLE_FS_TALL)
@@ -2291,6 +2606,21 @@ func _fit_menu_text() -> void:
 		fs -= 1
 	_menu_l.add_theme_font_size_override("font_size", fs)
 	_menu_l.add_theme_constant_override("line_spacing", spacing)
+
+
+## 可见区域变了（窗口缩放 / 界面缩放）就重排当前开着的菜单。
+## 车库与标题页不做重排会保留旧坐标，暂停菜单则会保留旧字号。
+func _relayout_menu() -> void:
+	if _menu == null or not _menu.visible:
+		return
+	match state:
+		"title":
+			_layout_title()
+		"select":
+			_layout_garage()
+		_:
+			if _menu_l.visible:
+				_fit_menu_text()
 
 
 func _hide_menu() -> void:

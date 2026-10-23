@@ -127,6 +127,22 @@ static func _append(name: String, key: int) -> void:
 		InputMap.action_add_event(name, e)
 
 
+## 分组后的操作说明，供标题页底部的操作条逐列渲染。
+##
+## 每组是 {label, text}：label 是左侧分类词，text 是本组按键（用换行分成短句）。
+## 与 controls_text() 描述的是同一套按键，只是排版不同：标题页横向铺开五列，
+## 一列一件事，玩家扫一眼就能定位到"我要开火 / 我要切视角"。
+static func control_rows(drive_relative: bool) -> Array:
+	return [
+		{"label": "驾驶", "text": ("WASD 按画面方向移动\nA / D 单独按 = 原地转车"
+				if drive_relative else "WASD 前进后退\nA / D 原地转车")},
+		{"label": "瞄准", "text": "鼠标 / 右摇杆 转炮塔\n右键 / LT 狙击镜\n滚轮 狙击镜变倍"},
+		{"label": "火力", "text": "左键 / RT 开火\nQ / Y 切换弹种"},
+		{"label": "战术", "text": "Shift / RB 冲刺\nSpace / LB 烟雾弹\nV / R3 切换视角"},
+		{"label": "系统", "text": "Esc 暂停与设置\nF11 显示模式\nF3 输入诊断"},
+	]
+
+
 ## 操作说明文本，菜单与暂停界面共用。
 ## 驾驶那一行由调用方传入：两套操控方案下 WASD 的含义完全不同，写死会误导玩家。
 ## 这里刻意不直接读 Settings —— 本文件是 Settings autoload 的编译依赖，
