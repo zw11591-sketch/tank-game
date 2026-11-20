@@ -375,6 +375,30 @@ func aim_at_angles(world_yaw: float, want_pitch: float, delta: float) -> bool
   否则每一下都"咔"一声像打空了。装填压到 0.05~0.09 s 之后这一档实际上碰不到，
   它是"换弹再慢也永远有反馈"的护栏。
 
+### 3.3.1 镜内火控（边瞄准边射击）
+
+狙击镜不只是放大与测距：举镜之后**观察与射击合并成同一件事**，连射时准星不会被
+后坐震离目标。三条规则，全部由 `player.gd` 驱动：
+
+1. **镜内开火震屏缩放**：`CameraRig.fire_kick()` 在 `sniper` 时乘
+   `SCOPE_KICK_SCALE = 0.5`（`_trauma` / `_fire_push` / `_fov_punch` 同比例）。
+   保留"这一发打出去了"的反馈，但 26° / 14° 的窄视场下不再把准星顶离 40 m 外的
+   一个车身。受伤震屏（`add_trauma`）不缩放。
+2. **火控锁定**：准星连续压在同一个敌车身上 `SCOPE_LOCK_TIME = 0.4 s` 后锁定；
+   准星短暂脱离轮廓有 `SCOPE_LOCK_KEEP = 0.45 s` 的保持，微调不会让锁定闪断。
+   换目标、收镜、目标死亡立即掉锁。HUD 在准星下方画锁定进度条 / "锁定"读数。
+3. **提前量补偿**：锁定成立后，`Player._solved_aim_point()` 把 `aim_point` 换成
+   `Shell.intercept_time()` 解出的拦截点，`fire()` 与 `shot_origin()` 都按这个点走。
+   只在 AP、距离 ≥ `SCOPE_LEAD_MIN_RANGE = 20 m`、目标速度 ≥
+   `SCOPE_LEAD_MIN_SPEED = 2 m/s` 时生效，单发上限 `SCOPE_LEAD_MAX = 6 m`。
+   HE 走抛物线，不参与直线拦截解（切到 HE 时锁定读数一起收掉）。
+
+要点：锁定必须是"持续瞄准"的产物，不是举镜即自瞄——0.4 s 正是"HUD 标尺读出来、
+准星压上去、再扣扳机"所需的时间。验收：`tools/ScopeFireProbe.tscn` 第 2/3 组
+（同一次开火，炮弹初速必须指向拦截点而不是准星当前压着的车体；40 m 处
+crosshair ↔ lead 角差约 2.5°，补偿后 < 0.2°）。
+镜内火控不会在联机两侧产生分歧：方向在击发端算好后随 `submit_shot` 下发。
+
 ### 3.4 玩家技能
 
 | 技能 | 时长 | 冷却 | 效果 |
