@@ -777,6 +777,7 @@ godot --headless --path . res://tools/SmokeRun.tscn
 | `tools/conceal_probe.gd` | 草丛隐蔽、开火暴露、烟幕按云团生效、栅栏被压倒（需窗口模式） |
 | `tools/wreck_probe.gd` | 残骸燃烧期挡车不挡弹；期满自动塌陷、关碰撞、撤销封格；提前塌陷入口 |
 | `tools/garage_shot.gd` | 车库左栏逐行量宽，`FIT summary ... over=0 OK` 即通过 |
+| `tools/garage_gate_probe.gd` | 车库出击闸门：未解锁车被拦且提示真的写进左栏、解锁后能进、探针入口不被拦 |
 | `tools/smoke_test.gd` | 开局、移动、开火、命中、击毁的端到端冒烟 |
 | `tools/net_probe.gd` | 双进程联机：握手、移动同步、开火往返、拆墙、敌车死亡、断线清理 |
 | `tools/run_probe.gd` | Roguelite 数据层：卡表、抽卡、修正累加、经济、境界、词缀、修正、元进度与存档、联机行、跳弹（58 项） |

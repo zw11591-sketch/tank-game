@@ -109,6 +109,13 @@ var max_active := 3
 var _spawn_t := 1.5
 var _respawn_t := 0.0
 var _banner_t := 0.0
+## 菜单期提示（车库拦下出击、补给券不足）。不能沿用战斗横幅：那个挂在 HUD 上，
+## 而车库与暂停菜单里 HUD 是隐藏的，提示写进去等于没写——玩家看到的就是"按 Enter 没反应"。
+var _notice_text := ""
+var _notice_t := 0.0
+## 居中正文的底稿（暂停 / 结算页）。提示条每次都在这份底稿后重新追加，
+## 而不是往已经追加过的文本上再追加——后者每来一条提示就长一截。
+var _menu_body := ""
 var _fortify_t := 0.0
 var _stage_damage_bonus := 0.0
 var _field_t := 10.0
@@ -456,6 +463,18 @@ func _process(delta: float) -> void:
 		_banner_t -= delta
 		if _banner_t <= 0.0:
 			banner_text = ""
+
+	# 车库提示与战斗横幅分开计时：横幅到期时如果顺手清掉提示，
+	# 玩家刚读两秒就会眼看着一行字消失，而它正是解释"为什么按 Enter 没进去"的那行。
+	if _notice_t > 0.0:
+		_notice_t -= delta
+		if _notice_t <= 0.0 and _notice_text != "":
+			_notice_text = ""
+			if state == "select":
+				_refresh_select()
+			elif state == "over" or state == "win":
+				_attach_notice()
+				_fit_menu_text()
 
 	hit_vignette = maxf(0.0, hit_vignette - delta * 1.6)
 
@@ -1092,6 +1111,8 @@ func _enter_select() -> void:
 	# 默认停在存档里的车；未解锁（手改过存档）或没存过就退回名册默认车。
 	var saved := TankRoster.ORDER.find(Meta.default_tank(Settings.selected_tank))
 	_sel_tank = saved if saved >= 0 else maxi(0, TankRoster.ORDER.find(TankRoster.DEFAULT_ID))
+	_notice_text = ""
+	_notice_t = 0.0
 	_show_menu("车 库 · 选 择 战 车 与 挑 战", "")
 	_refresh_select()
 
@@ -1105,15 +1126,22 @@ func _refresh_select() -> void:
 	var unlocked := Meta.is_tank_unlocked(id)
 	var tank_val := "【%s】" % String(tank["full"])
 	if not unlocked:
-		tank_val += "  未解锁 · 需 %d 补给券（U 解锁）" % Meta.tank_cost(id)
+		# 直接写清"为什么出击会被拦下"，而不是只报一个价格：
+		# 玩家按 Enter 没进去时，这行与下方的提示条要能连起来读。
+		# 长度按左栏宽度收过（1080p / 100% 界面缩放下 ≤ 520 px）：
+		# 这一行一旦超宽，AUTOWRAP 就会在中文中间折行。
+		tank_val += "  未解锁 · %d 券（U）· 不能出击" % Meta.tank_cost(id)
 	var txt := "%s 战车   %s\n%s 难度   【%s】\n%s 挑战   【%s】\n%s 地形   【%s】\n" % [
 		marks[0], tank_val,
 		marks[1], DIFF_NAMES[_sel_diff],
 		marks[2], _challenge_name(),
 		marks[3], _terrain_choice_name(),
 	]
-	txt += "\n补给券 %d   最深抵达 第 %d 关   通关 %d 次   挑战通关 %d 次   补给站 第 3/6 关后\n" % [
-		Meta.credits, Meta.best_stage, Meta.wins, Meta.challenge_clears,
+	if _notice_t > 0.0 and _notice_text != "":
+		txt += "▶ %s\n" % _notice_text
+	txt += "\n补给券 %d   最深抵达 第 %d 关\n" % [Meta.credits, Meta.best_stage]
+	txt += "通关 %d 次   挑战通关 %d 次   补给站 第 3/6 关后\n" % [
+		Meta.wins, Meta.challenge_clears,
 	]
 	var keys: Array = ["lives", "credits", "reroll"]
 	var ups: Array = []
@@ -1207,10 +1235,13 @@ func _confirm_start() -> void:
 	# 补给券"而集体失效——那测的就不是物理与战斗，而是存档。
 	var gated: bool = state == "select" or state == "over" or state == "win"
 	if gated and not Meta.is_tank_unlocked(tank_id):
-		_banner("【%s】未解锁 · 需 %d 补给券（U 解锁）" % [
-			String(TankRoster.spec(tank_id)["name"]), Meta.tank_cost(tank_id)], 2.4)
+		_banner("【%s】需 %d 券（现有 %d）· 打完一局按战功结算" % [
+			String(TankRoster.spec(tank_id)["name"]), Meta.tank_cost(tank_id),
+			Meta.credits], 3.2)
 		Audio.play("dry")
 		return
+	_notice_text = ""
+	_notice_t = 0.0
 	difficulty = _sel_diff
 	score = 0
 	# 局结构固定 9 关，不再从第 N 关开始。
@@ -2840,6 +2871,22 @@ func _medals(won: bool) -> Array:
 func _banner(text: String, dur := 2.0) -> void:
 	banner_text = text
 	_banner_t = dur
+	# 车库 / 暂停 / 结算都盖着战斗 HUD，`banner_text` 在那儿没人画。
+	# 这些状态里把同一条文字转存一份，由各自界面自己显示：
+	#   * 车库：写进左栏选项下方（`_refresh_select`）；
+	#   * 暂停与结算：追加到居中正文末尾（`_attach_notice`）。
+	if state == "select":
+		_notice_text = text
+		_notice_t = maxf(dur, 3.0)
+		# 提示会加一行，字号必须按加上之后的高度重新收，否则矮窗口上最后一行被裁。
+		_refresh_select()
+	elif state == "pause" or state == "over" or state == "win":
+		_notice_text = text
+		_notice_t = maxf(dur, 3.0)
+		_attach_notice()
+	else:
+		_notice_text = ""
+		_notice_t = 0.0
 
 
 # ---------------- 菜单 UI ----------------
@@ -3312,6 +3359,10 @@ func _show_menu(title: String, body: String) -> void:
 	elif ResourceLoader.exists(path):
 		_bg.texture = load(path)
 	_title_l.text = title
+	# 居中正文的"底稿"：暂停 / 结算页的提示条要在这份文字后面追加。
+	# 无条件覆盖而不是"非空才写"：标题与车库都传空串，留着上一页的底稿
+	# 会在下一次进暂停页时把结算页的文字又贴回来。
+	_menu_body = body
 
 	# 标题页走单独的版式（左栏按钮 + 底部分组操作条）。它与居中文字互斥：
 	# 两套都留着，标题就会被居中那坨 26px 的说明文字压住，页面上同时出现
@@ -3339,9 +3390,22 @@ func _show_menu(title: String, body: String) -> void:
 	else:
 		_title_l.add_theme_font_size_override("font_size", GARAGE_TITLE_FS_TALL)
 		_title_l.offset_top = GARAGE_TITLE_TOP_TALL
-		if body != "":
-			_menu_l.text = body
+		_attach_notice()
 		_fit_menu_text()
+
+
+## 把菜单期提示追加到居中正文末尾。
+##
+## 暂停与结算页的正文是一整块居中 Label，字号由 `_fit_menu_text()` 按"排得下"反算。
+## 所以提示必须拼进同一份文本再统一排版：单独放一个 Label 会与正文抢同一块
+## 垂直空间，在矮窗口上变成两段文字互相压住。
+func _attach_notice() -> void:
+	if _menu_l == null:
+		return
+	var body := _menu_body
+	if _notice_t > 0.0 and _notice_text != "":
+		body += "\n\n▶ " + _notice_text
+	_menu_l.text = body
 
 
 ## 居中正文的字号按可用高度反算。
@@ -3465,17 +3529,26 @@ func _fit_garage_text(width: float, height: float) -> void:
 	const MIN_FS := 11
 	const SPACINGS := [8, 6, 4, 2, 0]
 	var f := ThemeDB.fallback_font
-	var widest := 0.0
+	# 量的是**左栏当前的整段文字**（含提示条与操作说明），不是只看操作说明那一份。
+	# 只看操作说明时，车型行的"未解锁 · … · 不能出击"这类长句从来没被量过，
+	# 于是字号一直停在 20，宽度 640 px 的那一行在 560 宽的栏里被 AUTOWRAP
+	# 从中文中间折断——车库看上去"没问题"，其实是折在词中间。切车、提示出现与
+	# 消失都会改文本，所以每次都按最新文本量。
+	var lines: Array = []
 	for rel in [true, false]:
-		for line in InputSetup.controls_text(rel).split("\n"):
-			widest = maxf(widest, f.get_string_size(line,
-					HORIZONTAL_ALIGNMENT_LEFT, -1, DESIGN_FS).x)
-	var lines := _select_l.text.split("\n").size()
+		lines.append_array(InputSetup.controls_text(rel).split("\n"))
+	if _select_l != null:
+		lines.append_array(_select_l.text.split("\n"))
+	var widest := 0.0
+	for line in lines:
+		widest = maxf(widest, f.get_string_size(String(line),
+				HORIZONTAL_ALIGNMENT_LEFT, -1, DESIGN_FS).x)
+	var nlines := _select_l.text.split("\n").size()
 	var fs := DESIGN_FS
 	while fs >= MIN_FS:
 		if widest * (float(fs) / DESIGN_FS) <= width - 8.0:
 			for sp in SPACINGS:
-				if lines * (f.get_height(fs) + sp) <= height:
+				if nlines * (f.get_height(fs) + sp) <= height:
 					_select_l.add_theme_font_size_override("font_size", fs)
 					_select_l.add_theme_constant_override("line_spacing", sp)
 					return
