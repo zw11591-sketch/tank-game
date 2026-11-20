@@ -7,6 +7,18 @@ extends Tank
 
 enum State { SEEK, ENGAGE, FLANK, RETREAT }
 
+## 正面 AP 跳弹阈值角（度），按车型。取值区间 38°~52°，与玩家默认 45° 同表比较。
+##
+## 阈值越低 = 正面越硬：入射角超过它（且仍在正面 < 55°）的 AP 必然跳弹。
+## 重型与 Boss 靠这个把"正面硬甩"变成坏习惯，侦察与火炮则相反——正面照穿。
+const ENEMY_RICOCHET := {
+	0: 52.0,  # 侦察：轻甲不导流
+	1: 46.0,  # 中型：略高于玩家
+	2: 38.0,  # 重型：正面跳弹区最大
+	3: 50.0,  # 火炮：车体薄
+	4: 40.0,  # Boss：正面硬化
+}
+
 var etype := 0
 var points := 100
 var difficulty := 1
@@ -46,6 +58,18 @@ var _cover_search_cd := 0.0
 ## 再远就来不及在装填结束前退回去，行为会退化成"整场都在赶路"。
 const COVER_SEARCH_CELLS := 3
 const COVER_MAX_DIST := 14.0
+
+## ---- Roguelite：词缀 ----
+## 词缀由 EnemyAffix.roll() 决定、apply() 写入。这里只保留字段与钩子。
+var affixes: Array = []
+## 易爆：被击毁时原地爆炸（伤害由 main 结算，因为只有房主能改玩家 hp）。
+var volatile_bomb := false
+## 神射：瞄准散布系数（1.0 为正常，0.6 为散布缩到 60%）。
+var aim_spread_mult := 1.0
+## 神射：反应延迟缩短量（秒），从 _react_t 里减掉。
+var react_bonus := 0.0
+## 硬化修正：敌人受到的伤害系数。由 main 在生成时写入。
+var damage_scale := 1.0
 ## 草丛隐蔽的有效距离：超过这个距离就看不见蹲草的玩家。
 ## 20 m 大致是"一辆车从掩体后开到你面前"所需的时间，玩家有反应余地。
 const CONCEAL_SIGHT := 20.0
@@ -149,6 +173,17 @@ func configure(t: int, stage: int, diff: int) -> void:
 			damage = int(damage * 1.2)
 			reload_time *= 0.8
 	hp = max_hp
+
+	# 正面跳弹阈值按车型分化（docs/design/10_full_design.md 第 6.1 节）。
+	#
+	# 语义与玩家侧完全相同：正面、AP、入射角大于该值（且 < 55°）时必然跳弹。
+	# 于是阈值越低，正面越"硬"：
+	#   * 重型 38° / Boss 40°：正面硬化，硬甩正面会被弹开，逼玩家绕侧面；
+	#   * 中型 46°：介于两者之间；
+	#   * 侦察 52° / 火炮 50°：装甲薄、不导流，正面照穿。
+	#
+	# 客户端那份复制品也走 configure()，所以两端读到的阈值一致，准星提示不会撒谎。
+	ricochet_angle = ENEMY_RICOCHET[t]
 
 
 ## 车体涂装。亮度不是美术偏好而是判据：涂装值太低的车在暗图上直接压进黑场，
@@ -256,6 +291,12 @@ func _update_engine_pitch() -> void:
 
 # ---------------- 主循环 ----------------
 
+## 硬化修正 + 重甲词缀：敌人吃到的伤害在这里打折。
+## 覆盖 Tank 的钩子（基类恒为 1.0），于是玩家永远不受这两项影响。
+func damage_taken_mult(_kind: int) -> float:
+	return damage_scale
+
+
 func tick(delta: float) -> void:
 	# 客户端上的敌车是快照复制品，AI 只在房主那边跑。
 	if is_remote:
@@ -286,7 +327,8 @@ func tick(delta: float) -> void:
 
 	if _aim_err_t <= 0.0:
 		_aim_err_t = randf_range(0.35, 0.9)
-		var spread: float = [3.2, 1.9, 1.0][difficulty] * (1.0 + _prefer_range * 0.012)
+		var spread: float = [3.2, 1.9, 1.0][difficulty] * (1.0 + _prefer_range * 0.012) \
+				* aim_spread_mult
 		_aim_err = Vector3(randf_range(-spread, spread), 0.0, randf_range(-spread, spread))
 
 	# 脱困优先于一切行为：被掩体或另一辆坦克卡住时先倒车转向脱开，
@@ -384,7 +426,7 @@ func _update_state(sees: bool, _delta: float) -> void:
 		# 反应延迟必须在**每一次**换状态时都给：原来只有 ENGAGE 给，
 		# 于是"先侧绕再开火"和"一看不见就后撤"这两条路径绕过了难度差异——
 		# 困难档的敌人在这两种状态下反应速度和简单档一模一样。
-		_react_t = [0.75, 0.45, 0.2][difficulty]
+		_react_t = maxf(0.08, [0.75, 0.45, 0.2][difficulty] - react_bonus)
 		if state == State.FLANK or state == State.RETREAT:
 			# 侧绕与后撤本来就比正面交战慢半拍，多给一点时间，读起来才像"在判断"
 			_react_t *= 1.5

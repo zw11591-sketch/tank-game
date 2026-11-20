@@ -57,6 +57,46 @@ const CLOSE_TURRET_RANGE := 18.0
 ## 近距离炮塔回转倍率。只在这一帧的 aim_at_angles() 里生效，
 ## 远距离与倒计时预瞄仍是名册里的原值（炮塔转速是车型差异，不能被推翻）。
 const CLOSE_TURRET_BOOST := 1.9
+## 举镜（狙击镜）时的炮塔跟瞄倍率。
+##
+## 狙击镜把视野收到 26° / 14°，玩家在镜里做的动作是"用准星咬住远处那辆车然后
+## 立刻开火"——而炮塔仍按名册转速（1.3~4.6 rad/s）去追。100 m 外差 2° 就是 3.5 m，
+## 一圈准星环都圈不住的身位；等炮塔转过去再开火，那辆车已经换位置了。
+## 所以只在举镜时把回转速度抬到 1.6 倍：镜内"边瞄边打"才成立，
+## 第三人称的炮塔手感、歼击车的射界与车型差异全部保持原样（不举镜时这个倍率不生效）。
+## 不能再高：2 倍以上时炮塔会开始"抢镜"，玩家微调准星时炮管先一步甩过去，
+## 读起来像鼠标自己动了一下。
+const SCOPE_TURRET_BOOST := 1.6
+## ---- 镜内连射（边瞄准边射击） ----
+##
+## 狙击镜原来的作用只有"放大 + 测距"：每一发都要把视线从目标上移开去等后坐，
+## 连射时准星被震屏顶走，远距离的第二次、第三次击发全靠重新找目标。镜内的
+## 观察与射击实际上是两件事，于是玩家只在"准备打一发"时才举镜。
+##
+## 这一档把两者合并：
+##   * `CameraRig` 在镜内按 `SCOPE_KICK_SCALE` 缩放开火震屏 / 后推 / 视场冲击，
+##     读得清"打出去了"，但准星不会被顶离目标；
+##   * 准星连续压在同一个敌人身上 `SCOPE_LOCK_TIME` 之后进入**火控锁定**，
+##     此后每一发都按目标的移动速度解提前量（`_lead_point`）。
+##     锁定是"持续瞄准"的产物，不是自动瞄准：准星离开目标、换目标、收镜都会掉锁。
+##
+## 提前量只补偿**目标自己走掉的那一段**，并设上限：40 m 外 12 m/s 的目标飞 0.16 s
+## 只走 1.9 m，补它是"本该打中的那一发真的打中"；而把上限锁死在
+## `SCOPE_LEAD_MAX`，高速贴脸的目标也不会被补到车外去。
+const SCOPE_LOCK_TIME := 0.4
+## 准星短暂离开目标后的锁定保持时间（秒）。玩家微调准星时会有一两帧脱离轮廓，
+## 立刻掉锁会让锁定反复闪烁、提前量忽有忽无；0.45 s 足够覆盖微调，
+## 又不足以让"移开准星去瞄别处"还继续补偿上一辆车。
+const SCOPE_LOCK_KEEP := 0.45
+## 锁定目标的最低速度（m/s）。静止目标没有提前量可算，锁定状态留着，
+## 但 `_lead_point` 不改变弹道——否则"补偿 0.0 m"会让 HUD 多画一条没意义的读数。
+const SCOPE_LEAD_MIN_SPEED := 2.0
+## 提前量补偿的生效距离（m）。近距离的目标 0.03 s 就飞到了，补偿没有意义，
+## 而且会让"甩炮"的手感变钝；只在真正的远射里启用。
+const SCOPE_LEAD_MIN_RANGE := 20.0
+## 单发提前量上限（m）。约等于一辆中型车的一半车长：超过这个量说明目标比炮弹
+## 还快或正横着高速通过，补偿不再可靠，交回玩家自己判断。
+const SCOPE_LEAD_MAX := 6.0
 ## 压炮的落点高度（离地）。车体命中体是 0~2.0 m 的圆柱，1.0 m 就是它的中心：
 ## 弹道只要指向它，就一定从正面落进车体，而不是从车顶或炮塔上沿擦过去。
 const CLOSE_AIM_Y := 1.0
@@ -169,6 +209,11 @@ var hit_ricochet := false
 
 var _base_speed := 15.0
 var _base_turn := 2.5
+## 名册基线。卡牌修正每次从它重算，所以 apply_run_mods() 可以重复调用而不会叠加两次。
+var _roster_speed := 15.0
+var _roster_turn := 2.5
+var _roster_boost_cd := 9.0
+var _roster_smoke_cd := 22.0
 ## 本下点击是否已经排上一发。**不设过期时间**：点一下就必须打出去一发，
 ## 装填还要 0.05 秒还是 5 秒只是"什么时候响"，不是"响不响"。
 ## 以前这里是一个 0.30 秒的缓冲窗口，窗口外的点击被丢掉——读起来就是"点击没反应"。
@@ -180,6 +225,15 @@ var _dry_cd := 0.0
 ## 开火键已连续按住多久（秒）。松开即清零，于是"按住连发"按 HOLD_FIRE_INTERVAL 走，
 ## 而每一次新的按下都还是当帧击发。
 var _hold_t := 0.0
+## 镜内火控锁定的目标与已连续压住它的时间（见 SCOPE_LOCK_TIME）。
+## `scope_lock_ready` / `scope_lock_ratio` 是给 HUD 读的公开状态。
+var _scope_lock: Tank = null
+var _scope_lock_t := 0.0
+var _scope_lock_keep := 0.0
+var scope_lock_ready := false
+var scope_lock_ratio := 0.0
+## 锁定目标在炮弹飞行期间会走出的距离（m），给 HUD 的"自动补偿"读数用。
+var scope_lead_len := 0.0
 ## 本帧的舵是不是玩家用 A/D 亲自给的（见 _carry_aim_with_steer）。
 ## W 的自动对齐由准星驱动车头，不能反向补准星；只有 A/D 的转角要带着准星一起转。
 var _steer_aim := false
@@ -262,6 +316,10 @@ func _apply_roster() -> void:
 
 	_base_speed = move_speed
 	_base_turn = turn_speed
+	_roster_speed = move_speed
+	_roster_turn = turn_speed
+	_roster_boost_cd = boost_cd_max
+	_roster_smoke_cd = smoke_cd_max
 
 
 func model_key() -> String:
@@ -298,6 +356,21 @@ func apply_difficulty(diff: int) -> void:
 	max_hp = int(round(max_hp * DIFF_HP[d]))
 	reload_time = reload_time * DIFF_RELOAD[d]
 	hp = max_hp
+
+
+## 卡牌修正的玩家侧部分：极速 / 转向走 `_base_*`，因为 tick() 每帧都会从
+## 这两个字段重算 move_speed（冲刺与过载是乘在它们上面的临时增益）。
+##
+## 冷却走"名册基线 × (1 − cdr)"，同样从基线重算，避免重复调用把冷却越减越短。
+func apply_run_mods(m: Dictionary, heal := false) -> void:
+	super.apply_run_mods(m, heal)
+	_base_speed = _roster_speed * float(m.get("speed", 1.0))
+	_base_turn = _roster_turn * float(m.get("turn", 1.0))
+	move_speed = _base_speed
+	turn_speed = _base_turn
+	var cdr: float = clampf(float(m.get("cdr", 0.0)), 0.0, 0.6)
+	boost_cd_max = _roster_boost_cd * (1.0 - cdr)
+	smoke_cd_max = _roster_smoke_cd * (1.0 - cdr)
 
 
 func tick(delta: float) -> void:
@@ -354,6 +427,14 @@ func tick(delta: float) -> void:
 	# ---- 转塔：右摇杆是鼠标之外的第二套瞄准 ----
 	_look_with_stick(delta)
 
+	# ---- 视角：狙击镜状态必须在瞄准之前更新 ----
+	# 炮塔倍率、镜内火控锁定、HUD 的镜框都读 `rig.sniper`；放在瞄准之后再置位，
+	# 这一帧的炮塔与锁定都会按"上一帧有没有举镜"去算，举镜后的第一帧等于没生效。
+	# 举镜与第一人称切换都允许在倒计时 / 结算阶段使用（环视与预瞄）。
+	rig.set_sniper(Input.is_action_pressed("aim_scope"))
+	if InputSetup.edge("toggle_view"):
+		rig.toggle_first_person()
+
 	# ---- 瞄准：鼠标给的是世界角度，炮塔按自身回转速度去追 ----
 	# 俯仰**不做平滑**：aim_pitch 就是玩家给的角度，炮管当帧照做。
 	# 曾经有一段 `_converge_pitch()`，在准星压住敌车时把炮管往敌车的 `aim_height`
@@ -370,19 +451,23 @@ func tick(delta: float) -> void:
 	# 近战压炮要放在回转之前：它会把 rig.aim_pitch 压低，炮塔与准星射线都要按
 	# 压低后的角度走，否则准星在顶上、炮管在下面，两边各说各话。
 	_apply_close_assist()
+	# 火控锁定同理：它要把 `aim_point` 挪到提前量点上，炮塔就该按**补偿之后**
+	# 的方向转过去。反过来写（先转塔再补偿）的话，炮管永远差着提前量那一截，
+	# 而 fire() 的打点修正只能救 18° 以内的差——远射时正好崩在这一档上。
+	_update_scope_lock(delta)
 
 	var slew := turret_speed
+	var chase := 1.0
+	if rig.sniper:
+		chase *= SCOPE_TURRET_BOOST
 	if _close_target():
-		turret_speed = slew * CLOSE_TURRET_BOOST
+		chase *= CLOSE_TURRET_BOOST
+	turret_speed = slew * chase
 	aim_at_angles(rig.aim_yaw, rig.aim_pitch, delta)
 	turret_speed = slew
 	# 近战时炮口（车头前 3.8 m）可能已经越过对方车体，fire() 需要知道准星落在哪
 	# 才能把出发点收回来。准星射线本来每帧就要打一次（HUD 要用），这里不额外花销。
-	aim_point = rig.aim_point()
-
-	# 视角切换在倒计时与结算阶段也该可用，所以放在开火判定之前
-	if InputSetup.edge("toggle_view"):
-		rig.toggle_first_person()
+	aim_point = _solved_aim_point()
 
 	if game.state != "play":
 		# 倒计时与结算阶段可以环视、预瞄、挪车，但不能开火与放技能。
@@ -397,8 +482,7 @@ func tick(delta: float) -> void:
 	#
 	# 两条输入通道都算数：edge() 处理"物理帧上读到的按下"，`_fire_latch` 处理
 	# "落在两个物理帧之间、轮询看不到的那一下"。后者是"点了没反应"的最后一个来源，
-	# 所以按下本身在事件层就锁存（见 _unhandled_input）。
-	rig.set_sniper(Input.is_action_pressed("aim_scope"))
+	# 所以按下本身在事件层就锁存（见 _unhandled_input）。举镜状态已在上面更新。
 	if InputSetup.edge("zoom_in"):
 		rig.cycle_zoom(1)
 	elif InputSetup.edge("zoom_out"):
@@ -749,6 +833,109 @@ func _snap_turret_to_aim() -> void:
 	if absf(angle_difference(turret.rotation.y, want)) > FIRE_SNAP_MAX:
 		return
 	turret.rotation.y = want
+
+
+## ---------------- 镜内火控：边瞄准边射击 ----------------
+
+## 本帧炮口该去的世界点。
+##
+## 平时就是准星射线打中的位置。镜内火控锁定成立时，换成目标在炮弹飞行期间
+## 走到的那一点（提前量点）——`fire()` 用它解发射方向，`shot_origin()` 用它
+## 决定出发点，HUD 的"自动补偿"读数也从这里来。三者必须同源：
+## 只要有一处还在用当前车体位置，屏幕上就会同时出现"该打这里"和"炮弹飞向那里"。
+func _solved_aim_point() -> Vector3:
+	var cross := rig.aim_point()
+	if not scope_lock_ready or _scope_lock == null:
+		return cross
+	if _shell_kind_now() != Shell.Kind.AP:
+		return cross
+	return _lead_point(cross, _scope_lock)
+
+
+## 目标在炮弹飞到之前会走到的位置。
+##
+## 只在 AP、锁定、20 m 以外、目标速度 ≥ 2 m/s 时生效；提前量上限 `SCOPE_LEAD_MAX`。
+## 近距离（< 20 m）不补：0.03 s 就飞到了，补出来的只是炮口抖动。
+func _lead_point(at: Vector3, t: Tank) -> Vector3:
+	if not is_instance_valid(t) or not t.alive:
+		return at
+	var vel := t.motion_velocity()
+	vel.y = 0.0
+	if Vector2(vel.x, vel.z).length() < SCOPE_LEAD_MIN_SPEED:
+		return at
+	var from := muzzle_pos()
+	if from.distance_to(at) < SCOPE_LEAD_MIN_RANGE:
+		return at
+	var flight := Shell.intercept_time(from, at, vel, Shell.AP_SPEED)
+	if flight <= 0.0:
+		return at
+	var lead := vel * flight
+	var max_len := SCOPE_LEAD_MAX
+	if lead.length() > max_len:
+		lead = lead.normalized() * max_len
+	return at + lead
+
+
+## 当前实际会打出的弹种。HE 走抛物线，直线拦截解不适用。
+func _shell_kind_now() -> int:
+	return shell_kind if can_use_he else Shell.Kind.AP
+
+
+## 镜内火控锁定：准星在同一个敌人身上连续停留 `SCOPE_LOCK_TIME` 后成立。
+##
+## 为什么要有这个延迟，而不是"举起镜来就算锁定"：
+##   * 举镜是一个 0.1 s 的动作，举起镜的第一帧准星往往还在目标旁边扫过，
+##     立刻补偿会把"顺手甩过去"的那一发也按提前量打出去，读起来像自瞄；
+##   * 0.4 s 是"HUD 标尺读出来、准星压上去、再扣扳机"所需的时间，
+##     它要求玩家真的在瞄，而不是只把镜举起来；
+##   * 微调准星时准星会短暂脱离轮廓，`SCOPE_LOCK_KEEP` 负责不让锁定闪烁。
+func _update_scope_lock(delta: float) -> void:
+	scope_lock_ratio = 0.0
+	scope_lead_len = 0.0
+	scope_lock_ready = false
+	if not rig.sniper or not alive:
+		_clear_scope_lock()
+		return
+	var tgt: Tank = rig.aim_target()
+	if tgt != null and (not is_instance_valid(tgt) or not tgt.alive \
+			or tgt == self or tgt.team == team):
+		tgt = null
+	if tgt != null:
+		if tgt != _scope_lock:
+			_scope_lock = tgt
+			_scope_lock_t = 0.0
+		_scope_lock_t += delta
+		_scope_lock_keep = SCOPE_LOCK_KEEP
+	elif _scope_lock != null:
+		# 准星短暂离开目标：保持一小段时间，微调时锁定不闪断
+		_scope_lock_keep -= delta
+		if _scope_lock_keep <= 0.0:
+			_clear_scope_lock()
+			return
+	if _scope_lock == null:
+		return
+	if not is_instance_valid(_scope_lock) or not _scope_lock.alive:
+		_clear_scope_lock()
+		return
+	scope_lock_ratio = clampf(_scope_lock_t / SCOPE_LOCK_TIME, 0.0, 1.0)
+	scope_lock_ready = _scope_lock_t >= SCOPE_LOCK_TIME
+	# HE 不走直线拦截解（它吃重力、走低抛弹道），所以锁定只对 AP 成立。
+	# 切到 HE 时把锁定读数与计时一起清掉：留着"已锁定"却打不出补偿，比不显示更误导；
+	# 计时不清的话，切回 AP 的那一帧会瞬间完成锁定（时间是在 HE 下偷偷攒的）。
+	if _shell_kind_now() != Shell.Kind.AP:
+		_scope_lock_t = 0.0
+		scope_lock_ratio = 0.0
+		scope_lock_ready = false
+		return
+	if scope_lock_ready:
+		scope_lead_len = _lead_point(rig.aim_point(), _scope_lock).distance_to(rig.aim_point())
+
+
+func _clear_scope_lock() -> void:
+	_scope_lock = null
+	_scope_lock_t = 0.0
+	_scope_lock_keep = 0.0
+
 
 ## 右摇杆瞄准：鼠标之外的第二套瞄准通道。摇杆给的是角速度，所以需要 delta。
 func _look_with_stick(delta: float) -> void:

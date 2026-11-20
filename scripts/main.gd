@@ -2,11 +2,23 @@ extends Node3D
 ## 主协调器：标题 / 难度选关 / 关卡流程 / 波次生成 / 计分连击 / 道具 / 胜负判定。
 ## 所有子节点（战场、坦克、炮弹、道具、HUD）均在运行时构建。
 
-const MAX_STAGE := 8
+const MAX_STAGE := 9
 const MAX_LIVES := 3
 const COMBO_WINDOW := 4.5
 const COMBO_MAX := 5.0
 const DROP_CHANCE := 0.34
+
+## ---- Roguelite：补给站 ----
+## 每 3 关（战区末尾）出现一次。价格是常量、不随关卡上涨：
+## 补给站的吸引力应该来自"买得起什么"，而不是"越买越贵"。
+const STATION_ITEMS := [
+	{"name": "全面维修", "desc": "全员回满结构 + 5 秒护盾", "cost": 120},
+	{"name": "战术档案", "desc": "获得随机稀有或史诗强化", "cost": 180},
+	{"name": "备用车体", "desc": "本局每人 +1 条命", "cost": 260},
+]
+const STATION_FIX := 0
+const STATION_CARD := 1
+const STATION_LIFE := 2
 
 ## 场地补给：战斗中定时空投，与击杀掉落互不干扰。
 ## 有了它，玩家在没打死人的空窗期也有"去抢个增益"的事可做。
@@ -130,6 +142,8 @@ var _preview_model: Node3D
 var _sel_row := 0
 var _sel_diff := 1
 var _sel_stage := 0
+## 挑战：Mutators.NONE / DAILY / ELITE（车库第三行）
+var _sel_challenge := Mutators.NONE
 ## 所选车型在 TankRoster.ORDER 里的下标
 var _sel_tank := 0
 ## -1 表示"随机"：每关按关号轮换地形
@@ -161,6 +175,22 @@ var _net_client_updates := 0
 
 const DIFF_NAMES := ["简单", "普通", "困难"]
 const SELECT_ROWS := 4
+
+## ---- Roguelite：Run 界面与关卡运行状态 ----
+var run_ui: RunUI
+var _run_layer: CanvasLayer
+## 补给站商品（每次进站重建）：[{name, desc, cost, sold, enabled}]
+var _station: Array = []
+## 坚守关剩余时间；非坚守关为 0
+var hold_left := 0.0
+## 本局是否已经结算过：结算页、返回标题与联机结束都走同一个入口，避免重复发补给券。
+var _run_settled := false
+## 本局是否真的开过（决定结算页要不要显示 Run 段落）。中途退到标题也要结算，
+## 所以不能用 Run.active 判断——结算函数自己会把它关掉。
+var _run_played := false
+## 客户端已套用到车上的 mods 版本。快照 25 Hz，只有卡牌真的变了才重算，
+## 否则每帧重算一次会按比例回填血量，队友挨的伤在客户端上看起来会"回血"。
+var _run_mods_version := -1
 
 ## 车库标题的字号与顶边距。1080p 设计空间（界面缩放 100%）沿用 62px / y=90，
 ## 与改造前完全一致；界面缩放 200% 时可见区只剩 960x540，62px 的标题要占掉
@@ -210,6 +240,20 @@ func _ready() -> void:
 	hud.game = self
 	hud.visible = false
 	add_child(hud)
+
+	# Roguelite 覆盖层走独立 CanvasLayer：HUD 在 layer 5，结算与暂停菜单在 layer 8，
+	# 三选一与补给站必须压在 HUD 之上、菜单之下。
+	_run_layer = CanvasLayer.new()
+	_run_layer.layer = 7
+	add_child(_run_layer)
+	run_ui = RunUI.new()
+	run_ui.process_mode = Node.PROCESS_MODE_ALWAYS
+	_run_layer.add_child(run_ui)
+	run_ui.card_picked.connect(_on_card_picked)
+	run_ui.rerolled.connect(_on_card_reroll)
+	run_ui.skipped.connect(_on_card_skip)
+	run_ui.station_bought.connect(_on_station_buy)
+	run_ui.station_closed.connect(_on_station_close)
 
 	_build_menu()
 	# 标题页 / 车库的坐标都按"当前可见区域"算，窗口缩放与界面缩放改的是同一个量。
@@ -269,6 +313,12 @@ func _unhandled_input(event: InputEvent) -> void:
 				_adjust_selection(-1)
 			elif event.is_action_pressed("ui_right"):
 				_adjust_selection(1)
+			elif event is InputEventKey and event.pressed and not event.echo \
+					and (event as InputEventKey).keycode == KEY_U:
+				_unlock_selected_tank()
+			elif event is InputEventKey and event.pressed and not event.echo \
+					and (event as InputEventKey).keycode in [KEY_1, KEY_2, KEY_3]:
+				_buy_upgrade((event as InputEventKey).keycode - KEY_1)
 			elif event.is_action_pressed("ui_accept"):
 				_confirm_start()
 			elif event.is_action_pressed("ui_cancel"):
@@ -276,6 +326,30 @@ func _unhandled_input(event: InputEvent) -> void:
 		"ready", "play", "clear":
 			if event.is_action_pressed("pause"):
 				_set_pause(true)
+		"reward":
+			if event.is_action_pressed("ui_up"):
+				run_ui.move(-1)
+			elif event.is_action_pressed("ui_down"):
+				run_ui.move(1)
+			elif event.is_action_pressed("ui_left"):
+				run_ui.move(-1)
+			elif event.is_action_pressed("ui_right"):
+				run_ui.move(1)
+			elif event.is_action_pressed("ui_accept"):
+				run_ui.confirm()
+			elif event.is_action_pressed("restart"):
+				run_ui.reroll()
+			elif event.is_action_pressed("ui_cancel"):
+				run_ui.back()
+		"station":
+			if event.is_action_pressed("ui_up"):
+				run_ui.move(-1)
+			elif event.is_action_pressed("ui_down"):
+				run_ui.move(1)
+			elif event.is_action_pressed("ui_accept"):
+				run_ui.confirm()
+			elif event.is_action_pressed("ui_cancel"):
+				run_ui.back()
 		"pause":
 			if event.is_action_pressed("pause") or event.is_action_pressed("ui_accept"):
 				_set_pause(false)
@@ -396,6 +470,14 @@ func _process(delta: float) -> void:
 
 	_update_damage_marks(delta)
 
+	# 坚守倒计时由房主推进；客户端只读快照里的 `hold`。
+	# 客户端本地也减一次会让倒计时走得更快，而且归零时会在本地触发
+	# "敌人撤退 + 进入 clear"，把房主还在跑的那一关提前结束。
+	if not Net.is_client() and hold_left > 0.0 and state == "play":
+		hold_left = maxf(0.0, hold_left - delta)
+		if hold_left <= 0.0:
+			_hold_complete()
+
 	# 车库转台：只在选车界面转，且只在真有展品时转
 	if state == "select" and _preview_model != null and is_instance_valid(_preview_model):
 		_preview_holder.rotation.y += delta * 0.5
@@ -425,11 +507,7 @@ func _process(delta: float) -> void:
 			if not Net.is_client():
 				state_timer -= delta
 				if state_timer <= 0.0:
-					if stage >= MAX_STAGE:
-						_win()
-					else:
-						stage += 1
-						_start_stage()
+					_on_clear_timeout()
 
 
 func _update_play(delta: float) -> void:
@@ -477,19 +555,288 @@ func _update_play(delta: float) -> void:
 			still.append(item)
 	_net_respawn = still
 
-	if enemies_remaining() == 0 and not _stage_cleared:
-		_stage_cleared = true
-		state = "clear"
-		state_timer = 3.4
-		_refresh_mouse_mode()
-		score += 1000 + stage * 250
-		_banner("第 %d 关 肃清！ +%d" % [stage, 1000 + stage * 250], 3.4)
-		Audio.play("power")
+	# 坚守关：场上打空就补一波，直到计时归零。不补的话"坚守"会变成
+	# "开局清光敌人然后干等一分钟"，压力曲线完全消失。
+	if Run.active and Run.is_hold() and not _stage_cleared and hold_left > 0.0 \
+			and spawn_queue.is_empty() and enemies_remaining() == 0:
+		_build_hold_wave()
+
+	if not Run.is_hold() and enemies_remaining() == 0 and not _stage_cleared:
+		_complete_stage_clear("第 %d 关 肃清！" % stage, 1000 + stage * 250)
 
 
-## 坦克互推：CharacterBody3D 之间不会相互推挤，两辆车一旦挤到一起就谁也动不了，
-## 这就是"两个坦克叠在一起卡住"的根源。每物理帧做两件独立的事：
-##
+## 一关达成目标（肃清 / 坚守完成）后的统一收尾：计分、战功、提示与 3.4 秒缓冲。
+## 缓冲期间敌人已经不在场上，但玩家仍能移动，用来捡补给、调整位置。
+func _complete_stage_clear(label: String, score_bonus: int) -> void:
+	if _stage_cleared:
+		return
+	_stage_cleared = true
+	state = "clear"
+	state_timer = 3.4
+	_refresh_mouse_mode()
+	spawn_queue.clear()
+	score += score_bonus
+	var gain := 0
+	if Run.active and not Net.is_client():
+		gain = Run.award_stage()
+	var tail := "" if gain <= 0 else "  战功 +%d" % gain
+	_banner("%s%s" % [label, tail], 3.4)
+	Audio.play("power")
+
+
+## 坚守关的补波：数量比正常波次少，保证"压力持续"而不是"瞬间被淹没"。
+## 不追加 Boss——Boss 只属于决战关。
+func _build_hold_wave() -> void:
+	var n: int = maxi(3, 3 + int(stage / 2.0))
+	for i in n:
+		spawn_queue.append(_roll_enemy_type())
+	_spawn_t = 0.8
+
+
+## 坚守计时归零：场上敌人集体撤退，不计击杀、不掉落，然后进入肃清结算。
+func _hold_complete() -> void:
+	if _stage_cleared:
+		return
+	for e in enemies:
+		if is_instance_valid(e):
+			e.queue_free()
+	enemies.clear()
+	spawn_queue.clear()
+	# 客户端上的敌车是快照复制品，房主不广播它们就留在原地"陪跑"到下一关。
+	# 撤退不是死亡：不播爆炸、不留残骸、不计击杀，所以单独走一条事件。
+	if Net.is_host():
+		Net.broadcast_run_event("withdraw", {})
+	_complete_stage_clear("坚守成功！守住 %s" % Run.zone_name(), 1200 + stage * 250)
+
+
+## 肃清提示结束后的分流：最后一关直接胜利；其余先三选一，战区末尾再加补给站。
+func _on_clear_timeout() -> void:
+	if Net.is_client():
+		return
+	if not Run.active:
+		# Run 被关闭（回退到旧流程）时保持原来的"关卡 +1"行为。
+		if stage >= MAX_STAGE:
+			_win()
+		else:
+			stage += 1
+			_start_stage()
+		return
+	if Run.is_final_stage():
+		_win()
+		return
+	_open_reward()
+
+
+## 三选一：房主/单机抽卡并广播；客户端只显示同一组卡。
+func _open_reward() -> void:
+	_run_settled = false
+	var offer := Run.roll_offer()
+	if offer.is_empty():
+		# 卡池全满（理论上只会在极端长局出现）：直接跳过，不卡住流程。
+		_after_reward()
+		return
+	state = "reward"
+	_refresh_mouse_mode()
+	_show_run_cards(not Net.is_client())
+	if Net.is_host():
+		Net.broadcast_run_offer(Run.offer, Run.stage)
+
+
+func _show_run_cards(interactive: bool) -> void:
+	var sub := "战功 %d    已选 %d 张" % [Run.credits, Run.cards.size()]
+	var head := "第 %d 关 · %s · 选择强化" % [Run.stage, Run.kind_name()]
+	run_ui.show_cards(Run.offer, head, sub,
+			Run.credits, Run.reroll_price(), interactive)
+
+
+func _on_card_picked(id: String) -> void:
+	if Net.is_client() or state != "reward":
+		return
+	if not Run.pick_card(id):
+		Audio.play("dry")
+		return
+	Audio.play("power")
+	if Net.is_host():
+		Net.broadcast_run_event("card", {"id": id})
+	_apply_run_to_players()
+	if id == "phoenix":
+		_grant_lives_all(1)
+	run_ui.close()
+	_after_reward()
+
+
+func _on_card_reroll() -> void:
+	if Net.is_client() or state != "reward":
+		return
+	if not Run.reroll():
+		Audio.play("dry")
+		return
+	Audio.play("switch")
+	_show_run_cards(true)
+	if Net.is_host():
+		Net.broadcast_run_offer(Run.offer, Run.stage)
+
+
+func _on_card_skip() -> void:
+	if Net.is_client() or state != "reward":
+		return
+	Run.skip_offer()
+	Audio.play("switch")
+	if Net.is_host():
+		Net.broadcast_run_event("skip", {})
+	run_ui.close()
+	_after_reward()
+
+
+## 三选一之后：战区末尾进补给站，其余直接进下一关。
+func _after_reward() -> void:
+	if Run.is_zone_end():
+		_open_station()
+	else:
+		_advance_stage()
+
+
+func _open_station() -> void:
+	_station.clear()
+	for item in STATION_ITEMS:
+		_station.append({
+			"name": String(item["name"]),
+			"desc": String(item["desc"]),
+			"cost": int(item["cost"]),
+			"sold": false,
+			"enabled": Run.credits >= int(item["cost"]),
+		})
+	_refresh_station_enabled()
+	state = "station"
+	_refresh_mouse_mode()
+	var head := "%s · 前线补给站" % Run.zone_name()
+	var sub := "战功 %d    补给券（结算）%d" % [Run.credits, Meta.credits]
+	run_ui.show_station(_station, head, sub, not Net.is_client())
+	if Net.is_host():
+		Net.broadcast_run_event("station_open", {
+			"items": _station.duplicate(true), "head": head, "sub": sub,
+			"credits": Run.credits,
+		})
+	Audio.play("power")
+
+
+func _refresh_station_enabled() -> void:
+	var low_lives := _min_player_lives()
+	for i in _station.size():
+		var it: Dictionary = _station[i]
+		# 备用车体是唯一可以反复买的商品，所以它需要单独的"已达上限"状态：
+		# 只写 enabled=false 会让界面显示成"战功不足"，把玩家引向错误的结论。
+		var maxed: bool = i == STATION_LIFE and low_lives >= 5
+		it["maxed"] = maxed
+		if bool(it.get("sold", false)) or maxed:
+			it["enabled"] = false
+			continue
+		it["enabled"] = Run.credits >= int(it.get("cost", 0))
+
+
+func _on_station_buy(index: int) -> void:
+	if Net.is_client() or state != "station":
+		return
+	if Net.is_host() and not run_ui.interactive:
+		return
+	if index < 0 or index >= _station.size():
+		return
+	var it: Dictionary = _station[index]
+	if bool(it.get("sold", false)) or not bool(it.get("enabled", true)):
+		Audio.play("dry")
+		return
+	var cost := int(it.get("cost", 0))
+	if not Run.spend(cost):
+		Audio.play("dry")
+		return
+	var card := ""
+	match index:
+		STATION_FIX:
+			_heal_players_full(5.0)
+		STATION_CARD:
+			card = Run.grant_random_card(1)
+			if not card.is_empty():
+				# 补给站给的是常驻卡，必须立刻套到所有存活车辆上；
+				# 只改 mods 不改车，要等到下一次重生才生效。
+				_apply_run_to_players()
+				_banner("战术档案 · %s" % String(UpgradeCards.info(card)["name"]), 2.2)
+		STATION_LIFE:
+			_grant_lives_all(1)
+	# 前两件是一次性商品；备用车体可以反复买，直到每人 5 条命。
+	if index != STATION_LIFE:
+		it["sold"] = true
+	_station[index] = it
+	_refresh_station_enabled()
+	Audio.play("power")
+	var sub := "战功 %d    补给券（结算）%d" % [Run.credits, Meta.credits]
+	run_ui.refresh_station(_station, sub)
+	if Net.is_host():
+		Net.broadcast_run_event("station_buy", {
+			"index": index, "card": card, "credits": Run.credits,
+			"items": _station.duplicate(true), "sub": sub,
+		})
+
+
+func _on_station_close() -> void:
+	if Net.is_client() or state != "station":
+		return
+	_advance_stage()
+
+
+## 离开补给站 / 三选一：进入下一关倒计时。客户端由 "advance" 事件驱动。
+func _advance_stage() -> void:
+	run_ui.close()
+	if Run.active and Run.stage >= Run.TOTAL_STAGES:
+		_win()
+		return
+	stage += 1
+	if Net.is_host():
+		Net.broadcast_run_event("advance", {"stage": stage})
+	_start_stage()
+
+
+## 把当前卡牌修正重算到所有存活玩家。幂等，不白送满血。
+func _apply_run_to_players() -> void:
+	if not Run.active:
+		return
+	for p in players:
+		if is_instance_valid(p) and p.alive:
+			p.apply_run_mods(Run.mods, false)
+
+
+## 补给站"全面维修"：所有存活玩家回满结构并拿 5 秒护盾。
+func _heal_players_full(shield: float) -> void:
+	for p in players:
+		if is_instance_valid(p) and p.alive:
+			p.hp = p.max_hp
+			p.shield_t = maxf(p.shield_t, shield)
+
+
+## "备用车体"：每人 +1 条命，上限 5。单机走 lives，联机走 Net.players 名册。
+func _grant_lives_all(n: int) -> void:
+	if Net.is_multiplayer():
+		for pid in Net.players.keys():
+			var row: Dictionary = Net.players[pid]
+			row["lives"] = mini(5, int(row.get("lives", 0)) + n)
+			Net.players[pid] = row
+		Net.push_roster()
+	else:
+		lives = mini(5, lives + n)
+
+
+## 名册里最少的命数。补给站的"备用车体"用它判断能不能再买（< 5 才能买）。
+## 用最小值而不是最大值：只要还有队友没满，这一件就该保持可购买；
+## 用最大值会让"一个人先满 5 条"把其他人的购买入口一起关掉。
+func _min_player_lives() -> int:
+	if not Net.is_multiplayer():
+		return lives
+	var low := 5
+	for pid in Net.players.keys():
+		low = mini(low, int((Net.players[pid] as Dictionary).get("lives", 5)))
+	return low
+
+
+## 坦克互推：CharacterBody3D 之间不会相互推挤，两辆车一旦挤到一起就谁也动不了，##
 ##   径向分离 —— 按重叠量沿连线把两车推开，只在真的重叠时才介入。
 ##   切向滑移 —— 双方都被顶住不动时，按接触时长积分出一个侧移速度让它们错开。
 ##
@@ -657,6 +1004,11 @@ func _cleanup() -> void:
 # ---------------- 界面流转 ----------------
 
 func _enter_title() -> void:
+	# 中途退出按失败结算：Roguelite 的"随时可退"不能变成"随时可无成本重开"。
+	# 已结算过的局面（结算页按 Esc / 通关页 Enter）不会重复发补给券。
+	if Run.active or (_run_played and not _run_settled):
+		_settle_run(false)
+	_run_played = false
 	state = "title"
 	get_tree().paused = false
 	_refresh_mouse_mode()
@@ -684,6 +1036,9 @@ func _leave_lobby_to_title() -> void:
 
 func _enter_lobby() -> void:
 	state = "lobby"
+	# 车库选好的挑战带进房间：大厅的"挑战"行与开局都读 Net.room_challenge，
+	# 不在这里同步，玩家在车库选"每日挑战"再点局域网就会静默退回标准行动。
+	Net.room_challenge = _sel_challenge
 	get_tree().paused = false
 	_refresh_mouse_mode()
 	hud.visible = false
@@ -734,10 +1089,10 @@ func _parse_cmdline() -> void:
 func _enter_select() -> void:
 	state = "select"
 	_sel_row = 0
-	# 默认停在存档里的车；没存过（首次游玩）就用名册的默认车
-	var saved := TankRoster.ORDER.find(Settings.selected_tank)
+	# 默认停在存档里的车；未解锁（手改过存档）或没存过就退回名册默认车。
+	var saved := TankRoster.ORDER.find(Meta.default_tank(Settings.selected_tank))
 	_sel_tank = saved if saved >= 0 else maxi(0, TankRoster.ORDER.find(TankRoster.DEFAULT_ID))
-	_show_menu("选 择 战 车 与 关 卡", "")
+	_show_menu("车 库 · 选 择 战 车 与 挑 战", "")
 	_refresh_select()
 
 
@@ -745,19 +1100,54 @@ func _refresh_select() -> void:
 	var marks: Array = []
 	for i in SELECT_ROWS:
 		marks.append("▶" if _sel_row == i else "  ")
-	var tank: Dictionary = TankRoster.spec(TankRoster.ORDER[_sel_tank])
-	var txt := "%s 战车   【%s】\n%s 难度   【%s】\n%s 关卡   【第 %d 关】\n%s 地形   【%s】\n\n↑↓ 选择   ←→ 切换\nEnter 出击   Esc 返回\n\n%s" % [
-		marks[0], String(tank["full"]),
+	var id: String = TankRoster.ORDER[_sel_tank]
+	var tank: Dictionary = TankRoster.spec(id)
+	var unlocked := Meta.is_tank_unlocked(id)
+	var tank_val := "【%s】" % String(tank["full"])
+	if not unlocked:
+		tank_val += "  未解锁 · 需 %d 补给券（U 解锁）" % Meta.tank_cost(id)
+	var txt := "%s 战车   %s\n%s 难度   【%s】\n%s 挑战   【%s】\n%s 地形   【%s】\n" % [
+		marks[0], tank_val,
 		marks[1], DIFF_NAMES[_sel_diff],
-		marks[2], _sel_stage + 1,
+		marks[2], _challenge_name(),
 		marks[3], _terrain_choice_name(),
-		_garage_controls_text(),
 	]
+	txt += "\n补给券 %d   最深抵达 第 %d 关   通关 %d 次   挑战通关 %d 次   补给站 第 3/6 关后\n" % [
+		Meta.credits, Meta.best_stage, Meta.wins, Meta.challenge_clears,
+	]
+	var keys: Array = ["lives", "credits", "reroll"]
+	var ups: Array = []
+	for i in keys.size():
+		var key := String(keys[i])
+		var def: Dictionary = Meta.UPGRADES[key]
+		var lv := Meta.upgrade_level(key)
+		if lv >= int(def["max"]):
+			ups.append("[%d] %s %d/%d 已满级" % [i + 1, String(def["name"]), lv, int(def["max"])])
+		else:
+			ups.append("[%d] %s %d/%d · %d 补给券" % [
+				i + 1, String(def["name"]), lv, int(def["max"]), Meta.upgrade_cost(key)])
+	txt += "\n".join(ups)
+	txt += "\n\n↑↓ 选择   ←→ 切换   U 解锁   1/2/3 购买升级\nEnter 出击   Esc 返回\n\n%s" % _garage_controls_text()
 	if _select_l != null:
 		_select_l.text = txt
 	# 文本变了，字号要按新内容重新量一次（切驾驶方式会换掉第一行）
 	_layout_garage()
 	_show_tank(_sel_tank)
+
+
+## 车库第三行的挑战名。每日挑战把当天抽到的两个修正一起写出来，
+## 否则玩家要等开局才知道今天难在哪。
+func _challenge_name() -> String:
+	var nm: String = Mutators.CHALLENGE_NAMES[clampi(_sel_challenge, 0, 2)]
+	if _sel_challenge == Mutators.NONE:
+		return nm
+	var ids := Mutators.for_challenge(_sel_challenge, 0)
+	if ids.is_empty():
+		return nm
+	var parts: Array = []
+	for id in ids:
+		parts.append(Mutators.name_of(String(id)))
+	return "%s · %s" % [nm, "·".join(parts)]
 
 
 ## 把转台与属性卡切到指定车型。切车是"换一个展品"，所以模型整个重建而不是改材质——
@@ -797,7 +1187,7 @@ func _adjust_selection(d: int) -> void:
 		1:
 			_sel_diff = clampi(_sel_diff + d, 0, 2)
 		2:
-			_sel_stage = posmod(_sel_stage + d, MAX_STAGE)
+			_sel_challenge = clampi(_sel_challenge + d, 0, 2)
 		_:
 			# 游标在 [-1, TERRAINS.size()-1] 上循环，-1 即"随机"
 			var n: int = Arena.TERRAINS.size() + 1
@@ -807,29 +1197,99 @@ func _adjust_selection(d: int) -> void:
 
 
 func _confirm_start() -> void:
+	var tank_id: String = TankRoster.ORDER[clampi(_sel_tank, 0, TankRoster.ORDER.size() - 1)]
+	# 显式的 _sel_tank 是**运行时意图**（车库、探针、联机大厅都靠它），
+	# 比"存档里那台车还没解锁"更可信：静默换车会让探针以为在开甲车、实际是乙车，
+	# 车库回车也会让玩家以为自己选错了。所以这里只拦不换。
+	#
+	# 闸门只在玩家可见的入口生效（车库出发 / 结算页再来一局）。探针与命令行
+	# 从 title 直接调用它，必须放行，否则 20 多个既有探针会因为"测试账号没有
+	# 补给券"而集体失效——那测的就不是物理与战斗，而是存档。
+	var gated: bool = state == "select" or state == "over" or state == "win"
+	if gated and not Meta.is_tank_unlocked(tank_id):
+		_banner("【%s】未解锁 · 需 %d 补给券（U 解锁）" % [
+			String(TankRoster.spec(tank_id)["name"]), Meta.tank_cost(tank_id)], 2.4)
+		Audio.play("dry")
+		return
 	difficulty = _sel_diff
 	score = 0
-	stage = _sel_stage + 1
-	lives = MAX_LIVES
+	# 局结构固定 9 关，不再从第 N 关开始。
+	stage = 1
 	combo_mult = 1.0
 	_kills = 0
 	_stage_cleared = false
+	_run_settled = false
 	get_tree().paused = false
 	# 单局统计从零开始：结算页要报的是"这一局"，不是"到今天为止"
 	Stats.begin_run()
 	# 选车结果写进设置：下次开局直接停在上一次那台车上，不必每次重选
-	Settings.selected_tank = TankRoster.ORDER[_sel_tank]
+	Settings.selected_tank = tank_id
 	Settings.save_cfg()
 	# 地形轮换的起点每局随机：战场数量多于关卡数，固定从 0 开始会让后几张图永远见不到
 	_terrain_offset = randi() % Arena.TERRAINS.size()
+	# 开始一局：战功 / 卡牌 / 修正都在这里归零，命数取元升级与卡牌加成。
+	Run.begin_run(tank_id, difficulty, _sel_challenge)
+	_run_played = true
+	_run_mods_version = -1
+	lives = Run.starting_lives()
 	hud.visible = true
+	if run_ui != null:
+		run_ui.close()
 	_hide_menu()
 	_start_stage()
+
+
+## 车库 U：用补给券解锁当前展示的战车。未解锁的车型仍然可以查看模型与属性。
+func _unlock_selected_tank() -> void:
+	var id: String = TankRoster.ORDER[_sel_tank]
+	var nm := String(TankRoster.spec(id)["name"])
+	if Meta.is_tank_unlocked(id):
+		_banner("%s 已解锁" % nm, 1.6)
+		Audio.play("switch")
+		return
+	var cost := Meta.tank_cost(id)
+	if Meta.unlock_tank(id):
+		_banner("已解锁 %s   −%d 补给券" % [nm, cost], 2.6)
+		Audio.play("power")
+	else:
+		_banner("补给券不足 · %s 需 %d（现有 %d）" % [nm, cost, Meta.credits], 2.6)
+		Audio.play("dry")
+	_refresh_select()
+
+
+## 车库 1/2/3：购买永久升级。顺序与 Meta.UPGRADES 的键一一对应。
+func _buy_upgrade(index: int) -> void:
+	var keys: Array = ["lives", "credits", "reroll"]
+	if index < 0 or index >= keys.size():
+		return
+	var key := String(keys[index])
+	var def: Dictionary = Meta.UPGRADES[key]
+	var lv := Meta.upgrade_level(key)
+	if lv >= int(def["max"]):
+		_banner("%s 已满级" % String(def["name"]), 1.8)
+		Audio.play("dry")
+		return
+	var cost := Meta.upgrade_cost(key)
+	if Meta.buy_upgrade(key):
+		_banner("%s 升至 %d/%d   −%d 补给券" % [
+			String(def["name"]), lv + 1, int(def["max"]), cost], 2.4)
+		Audio.play("power")
+	else:
+		_banner("补给券不足 · %s 需 %d（现有 %d）" % [
+			String(def["name"]), cost, Meta.credits], 2.4)
+		Audio.play("dry")
+	_refresh_select()
 
 
 # ---------------- 关卡流程 ----------------
 
 func _start_stage() -> void:
+	# 房主权威：Run 的关卡号必须跟主协调器的关卡号一致。
+	# 卡池保底、战区末尾、敌人预算、坚守时长与结算页全部读 Run.stage；
+	# 这里不同步的话整局会永远停在第 1 关——关卡类型恒为歼灭、补给站永不出现。
+	# 客户端不跑这个函数，它在 net_begin_stage 里从房主下发的 run 行应用关卡号。
+	if Run.active and not Net.is_client():
+		Run.stage = stage
 	# 选了具体地形就固定用它；选"随机"则从本局的随机起点开始按关号轮换，
 	# 于是同一局不会重复战场，不同局之间又能走遍全部地形
 	if Net.is_multiplayer():
@@ -847,6 +1307,9 @@ func _start_stage() -> void:
 	_clear_battle()
 	_build_spawn_queue()
 	_stage_cleared = false
+	hold_left = Run.hold_seconds() if (Run.active and Run.is_hold()) else 0.0
+	if run_ui != null:
+		run_ui.close()
 	max_active = _net_max_active()
 	_stage_damage_bonus = 0.0
 	_fortify_t = 0.0
@@ -855,11 +1318,25 @@ func _start_stage() -> void:
 	_field_t = randf_range(FIELD_DROP_MIN, FIELD_DROP_MAX) * 0.45
 	combo_mult = 1.0
 	_spawn_players_for_stage()
+	# 战地维修：每关开始按比例回血。新落车的玩家本来满血，这一条主要作用于
+	# 上一关残血撑到现在的存活车辆。
+	if Run.active and float(Run.mods.get("stage_heal", 0.0)) > 0.0:
+		for p in players:
+			if is_instance_valid(p) and p.alive:
+				p.hp = mini(p.max_hp, p.hp + int(round(float(p.max_hp)
+						* float(Run.mods["stage_heal"]))))
 	net_fortify = false
 	state = "ready"
 	state_timer = 2.6
 	_refresh_mouse_mode()
-	_banner("第 %d 关  ·  %s  ·  %s" % [stage, terrain_name(), DIFF_NAMES[difficulty]], 2.6)
+	var tag := ""
+	if Run.active:
+		tag = "  ·  %s · %s" % [Run.zone_name(), Run.kind_name()]
+	var mtxt := ""
+	if Run.active and Run.mutators.size() > 0:
+		mtxt = "    " + Mutators.summary(Run.mutators)
+	_banner("第 %d 关%s  ·  %s  ·  %s%s" % [stage, tag, terrain_name(),
+			DIFF_NAMES[difficulty], mtxt], 2.6)
 	Audio.play("spawn")
 	# 房主把"下一关从哪里开始"发给客户端。客户端不跑 _start_stage，
 	# 收到这条后自己按同一个种子重建同一张地图并落车。
@@ -893,23 +1370,61 @@ func _scale_enemy_for_coop(e: Enemy) -> void:
 	e.hp = e.max_hp
 
 
+## 按关卡投放比例掷一个敌人类型（0 侦察 / 1 中型 / 2 重型 / 3 火炮）。
+##
+## 比例来自 docs/design/01_run_structure.md 第 4 节：前期只有轻中型，
+## 中期引入重型，后期火炮才有稳定出场。Boss 不在这里——它由关卡类型单独追加。
+func _roll_enemy_type() -> int:
+	var r: float = Run.rng.randf() if Run.active else randf()
+	if stage <= 2:
+		return 0 if r < 0.58 else 1
+	if stage <= 4:
+		if r < 0.42:
+			return 0
+		return 1 if r < 0.74 else 2
+	if stage <= 6:
+		if r < 0.30:
+			return 0
+		if r < 0.62:
+			return 1
+		return 2 if r < 0.88 else 3
+	if r < 0.26:
+		return 0
+	if r < 0.56:
+		return 1
+	return 2 if r < 0.82 else 3
+
+
 func _build_spawn_queue() -> void:
 	spawn_queue.clear()
-	var n: int = mini(26, 9 + stage * 2)
+	var n: int = Run.enemy_budget() if Run.active else mini(26, 9 + stage * 2)
 	for i in n:
-		var r := randf()
-		var t := 1
-		if stage >= 3 and r > 0.88:
-			t = 3          # 火炮
-		elif stage >= 2 and r > 0.68:
-			t = 2          # 重型
-		elif r > 0.42:
-			t = 1          # 中型
-		else:
-			t = 0          # 侦察
-		spawn_queue.append(t)
-	if stage == 4 or stage == MAX_STAGE:
-		spawn_queue.append(4)  # Boss 压轴
+		spawn_queue.append(_roll_enemy_type())
+	# 决战关：Boss 压轴。3 / 6 / 9 关各一台，正好是三个战区的收尾。
+	if Run.active and Run.is_boss():
+		spawn_queue.append(4)
+
+
+## 战区倍率与 Run 修正作用在敌人身上。调用点在 configure / 合作加成之后，
+## 于是关卡成长、人数加成、战区台阶三层是相乘关系，彼此不覆盖。
+func _apply_run_enemy_scale(e: Enemy, t: int) -> void:
+	if not Run.active:
+		return
+	e.max_hp = int(round(float(e.max_hp) * Run.zone_hp_mult()))
+	e.hp = e.max_hp
+	e.damage = int(round(float(e.damage) * Run.zone_damage_mult()))
+	e.reload_time *= Run.enemy_reload_mult()
+	e.damage = int(round(float(e.damage) * Run.enemy_damage_mult()))
+	e.damage_scale = Run.enemy_damage_taken()
+	# 第 3 关的"教学 Boss"稍软一点，第 9 关的终局 Boss 更硬。
+	if t == 4:
+		if stage == 3:
+			e.max_hp = int(round(float(e.max_hp) * 1.15))
+			e.hp = e.max_hp
+			e.reload_time *= 0.90
+		elif stage >= 9:
+			e.max_hp = int(round(float(e.max_hp) * 1.35))
+			e.hp = e.max_hp
 
 
 func _spawn_enemy(t: int) -> bool:
@@ -922,8 +1437,15 @@ func _spawn_enemy(t: int) -> bool:
 		var e := Enemy.new()
 		e.configure(t, stage, difficulty)
 		_scale_enemy_for_coop(e)
+		_apply_run_enemy_scale(e, t)
+		var affixes: Array[String] = []
+		if Run.active:
+			affixes = EnemyAffix.roll(Run.rng, stage, t, Run.mutators)
+			EnemyAffix.apply(e, affixes)
 		e.setup(self, arena, pos)
 		add_child(e)
+		# 表现必须在 add_child 之后：名条要挂在建好的节点上，车底环要读 body_radius。
+		EnemyAffix.apply_visuals(e)
 		# 主节点是 ALWAYS（为了在暂停里还能读 Esc），所以动态生成的战场单位
 		# 必须显式标成 PAUSABLE，否则它们会跟着主节点一起继续跑。
 		e.process_mode = Node.PROCESS_MODE_PAUSABLE
@@ -934,12 +1456,16 @@ func _spawn_enemy(t: int) -> bool:
 		if Net.is_host():
 			Net.broadcast_enemy_spawn({
 				"id": e.net_id, "type": t, "pos": pos, "hp": e.hp,
-				"stage": stage, "diff": difficulty,
+				"max_hp": e.max_hp, "damage": e.damage, "reload": e.reload_time,
+				"affixes": affixes, "stage": stage, "diff": difficulty,
 			})
 		Fx.smoke_puff(fx_root, pos + Vector3(0, 0.45, 0), 0.8)
 		Audio.play_3d("spawn", pos)
 		if t == 4:
-			_banner("⚠ 敌方指挥车出现！", 3.0)
+			if stage >= 9:
+				_banner("⚠ 敌方核心指挥车出现！", 3.0)
+			else:
+				_banner("⚠ 敌方指挥车出现！", 3.0)
 			Audio.play("alert")
 		return true
 	return false
@@ -971,8 +1497,14 @@ func _spawn_player(at := Vector3.INF, want_tank := "", pid := 0, local := true) 
 	p.process_mode = Node.PROCESS_MODE_PAUSABLE
 	# 必须在 _ready() 之后，否则基础属性会覆盖难度调整
 	p.apply_difficulty(difficulty)
+	if Run.active:
+		# 卡牌必须在名册与难度之后应用，否则会被它们的赋值覆盖。
+		p.apply_run_mods(Run.mods, true)
 	p.damage_mult = 1.0 + _stage_damage_bonus
-	p.shield_t = 3.0
+	if Run.active:
+		p.shield_t = maxf(3.0, float(Run.mods.get("spawn_shield", 0.0)))
+	else:
+		p.shield_t = 3.0
 	players.append(p)
 	Net.register_tank(p, p.net_id)
 	if local:
@@ -1156,7 +1688,11 @@ func on_tank_destroyed(t: Tank) -> void:
 	if not Net.is_multiplayer() or (t.last_shooter != null \
 			and is_instance_valid(t.last_shooter) and t.last_shooter.is_local):
 		Stats.add_kill()
-	_combo_t = COMBO_WINDOW
+	if Run.active:
+		Run.award_kill(t.etype)
+		_combo_t = COMBO_WINDOW * float(Run.mods.get("combo_window", 1.0))
+	else:
+		_combo_t = COMBO_WINDOW
 	combo_mult = minf(COMBO_MAX, combo_mult + 0.5)
 	Stats.note_combo(combo_mult)
 	var gain := int(t.points * combo_mult)
@@ -1165,7 +1701,42 @@ func on_tank_destroyed(t: Tank) -> void:
 	Fx.damage_number(fx_root, t.global_position, "+%d" % gain, Color(1.0, 0.85, 0.3))
 	if combo_mult > 1.4:
 		_banner("连击 x%.1f" % combo_mult, 1.0)
+	# 词缀"易爆"：先爆再留残骸。只伤玩家，不连锁引爆其他敌人，
+	# 否则一车变炸弹会把整波敌人一起清掉，玩家反而没有操作空间。
+	if t.volatile_bomb:
+		_volatile_burst(t.global_position, t.max_hp)
+	# 卡牌"殉爆药"：玩家打掉的敌车原地爆炸，只伤敌人。
+	# 这里必须比较"是不是玩家"，不能读 `Tank.is_player`：`is_player` 是
+	# 车辆类型标记，敌方 AI 的控制车也可能带这个标记，用它会把敌人互引爆
+	# 当成玩家的殉爆，整波敌人被连锁清空。
+	if Run.active and bool(Run.flags.get("kill_explode", false)) \
+			and players.has(t.last_shooter):
+		_kill_explode(t.global_position, t.max_hp)
 	_maybe_drop(t.global_position, t.etype == 4)
+
+
+## 易爆词缀：半径 6 m，40 + 8% 最大结构，伤玩家。
+func _volatile_burst(pos: Vector3, max_hp: int) -> void:
+	Fx.explosion(fx_root, pos + Vector3(0, 1.0, 0), 2.0)
+	Audio.play_3d("boom", pos)
+	var dmg := EnemyAffix.volatile_damage(max_hp)
+	for p in players.duplicate():
+		if not is_instance_valid(p) or not p.alive:
+			continue
+		if p.global_position.distance_to(pos) <= 6.0:
+			p.take_hit(dmg, pos, Shell.Kind.HE)
+
+
+## 殉爆药：半径 6 m，60 + 35% 最大结构，只伤敌车。
+func _kill_explode(pos: Vector3, max_hp: int) -> void:
+	Fx.explosion(fx_root, pos + Vector3(0, 1.0, 0), 2.4)
+	Audio.play_3d("boom", pos)
+	var dmg := 60 + int(round(float(max_hp) * 0.35))
+	for e in enemies.duplicate():
+		if not is_instance_valid(e) or not e.alive:
+			continue
+		if e.global_position.distance_to(pos) <= 6.0:
+			e.take_hit(dmg, pos, Shell.Kind.HE)
 
 
 func on_base_destroyed() -> void:
@@ -1185,6 +1756,26 @@ func on_player_hit(t: Tank, from_pos: Vector3, dmg: int) -> void:
 	hit_vignette = minf(1.0, hit_vignette + clampf(dmg / 200.0, 0.25, 0.8))
 	combo_mult = 1.0
 	_combo_t = 0.0
+
+
+## Tank.on_damage_dealt() 的统一结算入口：吸血卡。
+## 只在房主/单机生效——血量由房主写、随快照同步，客户端自己回血会被下一帧抹掉。
+func on_player_damage_dealt(t: Tank, amount: int) -> void:
+	if not Run.active or Net.is_client():
+		return
+	# 只认 `players` 里的车：敌方控制车也可能带 is_player 标记，
+	# 那会让敌人互相吸血，玩家打不死的敌车越打越满。
+	if t == null or not is_instance_valid(t) or not t.alive or not players.has(t):
+		return
+	var rate := float(Run.mods.get("lifesteal", 0.0))
+	if rate <= 0.0 or amount <= 0:
+		return
+	var heal := maxi(1, int(round(float(amount) * rate)))
+	if t.hp >= t.max_hp:
+		return
+	t.hp = mini(t.max_hp, t.hp + heal)
+	Fx.damage_number(fx_root, t.global_position + Vector3(0, 2.2, 0),
+			"+%d" % heal, Color(0.45, 1.0, 0.55))
 
 
 ## 玩家自己的车身挡下了一发（跳弹 / 护盾）。与"挨打"相反，这是好消息，
@@ -1478,20 +2069,33 @@ func my_lives() -> int:
 ## 房主：开场。stage / terrain / 名册都来自 Net.start_match，客户端随后
 ## 会收到单独的 net_stage_start，所以这里只有房主真正生成战场。
 func net_begin_match(info: Dictionary) -> void:
-	stage = int(info.get("stage", 1))
+	stage = 1
 	terrain = int(info.get("terrain", 0))
 	difficulty = int(info.get("difficulty", 1))
 	score = 0
-	lives = MAX_LIVES
 	combo_mult = 1.0
 	_kills = 0
 	_stage_cleared = false
+	_run_settled = false
 	get_tree().paused = false
 	if _lobby != null:
 		_lobby.close()
 	_hide_menu()
 	hud.visible = true
 	if Net.is_host():
+		# 房主是唯一权威：卡池、战功、修正、命数都从这里开始。
+		Run.begin_run(_player_tank_id(), difficulty,
+				int(info.get("challenge", Mutators.NONE)))
+		_run_played = true
+		_run_mods_version = -1
+		lives = Run.starting_lives()
+		# 名册里的命数是每人独立计数，房主开局要把它拉到与元升级一致，
+		# 否则"备用车体"在联机里始终是 3 条命、单人却是 4~5 条。
+		for pid in Net.players.keys():
+			var row: Dictionary = Net.players[pid]
+			row["lives"] = lives
+			Net.players[pid] = row
+		Net.push_roster()
 		Stats.begin_run()
 		_start_stage()
 
@@ -1505,10 +2109,18 @@ func net_begin_stage(info: Dictionary) -> void:
 	terrain = int(info.get("terrain", terrain))
 	difficulty = int(info.get("difficulty", difficulty))
 	_stage_seed = int(info.get("seed", 0))
+	# Run 行随关卡一起到达：先应用再建图/落车，于是本关类型、战功、卡牌加成
+	# 在倒计时第一帧就是对的（坚守倒计时、决战关的 Boss 权重都读它）。
+	var raw_run = info.get("run", {})
+	if raw_run is Dictionary and not (raw_run as Dictionary).is_empty():
+		Run.apply_row(raw_run)
+		_run_mods_version = Run.mods_version
+		_run_played = true
 	arena.generate(stage, terrain, _stage_seed)
 	Audio.set_space(String(Arena.TERRAINS[clampi(terrain, 0, Arena.TERRAINS.size() - 1)]["layout"]))
 	_clear_battle()
 	_stage_cleared = false
+	hold_left = Run.hold_seconds() if (Run.active and Run.is_hold()) else 0.0
 	max_active = _net_max_active()
 	net_remaining = -1
 	_fortify_t = 0.0
@@ -1516,10 +2128,16 @@ func net_begin_stage(info: Dictionary) -> void:
 	_spawn_players_for_stage()
 	state = "ready"
 	state_timer = 2.6
+	if run_ui != null:
+		run_ui.close()
 	_hide_menu()
 	hud.visible = true
 	_refresh_mouse_mode()
-	_banner("第 %d 关  ·  %s  ·  %s" % [stage, terrain_name(), DIFF_NAMES[difficulty]], 2.6)
+	var tag := ""
+	if Run.active:
+		tag = "  ·  %s · %s" % [Run.zone_name(), Run.kind_name()]
+	_banner("第 %d 关%s  ·  %s  ·  %s" % [stage, tag, terrain_name(),
+			DIFF_NAMES[difficulty]], 2.6)
 	Audio.play("spawn")
 
 
@@ -1566,6 +2184,11 @@ func net_collect_snapshot() -> Dictionary:
 		"timer": state_timer,
 		"score": score,
 		"left": _count_active() + spawn_queue.size(),
+		"hold": hold_left,
+		# Run 行：关卡、类型、战功、卡牌、当前 offer 与修正。客户端据此显示
+		# HUD 条、重算本地车的卡牌加成，并在可靠的界面事件丢失时自行恢复
+		# "三选一还开着"这件事（事件走可靠 RPC，快照是兜底）。
+		"run": Run.net_row() if Run.active else {},
 	}
 
 
@@ -1603,6 +2226,8 @@ func net_apply_snapshot(data: Dictionary) -> void:
 			net_fortify = fort
 	net_remaining = int(data.get("left", net_remaining))
 	score = int(data.get("score", score))
+	hold_left = float(data.get("hold", hold_left))
+	_net_apply_run_row(data.get("run", {}))
 	# 倒计时、肃清与结算页由房主的状态机驱动；客户端只跟随，不自行推进。
 	#
 	# 但本地暂停是一个纯覆盖层：房主还在跑，客户端也不能被快照从 "pause"
@@ -1615,6 +2240,101 @@ func net_apply_snapshot(data: Dictionary) -> void:
 		state = st
 		state_timer = float(data.get("timer", 0.0))
 		_refresh_mouse_mode()
+
+
+# ---------------- 联机：客户端的 Run 侧 ----------------
+
+## 客户端应用快照里的 Run 行。只有内容真的变了才动作：
+## 重算 mods 会按比例回填血量，25 Hz 每帧做一次会让玩家看到自己在"缓慢回血"。
+func _net_apply_run_row(row) -> void:
+	if not Net.is_client() or not (row is Dictionary):
+		return
+	var d: Dictionary = row
+	if d.is_empty():
+		return
+	Run.apply_row(d)
+	if Run.mods_version != _run_mods_version:
+		_run_mods_version = Run.mods_version
+		_apply_run_to_players()
+	if _run_settled:
+		return
+	_run_played = true
+	if run_ui == null:
+		return
+	# 兜底 1：可靠的 net_run_offer 丢了。房主在抽卡时 offer 非空而本地还停在
+	# "clear"（客户端不推进状态机），补开一次只读的三选一。
+	if state == "clear" and not Run.offer.is_empty() and run_ui.mode != "cards":
+		state = "reward"
+		_refresh_mouse_mode()
+		_show_run_cards(false)
+	# 兜底 2：房主重掷换了卡组。把界面换成新的一组，光标语义不变。
+	elif run_ui.mode == "cards" and not Run.offer.is_empty() \
+			and run_ui.offer != Run.offer:
+		_show_run_cards(false)
+
+
+## 房主打开三选一。客户端只显示，不接受输入（规格：05_ui_and_net 第 2.3 节）。
+func net_run_offer(offer: Array, _stage: int) -> void:
+	if not Net.is_client():
+		return
+	_run_played = true
+	Run.offer.clear()
+	for id in offer:
+		if UpgradeCards.has(String(id)):
+			Run.offer.append(String(id))
+	state = "reward"
+	_refresh_mouse_mode()
+	_show_run_cards(false)
+
+
+## 房主结算的 Run 事件。客户端的 `Run` 只跟随，不自己抽卡/扣款。
+func net_run_event(kind: String, data: Dictionary) -> void:
+	if not Net.is_client():
+		return
+	match kind:
+		"card":
+			Run.apply_pick(String(data.get("id", "")))
+			Run.offer.clear()
+			_run_mods_version = Run.mods_version
+			_apply_run_to_players()
+			run_ui.close()
+			state = "clear"
+			_refresh_mouse_mode()
+		"skip", "advance":
+			Run.offer.clear()
+			run_ui.close()
+			state = "clear"
+			_refresh_mouse_mode()
+		"withdraw":
+			# 坚守计时归零：场上敌人集体撤退。不是死亡，所以不播爆炸、不留残骸。
+			for e in enemies:
+				if is_instance_valid(e):
+					e.free_for_net()
+			enemies.clear()
+		"station_open":
+			_station.clear()
+			for it in data.get("items", []):
+				if it is Dictionary:
+					_station.append((it as Dictionary).duplicate())
+			state = "station"
+			_refresh_mouse_mode()
+			run_ui.show_station(_station, String(data.get("head", "")),
+					String(data.get("sub", "")), false)
+		"station_buy":
+			Run.credits = maxi(0, int(data.get("credits", Run.credits)))
+			var card := String(data.get("card", ""))
+			if not card.is_empty():
+				Run.apply_pick(card)
+				_run_mods_version = Run.mods_version
+				_apply_run_to_players()
+			var items = data.get("items", [])
+			if items is Array:
+				_station.clear()
+				for it in items:
+					if it is Dictionary:
+						_station.append((it as Dictionary).duplicate())
+			if run_ui.mode == "station":
+				run_ui.refresh_station(_station, String(data.get("sub", "")))
 
 
 ## 客户端：本机玩家的位置与姿态。房主拿它驱动"这个 peer 的车"，
@@ -1679,11 +2399,19 @@ func net_spawn_enemy(data: Dictionary) -> void:
 	e.configure(int(data.get("type", 1)), int(data.get("stage", stage)),
 			int(data.get("diff", difficulty)))
 	_scale_enemy_for_coop(e)
+	# 词缀随生成事件到达。客户端的敌车是快照复制品、只重播表现，
+	# 所以这里必须应用同一条词缀：否则"重甲车"在客户端掉得比房主快，
+	# 玩家的准星会以为打得穿，实际在房主那边一直是 −28% 伤害。
+	# 表现（车底环、名条）也在这里挂，否则客户端看到的敌人毫无标记。
+	var affixes: Array = data.get("affixes", [])
+	if affixes is Array and not (affixes as Array).is_empty():
+		EnemyAffix.apply(e, affixes)
 	e.is_remote = true
 	e.team = 1
 	e.net_id = id
 	e.setup(self, arena, data.get("pos", Vector3.ZERO))
 	add_child(e)
+	EnemyAffix.apply_visuals(e)
 	e.process_mode = Node.PROCESS_MODE_PAUSABLE
 	Net.register_tank(e, id)
 	e.apply_net_state(e.global_position, e.rotation.y, e.rotation.y, 0.0, 0.0,
@@ -1775,6 +2503,8 @@ func net_end_match(won: bool, score_value: int) -> void:
 	if score > high_score:
 		high_score = score
 		_save_high_score()
+	# 客户端也结算自己那份补给券：每台机器有自己的 meta.cfg。
+	_settle_run(won)
 	_show_menu("全 线 胜 利" if won else "战 败", _result_text(won))
 	Audio.play("victory" if won else "gameover")
 
@@ -1975,6 +2705,7 @@ func _game_over() -> void:
 		high_score = score
 		_save_high_score()
 	Stats.end_run(_player_tank_id(), difficulty, score, won)
+	_settle_run(false)
 	Net.match_active = false
 	if Net.is_host():
 		Net.broadcast_match_end(false, score)
@@ -1994,11 +2725,27 @@ func _win() -> void:
 		high_score = score
 		_save_high_score()
 	Stats.end_run(_player_tank_id(), difficulty, score, true)
+	_settle_run(true)
 	Net.match_active = false
 	if Net.is_host():
 		Net.broadcast_match_end(true, score)
 	_show_menu("全 线 胜 利", _result_text(true))
 	Audio.play("victory")
+
+
+## 唯一结算入口：战功按结果转化给 `Meta` 的补给券。
+##
+## 幂等（`_run_settled`），因为败北、通关、中途退标题、联机结束都会走到这里。
+## 客户端也结算自己那份：每台机器有自己的 `user://meta.cfg`，
+## 用房主下发的战功算，于是联机玩家不会白打一局。
+func _settle_run(won: bool) -> void:
+	if _run_settled:
+		return
+	_run_settled = true
+	if not Run.active:
+		return
+	_run_played = true
+	Run.finish(won)
 
 
 ## 当前使用的车型 id。玩家可能在关卡之间死掉（player == null），
@@ -2036,12 +2783,39 @@ func _result_text(won: bool) -> String:
 	lines.append("")
 	lines.append("生涯累计   击毁 %d   最高分 %07d   通关 %d 次" % [
 		Stats.kills, Stats.best_score, Stats.wins])
+	if _run_played:
+		lines.append("")
+		lines.append_array(_run_result_lines(won))
 	lines.append("")
 	if Net.is_multiplayer():
 		lines.append("Enter 返回标题（离开房间）")
 	else:
 		lines.append("R 重新出击   Esc 返回标题" if not won else "Enter 返回标题")
 	return "\n".join(lines)
+
+
+## 结算页的 Run 段落。失败时把"50% 转化"写出来，
+## 否则玩家看到战功 460、补给券 +230 会以为数字丢了。
+func _run_result_lines(won: bool) -> Array:
+	var out: Array = []
+	var remaining := maxi(0, Run.TOTAL_STAGES - Run.stage)
+	out.append("—— 本次行动 ——")
+	out.append("%s · 第 %d 关%s" % [
+		Run.zone_name(), Run.stage,
+		"   全线突破" if won else "   距终点 %d 关" % remaining,
+	])
+	out.append("选过的强化（%d）  %s" % [Run.cards.size(), Run.cards_summary()])
+	if Run.mutators.size() > 0:
+		out.append("行动修正        %s" % Mutators.summary(Run.mutators))
+	var rate := 100.0 if won else 50.0
+	if Run.challenge == Mutators.DAILY:
+		rate *= 1.1
+	out.append("战功 %d → 补给券 +%d（%s 转化 %d%%）" % [
+		Run.final_credits, Run.final_payout,
+		"通关" if won else "中途结束", int(round(rate)),
+	])
+	out.append("补给券余额 %d        最深抵达 第 %d 关" % [Meta.credits, Meta.best_stage])
+	return out
 
 
 ## 勋章阈值按"一局打满八关"的规模取：

@@ -168,14 +168,35 @@ func _physics_process(_delta: float) -> void:
 				_f = 0
 				_step = 9
 		9:
-			# 等状态计时走完、进入下一关，确认奖励没有再加一次
-			if _main.stage != int(_marks["stage_clear"]):
+			# clear 计时结束后会进入三选一（`reward`），不是直接进下一关。
+			# 这里替玩家选第一张卡，验证"只发一次奖励、卡牌之后关卡确实推进"。
+			if _main.state == "reward":
+				if Run.offer.is_empty():
+					print("PAUSE FAIL rewardWithoutOffer")
+					get_tree().quit(1)
+					return
+				_main._on_card_picked(Run.offer[0])
+				_f = 0
+				_step = 11
+			elif _main.stage != int(_marks["stage_clear"]):
+				# 兼容 Run 被关闭的旧流程：没有三选一，直接进下一关。
 				var once: bool = _main.score == int(_marks["score_clear"])
 				print("PAUSE rewardOnce=%s score=%d" % [str(once), _main.score])
 				_marks["reward"] = once
 				_verdict()
 			elif _f > 900:
 				print("PAUSE FAIL stageNeverAdvanced state=%s" % _main.state)
+				get_tree().quit(1)
+		11:
+			# 选卡会立刻进入下一关的 ready。此时确认：关卡真的推进了，
+			# 而 clear 时的得分没有被重复累加。
+			if _main.stage != int(_marks["stage_clear"]):
+				var once: bool = _main.score == int(_marks["score_clear"])
+				print("PAUSE rewardOnce=%s score=%d" % [str(once), _main.score])
+				_marks["reward"] = once
+				_verdict()
+			elif _f > 120:
+				print("PAUSE FAIL cardNeverAdvanced state=%s" % _main.state)
 				get_tree().quit(1)
 
 

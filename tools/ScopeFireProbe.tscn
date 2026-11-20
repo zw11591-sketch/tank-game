@@ -1,0 +1,9 @@
+[gd_scene format=3 uid="uid://b8scopefire"]
+
+[ext_resource type="Script" path="res://tools/scope_fire_probe.gd" id="1_scope"]
+[ext_resource type="PackedScene" path="res://scenes/Main.tscn" id="2_main"]
+
+[node name="ScopeFireProbe" type="Node"]
+script = ExtResource("1_scope")
+
+[node name="Main" parent="." instance=ExtResource("2_main")]

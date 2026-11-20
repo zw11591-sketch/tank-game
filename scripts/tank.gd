@@ -191,9 +191,24 @@ var armor_rear := 1.75
 var shield_t := 0.0
 var armor_buff_t := 0.0
 var rapid_buff_t := 0.0
-## 多弹装填：一次击发同时打出三发带散布的炮弹
+## 多弹装填：一次击发同时打出三发带散布的炮弹（限时道具）
 var multi_t := 0.0
 var damage_mult := 1.0
+
+# --- Roguelite 修正（由 Tank.apply_run_mods 写入，敌方走 EnemyAffix） ---
+## 跳弹阈值角（度）：正面 AP 入射角大于它必然跳弹。
+##
+## 这是**确定性**规则，不是概率：旧版是 32° 以上 30% 概率，
+## 玩家摆出好角度却被随机击穿，或者姿势很正却意外跳弹，都会归罪于运气。
+## 现在同一角度必然同一结果，"摆角度"因此可以学习、可以验证。
+## 卡牌 `ricochet` 把它往下拉，准星提示与结算共用这一个值。
+var ricochet_angle := 45.0
+## 卡牌带来的额外弹丸数（0/1/2）。与限时 `multi_t` 取较大值。
+var extra_shells := 0
+## 受伤回调给射手的钩子（吸血卡）。基类只转发，不自己回血。
+var _card_mult := {"damage": 1.0, "hp": 1.0, "armor": 1.0, "reload": 1.0,
+		"turret": 1.0, "he": 1.0, "splash": 1.0}
+var _base_tank := {}
 ## 开火后的"暴露"计时：草丛隐蔽在这段时间内失效（见 player.is_concealed）。
 ## 放在基类是因为它由 fire() 统一写入，玩家与敌人共用同一套开火流程。
 var expose_t := 0.0
@@ -324,6 +339,43 @@ func setup(g: Node, a: Arena, pos: Vector3) -> void:
 	game = g
 	arena = a
 	position = pos
+
+
+## 把 Run（Roguelite）的卡牌修正应用到本车。
+##
+## 唯一入口，必须满足两条：
+##   * 在 `_apply_roster()` / `apply_difficulty()` **之后**调用，否则名册会把卡牌覆写掉；
+##   * **幂等**：内部先把名册基线存进 `_base_tank`，之后每次都从这个基线重算，
+##     于是重生、联机重算、探针反复调用都不会越叠越高。
+##
+## heal 只在"刚出生"时为真。对局中途卡牌变了、联机快照重算时按原有血量比例回填，
+## 否则重算一次就白送一次满血——那会让"受伤"失去意义。
+func apply_run_mods(m: Dictionary, heal := false) -> void:
+	if _base_tank.is_empty():
+		_base_tank = {
+			"damage": damage, "max_hp": max_hp, "reload": reload_time,
+			"af": armor_front, "as": armor_side, "ar": armor_rear,
+			"turret": turret_speed, "he": he_mult, "splash": he_splash,
+			"ricochet": ricochet_angle,
+		}
+	var ratio: float = float(hp) / maxf(float(max_hp), 1.0)
+	damage = maxi(1, int(round(float(_base_tank["damage"]) * float(m.get("damage", 1.0)))))
+	max_hp = maxi(1, int(round(float(_base_tank["max_hp"]) * float(m.get("hp", 1.0)))))
+	if heal:
+		hp = max_hp
+	else:
+		hp = clampi(int(round(ratio * float(max_hp))), 1, max_hp)
+	reload_time = maxf(0.02, float(_base_tank["reload"]) * float(m.get("reload", 1.0)))
+	var am := float(m.get("armor", 1.0))
+	armor_front = float(_base_tank["af"]) * am
+	armor_side = float(_base_tank["as"]) * am
+	armor_rear = float(_base_tank["ar"]) * am
+	turret_speed = float(_base_tank["turret"]) * float(m.get("turret", 1.0))
+	he_mult = float(_base_tank["he"]) * float(m.get("he", 1.0))
+	he_splash = float(_base_tank["splash"]) * float(m.get("splash", 1.0))
+	ricochet_angle = clampf(float(_base_tank["ricochet"]) - float(m.get("ricochet", 0.0)),
+			24.0, float(_base_tank["ricochet"]))
+	extra_shells = clampi(int(m.get("shells", 0)), 0, 2)
 
 
 func _ready() -> void:
@@ -1884,6 +1936,16 @@ func speed() -> float:
 	return _speed
 
 
+## 车体当前的移动速度向量（世界系，m/s）。
+##
+## HUD 的镜内提前量标尺用它预测目标在炮弹飞行期间会走到哪。
+## 刻意不从 `velocity` 读：那是 CharacterBody3D 的**物理**量，只有本地跑 drive()
+## 的车才有意义；远端队友与客户端上的敌车走快照插值，`velocity` 一直是零，
+## 而 `_speed` 是由快照回写的（见 apply_net_state），两条路径都能拿到真实的行驶速度。
+func motion_velocity() -> Vector3:
+	return -global_transform.basis.z * _speed
+
+
 ## 仪表用：km/h 绝对值
 func speed_kmh() -> float:
 	return absf(_speed) * 3.6
@@ -2187,13 +2249,30 @@ func zone_index(from_pos: Vector3) -> int:
 	return 1
 
 
-## 该方向、该弹种下是否处在"可能跳弹"的角度上（正面 AP，夹角 > 32°）。
-## 只用于准星提示：真正的 30% 判定仍在 take_hit() 里。
+## 该方向、该弹种下是否会跳弹（正面 AP，入射角大于跳弹阈值角）。
+## 准星提示与 take_hit() 共用这一条判据：提示说会跳，结算就一定跳，
+## 不会出现"准星说跳弹、实际却击穿"的撒谎提示。
 func is_ricochet_angle(from_pos: Vector3, kind: int) -> bool:
 	if kind != Shell.Kind.AP:
 		return false
 	var ang := impact_angle(from_pos)
-	return ang > 32.0 and ang < 55.0
+	return ang > ricochet_angle and ang < 55.0
+
+
+## 受到伤害的额外系数。Enemy 用它实现"硬化"修正与"重甲"词缀，基类恒为 1。
+func damage_taken_mult(_kind: int) -> float:
+	return 1.0
+
+
+## 造成伤害后的回调。Roguelite 的吸血卡接在这里（由 main 统一结算并同步）。
+##
+## 基类只转发，不自己回血：回血要写进 `hp`，而联机下 hp 由房主快照同步，
+## 所以结算必须集中在 main 一处，否则客户端回的血会被下一帧快照抹掉。
+func on_damage_dealt(amount: int) -> void:
+	if amount <= 0 or not alive:
+		return
+	if game != null and game.has_method("on_player_damage_dealt"):
+		game.on_player_damage_dealt(self, amount)
 
 
 ## 返回 "shield" / "ricochet" / "hit" / "kill"，并输出实际伤害到 out_dmg[0]。
@@ -2218,8 +2297,13 @@ func take_hit(amount: int, from_pos: Vector3, kind: int, out_dmg: Array = [],
 	if zone_i == 0:
 		mult = armor_front
 		zone = "正面"
-		# 正面被 AP 弹以大角度擦到有几率跳弹
-		if kind == Shell.Kind.AP and ang > 32.0 and randf() < 0.30:
+		# 正面被 AP 弹以大角度擦到必然跳弹。
+		#
+		# 旧规则是 32° 以上 30% 概率，属于"看不见的随机"：玩家摆出好角度却被随机
+		# 击穿、姿势很正却意外跳弹，都会归罪于运气；Roguelite 玩家会反复刷局，
+		# 随机惩罚会被放大。现在改成按入射角的确定阈值（`ricochet_angle`，默认 45°），
+		# 准星提示与这里的结算共用同一个值，于是"斜摆车身有用"是可以学习、可以验证的。
+		if kind == Shell.Kind.AP and ang > ricochet_angle:
 			Audio.play_3d("ricochet", global_position)
 			# 玩家自己跳掉了一发，必须有反馈：这是"斜摆车身有用"唯一的学习途径。
 			# 原来这里是直接 return，玩家既看不到方向指示也听不到提示，
@@ -2234,7 +2318,7 @@ func take_hit(amount: int, from_pos: Vector3, kind: int, out_dmg: Array = [],
 	if armor_buff_t > 0.0:
 		mult *= 0.6
 
-	var dmg := maxi(1, int(round(amount * mult)))
+	var dmg := maxi(1, int(round(amount * mult * damage_taken_mult(kind))))
 	hp -= dmg
 	if out_dmg.size() > 0:
 		out_dmg[0] = dmg

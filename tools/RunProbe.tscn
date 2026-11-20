@@ -1,0 +1,9 @@
+[gd_scene format=3 uid="uid://b7runprobe"]
+
+[ext_resource type="Script" path="res://tools/run_probe.gd" id="1_run"]
+[ext_resource type="PackedScene" path="res://scenes/Main.tscn" id="2_main"]
+
+[node name="RunProbe" type="Node"]
+script = ExtResource("1_run")
+
+[node name="Main" parent="." instance=ExtResource("2_main")]

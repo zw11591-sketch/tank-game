@@ -37,6 +37,8 @@ var room_name := "坦克房间"
 var room_stage := 1
 var room_terrain := -1
 var room_difficulty := 1
+## 联机时挑战由房主在车库选好再进大厅；0 标准 / 1 每日 / 2 精英。
+var room_challenge := 0
 var room_seed := 0
 
 ## peer_id -> {name, tank_id, ready, lives, alive}
@@ -262,9 +264,22 @@ func set_room(stage: int, terrain: int, difficulty: int) -> void:
 	room_stage = clampi(stage, 1, 8)
 	room_terrain = clampi(terrain, -1, Arena.TERRAINS.size() - 1)
 	room_difficulty = clampi(difficulty, 0, 2)
-	var info := {"stage": room_stage, "terrain": room_terrain, "difficulty": room_difficulty}
+	var info := {"stage": room_stage, "terrain": room_terrain,
+			"difficulty": room_difficulty, "challenge": room_challenge}
 	rpc("net_room", info)
 	roster_changed.emit()
+
+
+## 挑战（标准 / 每日 / 精英）与关卡、难度一样由房主决定，但它的入口在车库：
+## 房主在车库第三行选好再进大厅，于是必须在进房间时把值带过来，否则大厅里
+## 开始的对局永远是"标准行动"，玩家在车库选的挑战被静默丢弃。
+func set_challenge(challenge: int) -> void:
+	room_challenge = clampi(challenge, 0, 2)
+	if role == Role.HOST and not is_offline():
+		var info := {"stage": room_stage, "terrain": room_terrain,
+				"difficulty": room_difficulty, "challenge": room_challenge}
+		rpc("net_room", info)
+		roster_changed.emit()
 
 
 func start_match() -> void:
@@ -300,6 +315,7 @@ func start_match() -> void:
 		"terrain": pick_terrain,
 		"seed": room_seed,
 		"difficulty": room_difficulty,
+		"challenge": room_challenge,
 		"players": list,
 	}
 	match_active = true
@@ -458,6 +474,7 @@ func net_room(info: Dictionary) -> void:
 	room_stage = int(info.get("stage", room_stage))
 	room_terrain = int(info.get("terrain", room_terrain))
 	room_difficulty = int(info.get("difficulty", room_difficulty))
+	room_challenge = clampi(int(info.get("challenge", room_challenge)), 0, 2)
 	roster_changed.emit()
 
 
@@ -482,6 +499,10 @@ func broadcast_stage_start(stage: int, terrain: int, seed: int, diff: int) -> vo
 	if role != Role.HOST:
 		return
 	var info := {"stage": stage, "terrain": terrain, "seed": seed, "difficulty": diff}
+	# Run 行一起下发：客户端要在建图之前就知道这一关是什么类型（坚守的 HUD 倒计时、
+	# 决战关的 Boss 横幅），免得地图已经建好、界面还是上一关的。
+	if Run != null and Run.active:
+		info["run"] = Run.net_row()
 	rpc("net_stage_start", info)
 	stage_started.emit(info)
 
@@ -601,12 +622,15 @@ func _spawn_shot_bundle(shooter: Tank, origin: Vector3, dir: Vector3, kind: int,
 	game.spawn_shell(shooter, origin, dir, kind, uid)
 	if role == Role.HOST:
 		rpc("net_shot", shooter.net_id, origin, dir, kind, uid)
-	if shooter.multi_t > 0.0:
-		for s in [-1.0, 1.0]:
-			var d := dir.rotated(Vector3.UP, deg_to_rad(2.4) * s)
-			game.spawn_shell(shooter, origin, d, kind, uid)
-			if role == Role.HOST:
-				rpc("net_shot", shooter.net_id, origin, d, kind, uid)
+	# 额外弹丸数与限时"多弹装填"取较大值：卡牌给的弹丸是常驻的，
+	# 道具给的是 22 秒的临时效果，两者不该叠加成四五发。
+	var extra: int = maxi(2 if shooter.multi_t > 0.0 else 0, shooter.extra_shells)
+	for i in extra:
+		var off := deg_to_rad(2.4) if i == 0 else -deg_to_rad(2.4)
+		var d := dir.rotated(Vector3.UP, off)
+		game.spawn_shell(shooter, origin, d, kind, uid)
+		if role == Role.HOST:
+			rpc("net_shot", shooter.net_id, origin, d, kind, uid)
 
 
 @rpc("any_peer", "call_remote", "reliable")
@@ -821,3 +845,40 @@ func net_match_end(won: bool, score_value: int) -> void:
 	if game.has_method("net_end_match"):
 		game.net_end_match(won, score_value)
 	match_ended.emit(won, score_value)
+
+
+# ---------------- Roguelite：Run 事件 ----------------
+#
+# 卡池、战功、补给站购买全部由房主结算（规格见 docs/design/05_ui_and_net.md 第 8 节）。
+# 关卡号与卡牌还会随 `net_collect_snapshot()` 的 "run" 行每 40 ms 到达一次，
+# 所以这里的事件只负责"界面怎么变"这类一次性动作：开三选一、选卡、买补给、进下一关。
+# 事件丢了有下面两条兜底，不会卡住流程：
+#   * 快照里的 stage 变了且本地还停在 reward/station → 关掉界面，跟房主走；
+#   * 快照里的 offer 非空且本地没在任何 Run 界面 → 重新打开三选一（只读）。
+
+func broadcast_run_offer(offer: Array, stage: int) -> void:
+	if role != Role.HOST:
+		return
+	rpc("net_run_offer", offer, stage)
+
+
+@rpc("authority", "call_remote", "reliable")
+func net_run_offer(offer: Array, stage: int) -> void:
+	if role != Role.CLIENT or game == null:
+		return
+	if game.has_method("net_run_offer"):
+		game.net_run_offer(offer, stage)
+
+
+func broadcast_run_event(kind: String, data: Dictionary = {}) -> void:
+	if role != Role.HOST:
+		return
+	rpc("net_run_event", kind, data)
+
+
+@rpc("authority", "call_remote", "reliable")
+func net_run_event(kind: String, data: Dictionary) -> void:
+	if role != Role.CLIENT or game == null:
+		return
+	if game.has_method("net_run_event"):
+		game.net_run_event(kind, data)

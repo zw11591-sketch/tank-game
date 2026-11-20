@@ -112,6 +112,9 @@ var cam: Camera3D
 
 var _trauma := 0.0
 var _shake_t := 0.0
+## 镜内开火反馈的缩放（见 `fire_kick`）。0.5 是"看得见打出去了、准星不离靶"的折中：
+## 0.3 以下连发时感受不到每一发，0.7 以上在 40 m 外的目标上又会抖掉半个车身。
+const SCOPE_KICK_SCALE := 0.5
 ## 开火震屏单独的上限。开火是"每发一次"的脉冲，不该像受伤那样累加：
 ## 每发 +0.45、衰减 1.9/s，连点 6 次/秒时 1 秒内就顶到 1.0，画面在 ±0.35 m 上抖，
 ## 而这是一款"每一下点击都要打出去"的游戏——震屏把准星晃掉就是纯粹的惩罚。
@@ -191,16 +194,31 @@ func add_trauma(amount: float) -> void:
 ##
 ## 震屏单独限幅（FIRE_TRAUMA_CAP），所以连点不会累积到"看不准"；
 ## 后推是定向的，衰减比抖动快，读起来是"炮弹出去了"而不是"画面在抖"。
+##
+## **镜内按 `SCOPE_KICK_SCALE` 缩放**：狙击镜把 FOV 收到 26° / 14°，同样的震幅在
+## 镜里对应的画面位移是腰射的好几倍，一发就把准星顶离 40 m 外的目标一整个车身。
+## 那样"边瞄准边射击"就只剩"打两枪、等画面停下来再找目标"，镜的观察与射击仍然
+## 是两件事。这里保留可感知的反馈（后推与一个小的视场冲击），但不再打断瞄准。
+## 受伤的震屏（`add_trauma`）不经过这里，举镜也不会让被打中的反馈打折扣。
 func fire_kick(amount: float) -> void:
+	var k := SCOPE_KICK_SCALE if sniper else 1.0
 	# 只在不超过开火上限的前提下累加。不能直接取 min()：玩家刚被重炮打中
 	# （trauma 0.8）时开一炮，min() 会把它压回 0.35——画面在一瞬间"安静下来"，
 	# 读起来像震屏被打断了。开火只能把震屏推到自己那一档，不能收掉受伤的震屏。
-	_trauma = maxf(_trauma, minf(FIRE_TRAUMA_CAP, _trauma + amount))
-	_fire_push = minf(1.0, _fire_push + amount)
-	_fov_punch = maxf(_fov_punch, 3.2)
+	_trauma = maxf(_trauma, minf(FIRE_TRAUMA_CAP, _trauma + amount * k))
+	_fire_push = minf(1.0, _fire_push + amount * k)
+	_fov_punch = maxf(_fov_punch, 3.2 * k)
 
 
+## 进出狙击镜。**只在状态变化时**重置档位。
+##
+## 玩家每物理帧都会调用它（`is_action_pressed` 的实时状态），所以这里不能用
+## "只要开着就把档位归零"的写法：滚轮切到窄镜之后，下一帧又会被按回宽镜，
+## 换档等于没反应（HUD 上的"×1/×2"会一直闪回 ×1）。只有从关到开的那一次才回到
+## 宽镜——玩家重新举镜时想要的是"先看全一片"，这是设计意图，不是每帧重置。
 func set_sniper(on: bool) -> void:
+	if on == sniper:
+		return
 	sniper = on
 	if on:
 		sniper_zoom = 0

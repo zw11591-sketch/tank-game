@@ -29,6 +29,10 @@ var _feed_l: Label
 ## 合作模式的队友状态：名字、血量、剩余命数。阵亡的队友仍在名册里，
 ## 所以这里按名册画，而不是按场上的车——否则"阵亡"两个字永远不出现。
 var _team_l: Label
+## Roguelite：战区 / 关卡类型 / 战功 / 卡牌数，一行读完全局进度。
+var _run_l: Label
+## 坚守关剩余时间。非坚守关为空，正常情况下不占视觉重量。
+var _hold_l: Label
 
 ## 战斗结果提示（击穿 / 跳弹 / 击毁 / 格挡）。画在准星下方，
 ## 因为玩家的视线就在准星附近：放在屏幕角落等于不提示。
@@ -57,8 +61,12 @@ func _ready() -> void:
 	_combo_l = _label(Vector2(20, 70), 21, Color(1.0, 0.72, 0.25), HORIZONTAL_ALIGNMENT_LEFT, 320)
 	_enemy_l = _label(Vector2(-340, 14), 21, Color(1.0, 0.62, 0.55), HORIZONTAL_ALIGNMENT_RIGHT, 320)
 	# 队友状态挂在左上角分数/关卡下方，最多三行，不会撞到中上方的隐蔽指示灯。
-	_team_l = _label(Vector2(20, 104), 16, Color(0.55, 1.0, 0.62), HORIZONTAL_ALIGNMENT_LEFT, 460)
+	_team_l = _label(Vector2(20, 128), 16, Color(0.55, 1.0, 0.62), HORIZONTAL_ALIGNMENT_LEFT, 460)
 	_team_l.visible = false
+	# Run 状态条：战区、关卡类型、战功、卡牌数。放在连击下面，
+	# 于是玩家不用打开任何界面就能读到"我现在在哪一段、还有多少战功"。
+	_run_l = _label(Vector2(20, 100), 17, Color(0.82, 0.86, 0.96), HORIZONTAL_ALIGNMENT_LEFT, 560)
+	_run_l.text = ""
 
 	# 底部状态区
 	_hp_bar = Bar.new()
@@ -80,6 +88,9 @@ func _ready() -> void:
 	# 隐蔽 / 被发现指示灯。草丛与烟幕只有在玩家能读懂"我现在藏住了没有"
 	# 的时候才是战术，否则只是一层看不见的判定。
 	_spot_l = _label(Vector2(0, 14), 18, Color(0.6, 1.0, 0.7), HORIZONTAL_ALIGNMENT_CENTER, 320)
+	# 坚守倒计时挂在右上角"剩余敌军"下面：两行读的是同一个问题——
+	# "还得撑多久 / 还剩几个目标"。
+	_hold_l = _label(Vector2(0, 44), 24, Color(1.0, 0.86, 0.42), HORIZONTAL_ALIGNMENT_RIGHT, 320)
 
 	_hint_l = _label(Vector2(0, 0), 30, Color(1.0, 0.85, 0.35), HORIZONTAL_ALIGNMENT_CENTER, 900)
 
@@ -279,6 +290,7 @@ func _process(_delta: float) -> void:
 	_feed_l.position = Vector2(vp.x - 420, 46)
 	_feed_l.size = Vector2(400, 120)
 	_feed_l.text = _feed_text()
+	_update_run(vp)
 	# 开场倒计时期间油门是锁死的，必须把"还要等多久"画出来。
 	# 否则玩家按方向键没反应、又看不到任何倒计时，只会以为操作失灵。
 	if game.state == "ready":
@@ -381,6 +393,28 @@ func _gear_txt(g: int) -> String:
 
 ## 隐蔽状态指示灯。优先级：被发现 > 烟幕 > 草丛 > 无。
 ## "被发现"用红色常亮而不是闪烁：它是一段持续状态，闪烁会读成警报噪音。
+func _update_run(vp: Vector2) -> void:
+	if game == null:
+		return
+	if Run.active:
+		_run_l.text = "战区 %d/%d · 第 %d 关 %s    战功 %d    卡牌 %d" % [
+			Run.zone_index() + 1, Run.ZONE_COUNT, Run.stage, Run.kind_name(),
+			Run.credits, Run.cards.size(),
+		]
+	else:
+		_run_l.text = ""
+	if float(game.hold_left) > 0.0:
+		var left := int(ceil(float(game.hold_left)))
+		_hold_l.position = Vector2(vp.x - 340, 40)
+		_hold_l.size = Vector2(320, 32)
+		_hold_l.text = "坚守 %02d:%02d" % [int(left / 60.0), left % 60]
+		# 最后 10 秒转红：倒计时本身就是这一关的压力来源。
+		_hold_l.add_theme_color_override("font_color",
+				Color(1.0, 0.86, 0.42) if left > 10 else Color(1.0, 0.36, 0.3))
+	else:
+		_hold_l.text = ""
+
+
 func _update_spot(p) -> void:
 	if p == null or not is_instance_valid(p) or not p.alive:
 		_spot_l.text = ""
@@ -449,6 +483,20 @@ class Bar extends Control:
 
 class Reticle extends Control:
 	var hud: HUD
+	## 镜内提前量标尺：当前跟随的目标，以及"准星离开后还跟多久"的截止时刻（毫秒）。
+	## 用时间戳而不是帧数：准星的重绘频率跟着渲染帧走，帧数在掉帧时会缩水。
+	var _lead_tank = null
+	var _lead_until := 0
+	## 标尺跟随的保持时间。0.9 s 够玩家把准星从目标身上移到标尺上；
+	## 再短就会"刚移过去标尺就没了"，那是比没有标尺更糟的体验。
+	const LEAD_KEEP_MS := 900
+	## 标尺瞄准的目标高度（离地）。车体命中体是 0~2.0 m 的圆柱，取它的中心。
+	const LEAD_AIM_Y := 1.05
+	## 目标横向速度低于该值就不画标尺：静止目标的提前量是零，标尺只会压在准星上。
+	const LEAD_SPEED_MIN := 1.5
+	## 准星离开目标后，目标仍在准星射线这么近的范围内就继续跟随。
+	## 10 m 在 100 m 外约 5.7°，覆盖"把准星移到提前量点"这一小段距离。
+	const LEAD_KEEP_RADIUS := 14.0
 
 	func _draw() -> void:
 		var g = hud.game
@@ -587,13 +635,133 @@ class Reticle extends Control:
 		draw_line(center + Vector2(0, r), center + Vector2(0, 40), Color(0.75, 0.8, 0.85, 0.5), 1.5)
 		var f := ThemeDB.fallback_font
 		var p = g.player
+		var aim_at: Vector3 = g.rig.aim_point()
 		if p != null and is_instance_valid(p):
-			var d: float = p.global_position.distance_to(g.rig.aim_point())
-			draw_string(f, center + Vector2(-80, r - 18), "%.0f m" % d,
-					HORIZONTAL_ALIGNMENT_CENTER, 160, 22, Color(0.9, 0.94, 0.98, 0.9))
+			var d: float = p.global_position.distance_to(aim_at)
+			# 距离与飞行时间同一行：远射真正要读的是"这一发几秒到"，
+			# 100 m 要 0.40 s，一辆 12 m/s 的敌车在这段时间里走 4.8 m。
+			var flight: float = d / maxf(Shell.AP_SPEED, 1.0)
+			draw_string(f, center + Vector2(-90, r - 18), "%.0f m  %.2fs" % [d, flight],
+					HORIZONTAL_ALIGNMENT_CENTER, 180, 22, Color(0.9, 0.94, 0.98, 0.9))
+			# 下一发的状态：能打 / 还在装填。连射时玩家不会把视线从目标上移开去
+			# 看屏幕角落的装填环，所以镜里必须有一条"现在能不能扣"的读数。
+			var ready: bool = p.reload_t <= 0.0
+			var ready_txt := "可击发" if ready else "装填 %.1fs" % p.reload_t
+			draw_string(f, center + Vector2(-80, r - 66), ready_txt,
+					HORIZONTAL_ALIGNMENT_CENTER, 160, 14,
+					Color(0.6, 0.95, 0.7, 0.9) if ready else Color(0.9, 0.75, 0.5, 0.85))
+			_draw_scope_lock(center, p, f, -r + 34)
+		# 弹种与提前量飞行时间：镜里最关心的就是"这一发多久到"
+		if p != null and is_instance_valid(p):
+			var kind_txt := "AP" if p.shell_kind == Shell.Kind.AP or not p.can_use_he else "HE"
+			draw_string(f, center + Vector2(-80, r - 42), kind_txt,
+					HORIZONTAL_ALIGNMENT_CENTER, 160, 15, Color(0.75, 0.8, 0.85, 0.7))
 		var zoom_txt := "×2 窄镜" if g.rig.sniper_zoom > 0 else "×1 宽镜"
 		draw_string(f, center + Vector2(-80, -r + 34), zoom_txt,
 				HORIZONTAL_ALIGNMENT_CENTER, 160, 17, Color(0.75, 0.8, 0.85, 0.75))
+		_draw_lead()
+
+	## 镜内火控锁定读数：画在镜筒上缘（缩放档位下面），远离准星与目标。
+	##
+	## 锁定需要玩家在同一个目标上压 0.4 s，不把这件事画出来，玩家只会觉得
+	## "有时候炮弹会拐弯"。所以分两种状态：
+	##   * 正在锁：显示进度条，读得懂"再压一会儿就成"；
+	##   * 已锁定：显示"火控锁定"，具体提前量由标尺旁那行"自动补偿 x.x m"给出。
+	## 不把读数画在准星下方：那里正好压着敌车，字数一多就糊住目标。
+	func _draw_scope_lock(center: Vector2, p, f: Font, top: float) -> void:
+		if p.scope_lock_ready:
+			draw_string(f, center + Vector2(-90, top + 22), "火控锁定",
+					HORIZONTAL_ALIGNMENT_CENTER, 180, 16, Color(0.55, 1.0, 0.68, 0.95))
+			return
+		if p.scope_lock_ratio <= 0.0:
+			return
+		var w := 96.0
+		var at := center + Vector2(-w * 0.5, top + 8)
+		draw_rect(Rect2(at, Vector2(w, 4)), Color(0.55, 0.6, 0.66, 0.35))
+		draw_rect(Rect2(at, Vector2(w * p.scope_lock_ratio, 4)),
+				Color(0.75, 0.95, 0.8, 0.85))
+		draw_string(f, at + Vector2(-40, 18), "火控锁定", HORIZONTAL_ALIGNMENT_CENTER,
+				176, 12, Color(0.75, 0.85, 0.8, 0.7))
+
+	## 镜内提前量标尺。
+	##
+	## 远射最难的一件事不是"看清车"，而是"算准车会走到哪"。AP 250 m/s 在 100 m 外
+	## 要飞 0.4 秒，一辆 12 m/s 的敌车在这段时间里走 4.8 m——两倍车宽。靠肉眼估，
+	## 玩家只能反复试射；而狙击镜的全部意义是"这一发就要打中"。
+	##
+	## 这里画的是**精确的拦截解**（`Shell.intercept_time()`，与敌人 AI 的预瞄同源）：
+	##   * 一个亮色圆环 = 这个距离、这个速度下该往哪里打（提前量）；
+	##   * 一条细实线 = 从目标当前位置指向该点的位移矢量（读得出"车往哪走"）；
+	##   * 一行数字 = 炮弹飞到目标所需的秒数。
+	## 它只提供几何关系，不入账任何命中加成：命中与否仍然由物理射线决定，
+	## 所以关镜时的公平性与现在完全一致。
+	##
+	## 目标跟随：准星压在车上就锁定它；准星移开之后，只要最新锁定的那辆车仍在
+	## 准星附近（`LEAD_KEEP_RADIUS`）就保持 0.9 秒——否则玩家一移开准星去瞄标尺，
+	## 标尺本身就先消失了，等于没法用它。
+	func _draw_lead() -> void:
+		var g = hud.game
+		if g == null or g.rig == null or g.rig.cam == null:
+			return
+		var p = g.player
+		if p == null or not is_instance_valid(p) or not p.alive:
+			return
+		var cam: Camera3D = g.rig.cam
+		var now := Time.get_ticks_msec()
+		var aimed: Tank = g.rig.aim_target()
+		if aimed != null and is_instance_valid(aimed) and aimed.alive and aimed.team != p.team:
+			_lead_tank = aimed
+			_lead_until = now + LEAD_KEEP_MS
+		var t: Tank = _lead_tank
+		if t == null or not is_instance_valid(t) or not t.alive:
+			_lead_tank = null
+			return
+		if now > _lead_until:
+			_lead_tank = null
+			return
+		# 准星已经离开这辆车：只有它还落在准星附近（玩家正把准星挪到提前量点上）
+		# 时才继续跟随，否则上一辆车的标尺会一直留在屏幕上。
+		if aimed != t:
+			var pt: Vector3 = g.rig.aim_point()
+			if pt.distance_to(t.global_position) > LEAD_KEEP_RADIUS:
+				_lead_tank = null
+				return
+
+		# HE 走抛物线，直线拦截解不适用；它的落点由 _draw_he_arc() 负责
+		if p.can_use_he and p.shell_kind == Shell.Kind.HE:
+			return
+		var from: Vector3 = p.muzzle_pos()
+		var tgt: Vector3 = t.global_position + Vector3(0, LEAD_AIM_Y, 0)
+		var vel: Vector3 = t.motion_velocity()
+		vel.y = 0.0
+		if Vector2(vel.x, vel.z).length() < LEAD_SPEED_MIN:
+			return
+		var flight: float = Shell.intercept_time(from, tgt, vel, Shell.AP_SPEED)
+		var aim: Vector3 = tgt + vel * flight
+		if cam.is_position_behind(aim) or cam.is_position_behind(tgt):
+			return
+		var a: Vector2 = cam.unproject_position(aim)
+		var b: Vector2 = cam.unproject_position(tgt)
+
+		var col := Color(1.0, 0.72, 0.22, 0.92)
+		draw_arc(a, 11.0, 0.0, TAU, 20, col, 2.0)
+		draw_line(a + Vector2(-16, 0), a + Vector2(-7, 0), col, 1.5)
+		draw_line(a + Vector2(7, 0), a + Vector2(16, 0), col, 1.5)
+		draw_line(a + Vector2(0, -16), a + Vector2(0, -7), col, 1.5)
+		draw_line(a + Vector2(0, 7), a + Vector2(0, 16), col, 1.5)
+		# 位移矢量：从目标当前位置指向标尺，就是需要提前让开的那一段
+		if a.distance_to(b) > 6.0:
+			draw_line(b, a, Color(col.r, col.g, col.b, 0.35), 1.2)
+		# 锁定之后这一发由火控自动补偿，标尺读的是"炮弹会落在哪"，
+		# 不再是"玩家该往哪瞄"——两者的文案必须分开，否则玩家会去瞄标尺，
+		# 把已经补好的提前量又手动加一遍。
+		var label := "自动补偿 %.1f m · %.2fs" if p.scope_lock_ready \
+				else "提前量 %.1f m · %.2fs"
+		var label_col := Color(0.55, 1.0, 0.68, 0.92) if p.scope_lock_ready \
+				else Color(col.r, col.g, col.b, 0.85)
+		draw_string(ThemeDB.fallback_font, a + Vector2(-70, 30),
+				label % [(aim - tgt).length(), flight],
+				HORIZONTAL_ALIGNMENT_CENTER, 140, 13, label_col)
 
 	## 结果提示：击穿 / 跳弹 / 击毁 / 格挡。
 	## 画在准星正下方并向上收拢，视线不用离开准星就能读到结果。

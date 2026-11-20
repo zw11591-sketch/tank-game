@@ -22,6 +22,8 @@ Settings="*res://scripts/settings.gd"
 Audio="*res://scripts/audio.gd"
 Stats="*res://scripts/stats.gd"
 Net="*res://scripts/net.gd"
+Meta="*res://scripts/meta_progress.gd"
+Run="*res://scripts/run_state.gd"
 
 [display]
 

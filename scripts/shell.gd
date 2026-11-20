@@ -98,6 +98,41 @@ static func lob_dir(origin: Vector3, target: Vector3, fallback: Vector3) -> Vect
 	return (flat / r + Vector3.UP * tan_theta).normalized()
 
 
+## 直线弹道的拦截解：炮弹飞多久之后，目标刚好走到弹道上。
+##
+## AP 不吃重力、速度恒定，所以"该往哪打"是一个精确的二次方程：
+## 设 r = 目标当前位置 − 炮口，v = 目标速度，s = 弹速，
+## 命中条件 |r + v·t| = s·t，展开即 (v² − s²)t² + 2(r·v)t + r² = 0。
+## 取**最小正根**（先到先打），没有正根时退回"按当前距离飞"——
+## 那种情况是目标比炮弹快或正朝炮口开来，提前量为零才是不会误导玩家的答案。
+##
+## 狙击镜的提前量标尺用的就是它：100 m 外一辆 12 m/s 的敌车要走 4.8 m，
+## 而 AP 只飞 0.4 s，肉眼估提前量等于瞎猜。
+static func intercept_time(from: Vector3, to: Vector3, vel: Vector3, speed: float) -> float:
+	var r := to - from
+	var s2 := speed * speed
+	var a := vel.dot(vel) - s2
+	var b := 2.0 * r.dot(vel)
+	var c := r.dot(r)
+	var t := -1.0
+	if absf(a) < 1e-4:
+		if absf(b) > 1e-4:
+			t = -c / b
+	else:
+		var disc := b * b - 4.0 * a * c
+		if disc >= 0.0:
+			var sq := sqrt(disc)
+			var t1 := (-b - sq) / (2.0 * a)
+			var t2 := (-b + sq) / (2.0 * a)
+			if t1 > 0.0 and (t <= 0.0 or t1 < t):
+				t = t1
+			if t2 > 0.0 and (t <= 0.0 or t2 < t):
+				t = t2
+	if t <= 0.0:
+		return r.length() / maxf(speed, 1.0)
+	return t
+
+
 ## 低抛弹道采样：从 origin 沿 dir 出发的 HE 飞行轨迹（世界坐标）。
 ##
 ## 供两处使用：狙击镜里的落点预览，以及 aim_reachable() 的抛物线路检。
@@ -291,6 +326,9 @@ func _hit_tank(t: Tank, point: Vector3) -> void:
 		_die()
 		return
 	if res != "none":
+		# 吸血卡：先记伤害再飘字。跳弹与护盾在上面已经提前 return，不会回血。
+		if is_instance_valid(shooter) and int(out[0]) > 0:
+			shooter.on_damage_dealt(int(out[0]))
 		var result := "kill" if res == "kill" else "pen"
 		_feedback("%s %d" % [out[1], out[0]], point, result, int(out[0]), _etype_of(t))
 	if kind == Kind.HE:
@@ -400,6 +438,8 @@ func _explode(direct: Tank = null) -> void:
 		var res: String = t.take_hit(dmg, center, kind, out)
 		if res != "none" and res != "shield" and res != "ricochet":
 			splash_landed = true
+			if is_instance_valid(shooter) and int(out[0]) > 0:
+				shooter.on_damage_dealt(int(out[0]))
 		# 直击目标不再重复提示：同一发炮弹只该有一个数字、一声提示
 		if t == direct:
 			continue

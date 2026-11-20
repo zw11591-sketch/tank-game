@@ -461,13 +461,15 @@ func _build_room(parent: Control) -> void:
 	var set_col := _card(right)
 	_settings_title = _section(set_col, "房间设置")
 	_opt_rows.clear()
-	_opt_rows.append(_option_row(set_col, "关卡"))
+	_opt_rows.append(_option_row(set_col, "挑战"))
 	_opt_rows.append(_option_row(set_col, "地形"))
 	_opt_rows.append(_option_row(set_col, "难度"))
+	# 关卡固定 9 关（Roguelite 局结构），大厅不再让玩家从第 N 关开始；
+	# 原来的"关卡"一行改成"挑战"，与车库第三行语义一致。
 	(_opt_rows[0]["prev"] as Button).pressed.connect(func() -> void:
-		Net.set_room(posmod(Net.room_stage - 2, 8) + 1, Net.room_terrain, Net.room_difficulty))
+		Net.set_challenge(posmod(Net.room_challenge + 2, 3)))
 	(_opt_rows[0]["next"] as Button).pressed.connect(func() -> void:
-		Net.set_room(posmod(Net.room_stage, 8) + 1, Net.room_terrain, Net.room_difficulty))
+		Net.set_challenge(posmod(Net.room_challenge + 1, 3)))
 	(_opt_rows[1]["prev"] as Button).pressed.connect(func() -> void:
 		var n: int = Arena.TERRAINS.size() + 1
 		Net.set_room(Net.room_stage, posmod(Net.room_terrain + n - 1, n) - 1, Net.room_difficulty))
@@ -782,7 +784,9 @@ func _refresh_room() -> void:
 	var players: Array = Net.get_players_array()
 	var diff: int = clampi(Net.room_difficulty, 0, 2)
 	_room_name_l.text = Net.room_name
-	_room_meta_l.text = "第 %d 关 · %s · %s" % [Net.room_stage, _terrain_name(), DIFF_NAMES[diff]]
+	_room_meta_l.text = "%s · %s · %s" % [
+			Mutators.CHALLENGE_NAMES[clampi(Net.room_challenge, 0, 2)],
+			_terrain_name(), DIFF_NAMES[diff]]
 
 	# 身份标签：房主金色、已连接绿色、还没接到名册时橙色"连接中"。
 	if host:
@@ -808,7 +812,8 @@ func _refresh_room() -> void:
 
 	# 房主能改设置，客户端只读；两个视图共用同一套控件，切人时面板不会跳动。
 	_settings_title.text = "▍ 房间设置" if host else "▍ 房间设置（房主决定）"
-	(_opt_rows[0]["value"] as Label).text = "第 %d 关" % Net.room_stage
+	(_opt_rows[0]["value"] as Label).text = Mutators.CHALLENGE_NAMES[
+			clampi(Net.room_challenge, 0, 2)]
 	(_opt_rows[1]["value"] as Label).text = _terrain_name()
 	(_opt_rows[2]["value"] as Label).text = DIFF_NAMES[diff]
 	for r in _opt_rows:
